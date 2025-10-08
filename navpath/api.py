@@ -61,6 +61,14 @@ def find_path(
     ) or _default_db_path()
 
     opts = options or SearchOptions()
+    # Provide start tile via extras so graph can limit global lodestone edges
+    try:
+        if not isinstance(opts.extras, dict):
+            opts.extras = {}
+        opts.extras["start_tile"] = start
+    except Exception:
+        # Fallback safety: ensure extras exists
+        opts.extras = {"start_tile": start}
     cost_model = CostModel(options=opts)
 
     t0_ns = time.perf_counter_ns()

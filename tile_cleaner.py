@@ -2,7 +2,7 @@ import os
 import sqlite3
 from collections import deque
 
-SOURCE_DB_PATH = "tiles.db"  # path to your source SQLite database
+SOURCE_DB_PATH = "/home/query/Dev/tiles.db"  # path to your source SQLite database
 OUTPUT_DB_PATH = "worldReachableTiles.db"  # path to the output SQLite database containing reachable tiles
 START_TILE = (3200, 3200, 0)  # example starting tile (x, y, plane)
 NODE_TABLES = [

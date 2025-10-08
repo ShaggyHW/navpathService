@@ -8,7 +8,7 @@ provided helper methods without losing fidelity.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 Tile = Tuple[int, int, int]
@@ -61,6 +61,9 @@ class ActionStep:
     node: Optional[NodeRef] = None
     """Associated node metadata for non-movement steps, when available."""
 
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    """Arbitrary metadata for the step (e.g., lodestone name)."""
+
     def to_json_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable dictionary for this action step."""
 
@@ -72,6 +75,8 @@ class ActionStep:
         }
         if self.node is not None:
             payload["node"] = self.node.to_json_dict()
+        if self.metadata:
+            payload["metadata"] = self.metadata
         return payload
 
 

@@ -89,9 +89,16 @@ class SqliteGraphProvider:
         # Small tables we can cache fully for performance
         self._ifslot_nodes_cache = None
         self._item_nodes_cache = None
+        # Track nodes that are referenced by another node's next_node; such nodes
+        # are NOT chain-heads and must not be invoked directly as starting nodes.
+        self._non_head_nodes: Dict[str, Set[int]] = {}
+        self._chain_head_index_built: bool = False
 
     def neighbors(self, tile: Tile, goal: Tile, options: SearchOptions) -> Iterable[Edge]:
         """Return edges reachable from ``tile`` according to the options."""
+
+        # Ensure we have computed chain-head restrictions before generating edges
+        self._ensure_chain_head_index()
 
         tile_row = self._db.fetch_tile(*tile)
         if tile_row is None:
@@ -103,7 +110,7 @@ class SqliteGraphProvider:
         if options.use_doors:
             edges.extend(self._door_edges(tile))
         if options.use_lodestones:
-            edges.extend(self._lodestone_edges(tile))
+            edges.extend(self._lodestone_edges(tile, options))
         # Action edges via portal semantics and chain resolution
         if options.use_objects:
             edges.extend(self._object_edges(tile, options))
@@ -155,6 +162,9 @@ class SqliteGraphProvider:
         edges: List[Edge] = []
         seen: Set[Tuple[Tile, int]] = set()
         for row in self._db.iter_door_nodes_touching(tile):
+            # Skip doors that are referenced by next_node (non-head)
+            if self._is_non_head("door", row.id):
+                continue
             if tile == row.tile_inside:
                 dest = row.tile_outside
             elif tile == row.tile_outside:
@@ -177,6 +187,13 @@ class SqliteGraphProvider:
                 continue
 
             cost = self._cost_model.door_cost(row.cost)
+            door_meta: dict[str, object] = {
+                "door_direction": row.direction,
+                "real_id_open": row.real_id_open,
+                "real_id_closed": row.real_id_closed,
+            }
+            if getattr(row, "open_action", None) is not None:
+                door_meta["action"] = row.open_action
             edges.append(
                 Edge(
                     type="door",
@@ -184,57 +201,56 @@ class SqliteGraphProvider:
                     to_tile=dest,
                     cost_ms=cost,
                     node=NodeRef("door", row.id),
-                    metadata={
-                        "door_direction": row.direction,
-                        "real_id_open": row.real_id_open,
-                        "real_id_closed": row.real_id_closed,
-                    },
+                    metadata=door_meta,
                 )
             )
 
         edges.sort(key=lambda edge: (edge.to_tile, edge.node.id if edge.node else -1))
         return edges
 
-    def _lodestone_edges(self, tile: Tile) -> List[Edge]:
+    def _lodestone_edges(self, tile: Tile, options: SearchOptions) -> List[Edge]:
         self._ensure_lodestone_cache()
 
-        source_nodes = self._lodestone_by_dest.get(tile)
-        if not source_nodes:
+        # Only generate global lodestone teleports from the start tile. Since
+        # lodestones have no origin constraints and costs are independent of
+        # the origin, any optimal path that uses a lodestone can begin with it.
+        # This drastically reduces branching without sacrificing optimality.
+        start_tile = options.extras.get("start_tile") if isinstance(options.extras, dict) else None
+        if start_tile is not None and tuple(start_tile) != tuple(tile):
             return []
 
+        # Lodestones have no origin constraints; they can be used from anywhere.
+        # Generate direct edges from the current tile to every valid lodestone destination.
         edges: List[Edge] = []
-        seen: Set[Tuple[int, int]] = set()
 
-        for source in sorted(source_nodes, key=lambda node: node.id):
-            cost = self._cost_model.lodestone_cost(source.cost)
-            for target in self._lodestone_nodes_cache or []:
-                if target.id == source.id:
-                    continue
-                pair = (source.id, target.id)
-                if pair in seen:
-                    continue
-                dest = self._lodestone_id_to_dest.get(target.id, target.dest)
-                if not self._lodestone_dest_valid.get(target.id, False):
-                    LOGGER.debug(
-                        "Skipping lodestone edge %s -> %s due to missing destination tile",
-                        source.id,
-                        dest,
-                    )
-                    continue
-                edges.append(
-                    Edge(
-                        type="lodestone",
-                        from_tile=tile,
-                        to_tile=dest,
-                        cost_ms=cost,
-                        node=NodeRef("lodestone", source.id),
-                        metadata={
-                            "source_lodestone": source.lodestone,
-                            "target_lodestone": target.lodestone,
-                        },
-                    )
+        for target in sorted(self._lodestone_nodes_cache or [], key=lambda node: node.id):
+            # Skip lodestones that are referenced by next_node (non-head)
+            if self._is_non_head("lodestone", target.id):
+                continue
+            if not self._lodestone_dest_valid.get(target.id, False):
+                LOGGER.debug(
+                    "Skipping lodestone destination %s due to missing destination tile",
+                    target.id,
                 )
-                seen.add(pair)
+                continue
+            dest = self._lodestone_id_to_dest.get(target.id, target.dest)
+            # Optional: skip no-op teleports to the current tile
+            if dest == tile:
+                continue
+            cost = self._cost_model.lodestone_cost(target.cost)
+            edges.append(
+                Edge(
+                    type="lodestone",
+                    from_tile=tile,
+                    to_tile=dest,
+                    cost_ms=cost,
+                    node=NodeRef("lodestone", target.id),
+                    metadata={
+                        "lodestone": target.lodestone,
+                        "target_lodestone": target.lodestone,
+                    },
+                )
+            )
 
         edges.sort(key=lambda edge: (edge.node.id if edge.node else -1, edge.to_tile))
         return edges
@@ -265,6 +281,8 @@ class SqliteGraphProvider:
         resolver = NodeChainResolver(self._db, self._cost_model, options)
         seen: Set[Tuple[int, Tile]] = set()
         for row in self._db.iter_object_nodes_touching(tile):
+            if self._is_non_head("object", row.id):
+                continue
             ref = NodeRef("object", row.id)
             resolution = resolver.resolve(ref)
             if not resolution.is_success or resolution.destination is None:
@@ -276,6 +294,16 @@ class SqliteGraphProvider:
             if key in seen:
                 continue
             seen.add(key)
+            # Attach actionable metadata when available
+            obj_meta: dict[str, object] = {}
+            if row.action is not None:
+                obj_meta["action"] = row.action
+            if row.object_id is not None:
+                obj_meta["object_id"] = row.object_id
+            if row.object_name is not None:
+                obj_meta["object_name"] = row.object_name
+            if row.match_type is not None:
+                obj_meta["match_type"] = row.match_type
             edges.append(
                 Edge(
                     type="object",
@@ -283,6 +311,7 @@ class SqliteGraphProvider:
                     to_tile=dest,
                     cost_ms=resolution.total_cost_ms,
                     node=ref,
+                    metadata=obj_meta,
                 )
             )
         edges.sort(key=lambda e: (e.node.id if e.node else -1, e.to_tile))
@@ -293,6 +322,8 @@ class SqliteGraphProvider:
         resolver = NodeChainResolver(self._db, self._cost_model, options)
         self._ensure_ifslot_cache()
         for row in self._ifslot_nodes_cache or []:
+            if self._is_non_head("ifslot", row.id):
+                continue
             ref = NodeRef("ifslot", row.id)
             resolution = resolver.resolve(ref)
             if not resolution.is_success or resolution.destination is None:
@@ -300,6 +331,16 @@ class SqliteGraphProvider:
             dest = self._select_dest_tile(resolution.destination, fallback_plane=tile[2])
             if dest is None:
                 continue
+            # Include interface interaction details
+            if_meta: dict[str, object] = {}
+            if row.interface_id is not None:
+                if_meta["interface_id"] = row.interface_id
+            if row.component_id is not None:
+                if_meta["component_id"] = row.component_id
+            if row.slot_id is not None:
+                if_meta["slot_id"] = row.slot_id
+            if row.click_id is not None:
+                if_meta["click_id"] = row.click_id
             edges.append(
                 Edge(
                     type="ifslot",
@@ -307,6 +348,7 @@ class SqliteGraphProvider:
                     to_tile=dest,
                     cost_ms=resolution.total_cost_ms,
                     node=ref,
+                    metadata=if_meta,
                 )
             )
         edges.sort(key=lambda e: (e.node.id if e.node else -1, e.to_tile))
@@ -317,6 +359,8 @@ class SqliteGraphProvider:
         resolver = NodeChainResolver(self._db, self._cost_model, options)
         seen: Set[Tuple[int, Tile]] = set()
         for row in self._db.iter_npc_nodes_touching(tile):
+            if self._is_non_head("npc", row.id):
+                continue
             ref = NodeRef("npc", row.id)
             resolution = resolver.resolve(ref)
             if not resolution.is_success or resolution.destination is None:
@@ -328,6 +372,16 @@ class SqliteGraphProvider:
             if key in seen:
                 continue
             seen.add(key)
+            # Attach NPC action metadata when present
+            npc_meta: dict[str, object] = {}
+            if row.action is not None:
+                npc_meta["action"] = row.action
+            if row.npc_id is not None:
+                npc_meta["npc_id"] = row.npc_id
+            if row.npc_name is not None:
+                npc_meta["npc_name"] = row.npc_name
+            if row.match_type is not None:
+                npc_meta["match_type"] = row.match_type
             edges.append(
                 Edge(
                     type="npc",
@@ -335,6 +389,7 @@ class SqliteGraphProvider:
                     to_tile=dest,
                     cost_ms=resolution.total_cost_ms,
                     node=ref,
+                    metadata=npc_meta,
                 )
             )
         edges.sort(key=lambda e: (e.node.id if e.node else -1, e.to_tile))
@@ -345,6 +400,8 @@ class SqliteGraphProvider:
         resolver = NodeChainResolver(self._db, self._cost_model, options)
         self._ensure_item_cache()
         for row in self._item_nodes_cache or []:
+            if self._is_non_head("item", row.id):
+                continue
             ref = NodeRef("item", row.id)
             resolution = resolver.resolve(ref)
             if not resolution.is_success or resolution.destination is None:
@@ -352,6 +409,12 @@ class SqliteGraphProvider:
             dest = self._select_dest_tile(resolution.destination, fallback_plane=tile[2])
             if dest is None:
                 continue
+            # Attach item action metadata when present
+            item_meta: dict[str, object] = {}
+            if row.action is not None:
+                item_meta["action"] = row.action
+            if row.item_id is not None:
+                item_meta["item_id"] = row.item_id
             edges.append(
                 Edge(
                     type="item",
@@ -359,6 +422,7 @@ class SqliteGraphProvider:
                     to_tile=dest,
                     cost_ms=resolution.total_cost_ms,
                     node=ref,
+                    metadata=item_meta,
                 )
             )
         edges.sort(key=lambda e: (e.node.id if e.node else -1, e.to_tile))
@@ -392,6 +456,57 @@ class SqliteGraphProvider:
             return
         self._item_nodes_cache = list(self._db.iter_item_nodes())
         self._item_nodes_cache.sort(key=lambda n: n.id)
+
+    # ------------------------------------------------------------------
+    # Chain-head filtering helpers
+    def _ensure_chain_head_index(self) -> None:
+        if self._chain_head_index_built:
+            return
+        non_head: Dict[str, Set[int]] = {}
+
+        def add_non_head(t: Optional[str], node_id: Optional[int]) -> None:
+            if t is None or node_id is None:
+                return
+            key = t.strip().lower()
+            non_head.setdefault(key, set()).add(int(node_id))
+
+        # Scan all tables for next_node references
+        try:
+            for row in self._db.iter_door_nodes():
+                add_non_head(getattr(row, "next_node_type", None), getattr(row, "next_node_id", None))
+        except Exception:
+            pass
+        try:
+            for row in self._db.iter_lodestone_nodes():
+                add_non_head(getattr(row, "next_node_type", None), getattr(row, "next_node_id", None))
+        except Exception:
+            pass
+        try:
+            for row in self._db.iter_object_nodes():
+                add_non_head(getattr(row, "next_node_type", None), getattr(row, "next_node_id", None))
+        except Exception:
+            pass
+        try:
+            for row in self._db.iter_ifslot_nodes():
+                add_non_head(getattr(row, "next_node_type", None), getattr(row, "next_node_id", None))
+        except Exception:
+            pass
+        try:
+            for row in self._db.iter_npc_nodes():
+                add_non_head(getattr(row, "next_node_type", None), getattr(row, "next_node_id", None))
+        except Exception:
+            pass
+        try:
+            for row in self._db.iter_item_nodes():
+                add_non_head(getattr(row, "next_node_type", None), getattr(row, "next_node_id", None))
+        except Exception:
+            pass
+
+        self._non_head_nodes = non_head
+        self._chain_head_index_built = True
+
+    def _is_non_head(self, node_type: str, node_id: int) -> bool:
+        return int(node_id) in self._non_head_nodes.get(node_type.strip().lower(), set())
 
 
 def _decode_allowed_mask(value: Optional[object]) -> int:

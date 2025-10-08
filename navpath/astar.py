@@ -147,6 +147,7 @@ def _reconstruct(end: Tile, parent: Dict[Tile, Tuple[Tile, Edge]]) -> Tuple[List
             to_tile=edge.to_tile,
             cost_ms=edge.cost_ms,
             node=edge.node,
+            metadata=edge.metadata,
         )
         actions.append(step)
         cur_from = edge.to_tile

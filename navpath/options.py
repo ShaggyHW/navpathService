@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-DEFAULT_MAX_EXPANSIONS = 250_000
-DEFAULT_TIMEOUT_MS = 1_000
+DEFAULT_MAX_EXPANSIONS = 250_000_000
+DEFAULT_TIMEOUT_MS = 1_000_000_000
 DEFAULT_MAX_CHAIN_DEPTH = 8
 
 

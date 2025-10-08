@@ -208,6 +208,14 @@ class Database:
         "FROM door_nodes WHERE (tile_inside_x = ? AND tile_inside_y = ? AND tile_inside_plane = ?) "
         "OR (tile_outside_x = ? AND tile_outside_y = ? AND tile_outside_plane = ?)"
     ))
+    _sql_all_doors: str = field(init=False, default=(
+        "SELECT id, direction, tile_inside_x, tile_inside_y, tile_inside_plane, "
+        "tile_outside_x, tile_outside_y, tile_outside_plane, "
+        "location_open_x, location_open_y, location_open_plane, "
+        "location_closed_x, location_closed_y, location_closed_plane, "
+        "real_id_open, real_id_closed, cost, open_action, next_node_type, next_node_id "
+        "FROM door_nodes"
+    ))
     _sql_lodestone_by_id: str = field(init=False, default=(
         "SELECT id, lodestone, dest_x, dest_y, dest_plane, cost, next_node_type, next_node_id "
         "FROM lodestone_nodes WHERE id = ?"
@@ -246,27 +254,49 @@ class Database:
         "SELECT id, item_id, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, next_node_type, next_node_id "
         "FROM item_nodes"
     ))
+    _sql_all_objects: str = field(init=False, default=(
+        "SELECT id, match_type, object_id, object_name, action, "
+        "dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
+        "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, "
+        "search_radius, cost, next_node_type, next_node_id "
+        "FROM object_nodes"
+    ))
+    _sql_all_npcs: str = field(init=False, default=(
+        "SELECT id, match_type, npc_id, npc_name, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
+        "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, search_radius, cost, next_node_type, next_node_id "
+        "FROM npc_nodes"
+    ))
     _sql_object_by_origin_tile: str = field(init=False, default=(
         "SELECT id, match_type, object_id, object_name, action, "
         "dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
         "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, "
         "search_radius, cost, next_node_type, next_node_id "
         "FROM object_nodes "
-        "WHERE orig_min_x IS NOT NULL AND orig_max_x IS NOT NULL "
-        "AND orig_min_y IS NOT NULL AND orig_max_y IS NOT NULL "
-        "AND ? BETWEEN orig_min_x AND orig_max_x "
-        "AND ? BETWEEN orig_min_y AND orig_max_y "
-        "AND (orig_plane IS NULL OR orig_plane = ?)"
+        "WHERE (" 
+        "  orig_min_x IS NOT NULL AND orig_max_x IS NOT NULL "
+        "  AND orig_min_y IS NOT NULL AND orig_max_y IS NOT NULL "
+        "  AND ? BETWEEN orig_min_x AND orig_max_x "
+        "  AND ? BETWEEN orig_min_y AND orig_max_y "
+        "  AND (orig_plane IS NULL OR orig_plane = ?)"
+        ") OR ("
+        "  orig_min_x IS NULL OR orig_max_x IS NULL "
+        "  OR orig_min_y IS NULL OR orig_max_y IS NULL"
+        ")"
     ))
     _sql_npc_by_origin_tile: str = field(init=False, default=(
         "SELECT id, match_type, npc_id, npc_name, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
         "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, search_radius, cost, next_node_type, next_node_id "
         "FROM npc_nodes "
-        "WHERE orig_min_x IS NOT NULL AND orig_max_x IS NOT NULL "
-        "AND orig_min_y IS NOT NULL AND orig_max_y IS NOT NULL "
-        "AND ? BETWEEN orig_min_x AND orig_max_x "
-        "AND ? BETWEEN orig_min_y AND orig_max_y "
-        "AND (orig_plane IS NULL OR orig_plane = ?)"
+        "WHERE ("
+        "  orig_min_x IS NOT NULL AND orig_max_x IS NOT NULL "
+        "  AND orig_min_y IS NOT NULL AND orig_max_y IS NOT NULL "
+        "  AND ? BETWEEN orig_min_x AND orig_max_x "
+        "  AND ? BETWEEN orig_min_y AND orig_max_y "
+        "  AND (orig_plane IS NULL OR orig_plane = ?)"
+        ") OR ("
+        "  orig_min_x IS NULL OR orig_max_x IS NULL "
+        "  OR orig_min_y IS NULL OR orig_max_y IS NULL"
+        ")"
     ))
 
     @classmethod
@@ -297,7 +327,9 @@ class Database:
     def iter_object_nodes_touching(self, tile: Tile) -> Iterator[ObjectNodeRow]:
         """Yield object nodes whose origin bounds include ``tile``.
 
-        Rows missing origin bounds are ignored by the query.
+        Also yields nodes with no origin bounds defined (any of
+        ``orig_min_x``, ``orig_max_x``, ``orig_min_y``, ``orig_max_y``
+        is NULL), treating them as usable from any tile.
         """
 
         x, y, plane = tile
@@ -339,6 +371,13 @@ class Database:
 
         params = (*tile, *tile)
         cursor = self.connection.execute(self._sql_door_by_tile, params)
+        for row in cursor:
+            yield _make_door_node(row)
+
+    def iter_door_nodes(self) -> Iterator[DoorNodeRow]:
+        """Yield all door nodes."""
+
+        cursor = self.connection.execute(self._sql_all_doors)
         for row in cursor:
             yield _make_door_node(row)
 
@@ -405,6 +444,33 @@ class Database:
             next_node_type=row["next_node_type"],
             next_node_id=row["next_node_id"],
         )
+
+    def iter_object_nodes(self) -> Iterator[ObjectNodeRow]:
+        """Yield all object nodes (full table scan)."""
+
+        cursor = self.connection.execute(self._sql_all_objects)
+        for row in cursor:
+            yield ObjectNodeRow(
+                id=row["id"],
+                match_type=row["match_type"],
+                object_id=row["object_id"],
+                object_name=row["object_name"],
+                action=row["action"],
+                dest_min_x=row["dest_min_x"],
+                dest_max_x=row["dest_max_x"],
+                dest_min_y=row["dest_min_y"],
+                dest_max_y=row["dest_max_y"],
+                dest_plane=row["dest_plane"],
+                orig_min_x=row["orig_min_x"],
+                orig_max_x=row["orig_max_x"],
+                orig_min_y=row["orig_min_y"],
+                orig_max_y=row["orig_max_y"],
+                orig_plane=row["orig_plane"],
+                search_radius=row["search_radius"],
+                cost=row["cost"],
+                next_node_type=row["next_node_type"],
+                next_node_id=row["next_node_id"],
+            )
 
     # -- ifslot helpers -----------------------------------------------
     def fetch_ifslot_node(self, node_id: int) -> Optional[IfslotNodeRow]:
@@ -479,8 +545,40 @@ class Database:
             next_node_id=row["next_node_id"],
         )
 
+    def iter_npc_nodes(self) -> Iterator[NpcNodeRow]:
+        """Yield all npc nodes (full table scan)."""
+
+        cursor = self.connection.execute(self._sql_all_npcs)
+        for row in cursor:
+            yield NpcNodeRow(
+                id=row["id"],
+                match_type=row["match_type"],
+                npc_id=row["npc_id"],
+                npc_name=row["npc_name"],
+                action=row["action"],
+                dest_min_x=row["dest_min_x"],
+                dest_max_x=row["dest_max_x"],
+                dest_min_y=row["dest_min_y"],
+                dest_max_y=row["dest_max_y"],
+                dest_plane=row["dest_plane"],
+                orig_min_x=row["orig_min_x"],
+                orig_max_x=row["orig_max_x"],
+                orig_min_y=row["orig_min_y"],
+                orig_max_y=row["orig_max_y"],
+                orig_plane=row["orig_plane"],
+                search_radius=row["search_radius"],
+                cost=row["cost"],
+                next_node_type=row["next_node_type"],
+                next_node_id=row["next_node_id"],
+            )
+
     def iter_npc_nodes_touching(self, tile: Tile) -> Iterator[NpcNodeRow]:
-        """Yield NPC nodes whose origin bounds include ``tile``."""
+        """Yield NPC nodes whose origin bounds include ``tile``.
+
+        Also yields nodes with no origin bounds defined (any of
+        ``orig_min_x``, ``orig_max_x``, ``orig_min_y``, ``orig_max_y``
+        is NULL), treating them as usable from any tile.
+        """
 
         x, y, plane = tile
         cursor = self.connection.execute(self._sql_npc_by_origin_tile, (x, y, plane))
