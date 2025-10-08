@@ -1,0 +1,21 @@
+{
+  "id": "approval_1759929198082_ma14bd825",
+  "title": "Requirements for astar-pathfinding (updated for item_nodes and next_node_type)",
+  "filePath": ".spec-workflow/specs/astar-pathfinding/requirements.md",
+  "type": "document",
+  "status": "needs-revision",
+  "createdAt": "2025-10-08T13:13:18.082Z",
+  "category": "spec",
+  "categoryName": "astar-pathfinding",
+  "response": "Feedback Summary (1 comments):\n\nGeneral Comments:\n1. The spec should leverage every nodes table available, including taking into consideration the next_node, since when that field is populated, it becomes a mandatory execution\n\n",
+  "annotations": "{\n  \"decision\": \"needs-revision\",\n  \"comments\": [\n    {\n      \"type\": \"general\",\n      \"comment\": \"The spec should leverage every nodes table available, including taking into consideration the next_node, since when that field is populated, it becomes a mandatory execution\",\n      \"timestamp\": \"2025-10-08T13:15:54.561Z\",\n      \"id\": \"comment_1759929354561_5wbv6vdar\"\n    }\n  ],\n  \"summary\": \"Feedback Summary (1 comments):\\n\\nGeneral Comments:\\n1. The spec should leverage every nodes table available, including taking into consideration the next_node, since when that field is populated, it becomes a mandatory execution\\n\\n\",\n  \"timestamp\": \"2025-10-08T13:15:56.730Z\"\n}",
+  "respondedAt": "2025-10-08T13:15:56.733Z",
+  "comments": [
+    {
+      "type": "general",
+      "comment": "The spec should leverage every nodes table available, including taking into consideration the next_node, since when that field is populated, it becomes a mandatory execution",
+      "timestamp": "2025-10-08T13:15:54.561Z",
+      "id": "comment_1759929354561_5wbv6vdar"
+    }
+  ]
+}

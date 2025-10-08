@@ -1,0 +1,39 @@
+{
+  "id": "approval_1759929463616_mchyfgpct",
+  "title": "Requirements for astar-pathfinding (all nodes + next_node chaining)",
+  "filePath": ".spec-workflow/specs/astar-pathfinding/requirements.md",
+  "type": "document",
+  "status": "needs-revision",
+  "createdAt": "2025-10-08T13:17:43.616Z",
+  "category": "spec",
+  "categoryName": "astar-pathfinding",
+  "response": "Feedback Summary (2 comments):\n\nSpecific Text Comments:\n1. \"### Requirement 1: Compute path with A*\n**User Sto...\": The A* should return not only the tiles, but also the node interactions required.\n2. \"### Requirement 4: API and I/O\n**User Story:** As ...\": Here we have the same thing, it should return a list of all actions not just the tiles\n",
+  "annotations": "{\n  \"decision\": \"needs-revision\",\n  \"comments\": [\n    {\n      \"type\": \"selection\",\n      \"comment\": \"The A* should return not only the tiles, but also the node interactions required.\",\n      \"timestamp\": \"2025-10-08T13:20:07.866Z\",\n      \"selectedText\": \"### Requirement 1: Compute path with A*\\n**User Story:** As a navigation client, I want to compute the optimal path between two tiles so that I can traverse the world efficiently and deterministically.\\n\\n#### Acceptance Criteria\\n1. WHEN given a valid `start=(x,y,plane)` and `goal=(x,y,plane)` that are connected, THEN the system SHALL return a path (list of `(x,y,plane)`), including both endpoints.\\n2. IF `start == goal` THEN the system SHALL return `[start]`.\\n3. IF no path exists, THEN the system SHALL return `None` or an empty list and a reason string (e.g., \\\"unreachable\\\").\\n4. The algorithm SHALL be A* with an admissible, consistent heuristic for 8-directional movement (octile distance) to ensure optimality.\\n5. The implementation SHALL be deterministic given identical inputs and configuration (including tie-breaking).\",\n      \"highlightColor\": {\n        \"bg\": \"rgba(255, 235, 59, 0.3)\",\n        \"border\": \"#FFEB3B\",\n        \"name\": \"#ffeb3b\"\n      },\n      \"id\": \"comment_1759929607866_77cvrp4hr\"\n    },\n    {\n      \"type\": \"selection\",\n      \"comment\": \"Here we have the same thing, it should return a list of all actions not just the tiles\",\n      \"timestamp\": \"2025-10-08T13:21:33.076Z\",\n      \"selectedText\": \"### Requirement 4: API and I/O\\n**User Story:** As a developer, I want a clear API I can call from services or scripts.\\n\\n#### Acceptance Criteria\\n1. Provide a function `find_path(start, goal, options=None) -> PathResult` in Python, where:\\n   - `start`, `goal`: `(x:int, y:int, plane:int)`\\n   - `options` may override costs and set maximum expansions and timeouts\\n   - `PathResult` includes: `path: list[tuple[int,int,int]] | None`, `reason: str | None`, `expanded: int`, `cost_ms: int`\\n2. Provide a thin CLI entrypoint: `python -m navpath.astar --start \\\"x,y,plane\\\" --goal \\\"x,y,plane\\\" [--json]` printing the path or a clear message.\\n3. The module SHALL open the DB at `worldReachableTiles.db` by default with an option to pass a different path.\\n4. The `options` structure SHALL allow enabling/disabling action edges by node type (e.g., `use_doors`, `use_lodestones`, `use_objects`, `use_ifslots`, `use_npcs`, `use_items`) and SHALL default to all enabled.\",\n      \"highlightColor\": {\n        \"bg\": \"rgba(255, 235, 59, 0.3)\",\n        \"border\": \"#FFEB3B\",\n        \"name\": \"#ffeb3b\"\n      },\n      \"id\": \"comment_1759929693076_en1p7i790\"\n    }\n  ],\n  \"summary\": \"Feedback Summary (2 comments):\\n\\nSpecific Text Comments:\\n1. \\\"### Requirement 1: Compute path with A*\\n**User Sto...\\\": The A* should return not only the tiles, but also the node interactions required.\\n2. \\\"### Requirement 4: API and I/O\\n**User Story:** As ...\\\": Here we have the same thing, it should return a list of all actions not just the tiles\\n\",\n  \"timestamp\": \"2025-10-08T13:21:35.212Z\"\n}",
+  "respondedAt": "2025-10-08T13:21:35.215Z",
+  "comments": [
+    {
+      "type": "selection",
+      "comment": "The A* should return not only the tiles, but also the node interactions required.",
+      "timestamp": "2025-10-08T13:20:07.866Z",
+      "selectedText": "### Requirement 1: Compute path with A*\n**User Story:** As a navigation client, I want to compute the optimal path between two tiles so that I can traverse the world efficiently and deterministically.\n\n#### Acceptance Criteria\n1. WHEN given a valid `start=(x,y,plane)` and `goal=(x,y,plane)` that are connected, THEN the system SHALL return a path (list of `(x,y,plane)`), including both endpoints.\n2. IF `start == goal` THEN the system SHALL return `[start]`.\n3. IF no path exists, THEN the system SHALL return `None` or an empty list and a reason string (e.g., \"unreachable\").\n4. The algorithm SHALL be A* with an admissible, consistent heuristic for 8-directional movement (octile distance) to ensure optimality.\n5. The implementation SHALL be deterministic given identical inputs and configuration (including tie-breaking).",
+      "highlightColor": {
+        "bg": "rgba(255, 235, 59, 0.3)",
+        "border": "#FFEB3B",
+        "name": "#ffeb3b"
+      },
+      "id": "comment_1759929607866_77cvrp4hr"
+    },
+    {
+      "type": "selection",
+      "comment": "Here we have the same thing, it should return a list of all actions not just the tiles",
+      "timestamp": "2025-10-08T13:21:33.076Z",
+      "selectedText": "### Requirement 4: API and I/O\n**User Story:** As a developer, I want a clear API I can call from services or scripts.\n\n#### Acceptance Criteria\n1. Provide a function `find_path(start, goal, options=None) -> PathResult` in Python, where:\n   - `start`, `goal`: `(x:int, y:int, plane:int)`\n   - `options` may override costs and set maximum expansions and timeouts\n   - `PathResult` includes: `path: list[tuple[int,int,int]] | None`, `reason: str | None`, `expanded: int`, `cost_ms: int`\n2. Provide a thin CLI entrypoint: `python -m navpath.astar --start \"x,y,plane\" --goal \"x,y,plane\" [--json]` printing the path or a clear message.\n3. The module SHALL open the DB at `worldReachableTiles.db` by default with an option to pass a different path.\n4. The `options` structure SHALL allow enabling/disabling action edges by node type (e.g., `use_doors`, `use_lodestones`, `use_objects`, `use_ifslots`, `use_npcs`, `use_items`) and SHALL default to all enabled.",
+      "highlightColor": {
+        "bg": "rgba(255, 235, 59, 0.3)",
+        "border": "#FFEB3B",
+        "name": "#ffeb3b"
+      },
+      "id": "comment_1759929693076_en1p7i790"
+    }
+  ]
+}

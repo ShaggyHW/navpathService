@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/astar-pathfinding/tasks.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2025-10-08T13:48:33.426Z",
+      "trigger": "initial",
+      "approvalId": "approval_1759931313424_5ml5cpmjf",
+      "approvalTitle": "Tasks for astar-pathfinding"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2025-10-08T14:00:53.307Z",
+      "trigger": "approved",
+      "approvalId": "approval_1759931313424_5ml5cpmjf",
+      "approvalTitle": "Tasks for astar-pathfinding"
+    }
+  ]
+}
