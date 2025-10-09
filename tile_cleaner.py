@@ -11,7 +11,8 @@ NODE_TABLES = [
     "object_nodes",
     "ifslot_nodes",
     "npc_nodes",
-    "item_nodes"
+    "item_nodes",
+    "requirements"
 ]
 
 

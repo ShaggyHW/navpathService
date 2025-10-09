@@ -1,0 +1,27 @@
+{
+  "id": "approval_1759967290585_0dhb0n72d",
+  "title": "Requirements v2: Requirements-aware Pathfinding (dynamic {key,value} JSON array)",
+  "filePath": ".spec-workflow/specs/requirements-aware-pathfinding/requirements.md",
+  "type": "document",
+  "status": "needs-revision",
+  "createdAt": "2025-10-08T23:48:10.585Z",
+  "category": "spec",
+  "categoryName": "requirements-aware-pathfinding",
+  "response": "Feedback Summary (1 comments):\n\nSpecific Text Comments:\n1. \"```json\n[\n  { \"key\": \"hasKey\", \"value\": 1 },\n  { \"...\": the value is always numerical in case of booleans use 0 / 1\n",
+  "annotations": "{\n  \"decision\": \"needs-revision\",\n  \"comments\": [\n    {\n      \"type\": \"selection\",\n      \"comment\": \"the value is always numerical in case of booleans use 0 / 1\",\n      \"timestamp\": \"2025-10-08T23:48:53.876Z\",\n      \"selectedText\": \"```json\\n[\\n  { \\\"key\\\": \\\"hasKey\\\", \\\"value\\\": 1 },\\n  { \\\"key\\\": \\\"questStage\\\", \\\"value\\\": 23 },\\n  { \\\"key\\\": \\\"spellUnlocked\\\", \\\"value\\\": true }\\n]\\n```\",\n      \"highlightColor\": {\n        \"bg\": \"rgba(255, 235, 59, 0.3)\",\n        \"border\": \"#FFEB3B\",\n        \"name\": \"#ffeb3b\"\n      },\n      \"id\": \"comment_1759967333876_325ky0owd\"\n    }\n  ],\n  \"summary\": \"Feedback Summary (1 comments):\\n\\nSpecific Text Comments:\\n1. \\\"```json\\n[\\n  { \\\"key\\\": \\\"hasKey\\\", \\\"value\\\": 1 },\\n  { \\\"...\\\": the value is always numerical in case of booleans use 0 / 1\\n\",\n  \"timestamp\": \"2025-10-08T23:48:56.146Z\"\n}",
+  "respondedAt": "2025-10-08T23:48:56.149Z",
+  "comments": [
+    {
+      "type": "selection",
+      "comment": "the value is always numerical in case of booleans use 0 / 1",
+      "timestamp": "2025-10-08T23:48:53.876Z",
+      "selectedText": "```json\n[\n  { \"key\": \"hasKey\", \"value\": 1 },\n  { \"key\": \"questStage\", \"value\": 23 },\n  { \"key\": \"spellUnlocked\", \"value\": true }\n]\n```",
+      "highlightColor": {
+        "bg": "rgba(255, 235, 59, 0.3)",
+        "border": "#FFEB3B",
+        "name": "#ffeb3b"
+      },
+      "id": "comment_1759967333876_325ky0owd"
+    }
+  ]
+}

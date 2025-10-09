@@ -10,7 +10,7 @@ import argparse
 import json
 import logging
 import sys
-from typing import Tuple
+from typing import Tuple, Dict, Any
 from pathlib import Path
 
 from .api import find_path
@@ -71,6 +71,28 @@ def _build_parser() -> argparse.ArgumentParser:
     # Logging
     p.add_argument("--log-level", default="INFO", choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"], help="Logging level")
 
+    # Requirements context (R3/R4)
+    p.add_argument(
+        "--requirements-file",
+        dest="requirements_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to JSON file with an array of {key:string, value:int|bool}. "
+            "Booleans are coerced to 1/0. When combined with --requirements-json, last-wins per key."
+        ),
+    )
+    p.add_argument(
+        "--requirements-json",
+        dest="requirements_json",
+        type=str,
+        default=None,
+        help=(
+            "JSON string of an array of {key:string, value:int|bool}. "
+            "Booleans coerced to 1/0. When combined with --requirements-file, last-wins per key."
+        ),
+    )
+
     # Defaults for toggles (enabled unless disabled)
     p.set_defaults(use_doors=True, use_lodestones=True, use_objects=True, use_ifslots=True, use_npcs=True, use_items=True)
 
@@ -104,7 +126,62 @@ def _options_from_args(args: argparse.Namespace) -> SearchOptions:
     opts.npc_cost_override = args.npc_cost
     opts.item_cost_override = args.item_cost
 
+    # Requirements ingestion (R3/R4)
+    req_map: Dict[str, int] = {}
+
+    if getattr(args, "requirements_file", None):
+        try:
+            text = Path(args.requirements_file).read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Failed to read --requirements-file: {args.requirements_file!r}: {exc}") from exc
+        try:
+            payload: Any = json.loads(text)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Invalid JSON in --requirements-file {args.requirements_file!r}: {exc}") from exc
+        _merge_requirements_payload(req_map, payload, source=f"--requirements-file {args.requirements_file}")
+
+    if getattr(args, "requirements_json", None):
+        try:
+            payload: Any = json.loads(args.requirements_json)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Invalid JSON in --requirements-json: {exc}") from exc
+        _merge_requirements_payload(req_map, payload, source="--requirements-json")
+
+    if req_map:
+        # Convert to an array of {key,value} per spec
+        opts.extras["requirements"] = [{"key": k, "value": v} for k, v in req_map.items()]
+
     return opts
+
+
+def _merge_requirements_payload(target: Dict[str, int], payload: Any, *, source: str) -> None:
+    """Validate and merge a requirements JSON payload into target map.
+
+    payload must be a list of {"key": string, "value": int|bool}.
+    Booleans are coerced to 1/0. Last-wins per key (later merges override).
+    Raises ValueError on invalid structure or types.
+    """
+
+    if not isinstance(payload, list):
+        raise ValueError(f"{source} must be a JSON array of objects; got {type(payload).__name__}")
+    for idx, item in enumerate(payload):
+        if not isinstance(item, dict):
+            raise ValueError(f"{source}[{idx}] must be an object with 'key' and 'value'")
+        key = item.get("key")
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"{source}[{idx}].key must be a non-empty string")
+        if "value" not in item:
+            raise ValueError(f"{source}[{idx}].value is required")
+        val = item["value"]
+        if isinstance(val, bool):
+            coerced = 1 if val else 0
+        elif isinstance(val, int):
+            coerced = val
+        else:
+            raise ValueError(
+                f"{source}[{idx}].value must be int or bool (coerced to 1/0); got {type(val).__name__}"
+            )
+        target[key] = int(coerced)
 
 
 def _format_human(result) -> str:
@@ -133,7 +210,12 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=getattr(logging, args.log_level))
 
-    options = _options_from_args(args)
+    try:
+        options = _options_from_args(args)
+    except ValueError as exc:
+        # Parse/validation error for requirements inputs
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
     result = find_path(args.start, args.goal, options=options, db_path=args.db)
 

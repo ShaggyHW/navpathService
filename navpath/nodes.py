@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Dict
 
 from .cost import CostModel
 from .db import (
@@ -19,6 +19,7 @@ from .db import (
 )
 from .options import SearchOptions
 from .path import NodeRef, Tile
+from .requirements import evaluate_requirement
 
 LOGGER = logging.getLogger(__name__)
 
@@ -149,6 +150,8 @@ class NodeChainResolver:
         self._cost_model = cost_model
         self._options = options or cost_model.options
         self._max_depth = self._options.max_chain_depth
+        # Build requirement context map from options.extras (prefer normalized map)
+        self._ctx_map: Dict[str, int] = self._build_ctx_map(self._options)
 
     def resolve(self, start: NodeRef) -> ChainResolution:
         """Resolve a chain beginning at ``start``.
@@ -198,6 +201,14 @@ class NodeChainResolver:
                 )
                 break
 
+            # Requirement gating per link: abort chain if unmet
+            req_id = getattr(row, "requirement_id", None)
+            if req_id is not None:
+                req = self._db.fetch_requirement(int(req_id))
+                if req is None or not evaluate_requirement(req, self._ctx_map):
+                    failure_reason = "requirement-unmet"
+                    break
+
             cost = self._node_cost(current_ref.type, row)
             destination = self._destination_bounds(current_ref.type, row)
             chain_link = ChainLink(ref=current_ref, cost_ms=cost, destination=destination, row=row)
@@ -228,6 +239,23 @@ class NodeChainResolver:
             destination=destination,
             failure_reason=failure_reason,
         )
+
+    def _build_ctx_map(self, options: SearchOptions) -> Dict[str, int]:
+        extras = options.extras if hasattr(options, "extras") and isinstance(options.extras, dict) else {}
+        ctx_map: Dict[str, int] = {}
+        req_map = extras.get("requirements_map")
+        if isinstance(req_map, dict):
+            for k, v in req_map.items():
+                if isinstance(k, str) and isinstance(v, int):
+                    ctx_map[k] = int(v)
+        elif isinstance(extras.get("requirements"), list):
+            for item in extras["requirements"]:
+                if isinstance(item, dict):
+                    k = item.get("key")
+                    v = item.get("value")
+                    if isinstance(k, str) and isinstance(v, int):
+                        ctx_map[k] = int(v)
+        return ctx_map
 
     def _normalise_type(self, node_type: str) -> str:
         return node_type.strip().lower()

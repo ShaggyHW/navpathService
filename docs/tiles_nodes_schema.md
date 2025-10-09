@@ -1,9 +1,9 @@
-# tiles.db Node Tables Schema
+# worldReachableTiles.db Node Tables Schema
 
-This document describes the structure of the node-related tables present in `tiles.db`.
+This document describes the structure of the node-related tables present in `worldReachableTiles.db`.
 
-- tables inspected: `door_nodes`, `lodestone_nodes`, `object_nodes`, `ifslot_nodes`, `npc_nodes`, `item_nodes`
-- inspection source: SQLite PRAGMA and schema introspection run against `tiles.db`
+- tables inspected: `door_nodes`, `lodestone_nodes`, `object_nodes`, `ifslot_nodes`, `npc_nodes`, `item_nodes`, plus supporting table `requirements`
+- inspection source: SQLite PRAGMA and schema introspection run against `worldReachableTiles.db`
 
 ## door_nodes
 
@@ -30,14 +30,14 @@ Represents door interaction nodes with details for both open and closed states.
   - `cost`: INTEGER, NULL
   - `next_node_type`: TEXT, NULL, CHECK IN ('object','npc','ifslot','door','lodestone','item')
   - `next_node_id`: INTEGER, NULL
+  - `requirement_id`: INTEGER, NULL, REFERENCES `requirements`(`id`)
 - **Constraints**
   - CHECK constraint on `direction` restricting values to 'IN' or 'OUT'
   - CHECK constraint on `next_node_type` restricting values to 'object','npc','ifslot','door','lodestone','item'
 - **Foreign Keys**
-  - None declared
+  - `requirement_id` REFERENCES `requirements`(`id`)
 - **Indexes**
-  - `idx_door_nodes_open` on (`real_id_open`)
-  - `idx_door_nodes_closed` on (`real_id_closed`)
+  - None declared
 
 ## lodestone_nodes
 
@@ -52,10 +52,11 @@ Represents lodestone teleport nodes and their destination coordinates.
   - `cost`: INTEGER, NULL
   - `next_node_type`: TEXT, NULL, CHECK IN ('object','npc','ifslot','door','lodestone','item')
   - `next_node_id`: INTEGER, NULL
+  - `requirement_id`: INTEGER, NULL, REFERENCES `requirements`(`id`)
 - **Constraints**
   - CHECK constraint on `next_node_type` restricting values to 'object','npc','ifslot','door','lodestone','item'
 - **Foreign Keys**
-  - None declared
+  - `requirement_id` REFERENCES `requirements`(`id`)
 - **Indexes**
   - None declared
 
@@ -83,14 +84,14 @@ Represents world object interaction nodes with support for matching by id or nam
   - `cost`: INTEGER, NULL
   - `next_node_type`: TEXT, NULL, CHECK IN ('object','npc','ifslot','door','lodestone','item')
   - `next_node_id`: INTEGER, NULL
+  - `requirement_id`: INTEGER, NULL, REFERENCES `requirements`(`id`)
 - **Constraints**
   - CHECK constraint on `match_type` restricting values to 'id', 'name', 'any'
   - CHECK constraint on `next_node_type` restricting values to 'object','npc','ifslot','door','lodestone','item'
 - **Foreign Keys**
-  - None declared
+  - `requirement_id` REFERENCES `requirements`(`id`)
 - **Indexes**
-  - `idx_object_nodes_name` on (`object_name`)
-  - `idx_object_nodes_id` on (`object_id`)
+  - None declared
 
 ## ifslot_nodes
 
@@ -110,12 +111,13 @@ Represents UI interaction nodes for interface/component/slot combinations and op
   - `cost`: INTEGER, NULL
   - `next_node_type`: TEXT, NULL, CHECK IN ('object','npc','ifslot','door','lodestone','item')
   - `next_node_id`: INTEGER, NULL
+  - `requirement_id`: INTEGER, NULL, REFERENCES `requirements`(`id`)
 - **Constraints**
   - CHECK constraint on `next_node_type` restricting values to 'object','npc','ifslot','door','lodestone','item'
 - **Foreign Keys**
-  - None declared
+  - `requirement_id` REFERENCES `requirements`(`id`)
 - **Indexes**
-  - `idx_ifslot_key` on composite key (`interface_id`, `component_id`, `slot_id`)
+  - None declared
 
 ## npc_nodes
 
@@ -141,14 +143,14 @@ Represents NPC interaction nodes with support for matching by id or name.
   - `orig_plane`: INTEGER, NULL
   - `next_node_type`: TEXT, NULL, CHECK IN ('object','npc','ifslot','door','lodestone','item')
   - `next_node_id`: INTEGER, NULL
+  - `requirement_id`: INTEGER, NULL, REFERENCES `requirements`(`id`)
 - **Constraints**
   - CHECK constraint on `match_type` restricting values to 'id', 'name', 'any'
   - CHECK constraint on `next_node_type` restricting values to 'object','npc','ifslot','door','lodestone','item'
 - **Foreign Keys**
-  - None declared
+  - `requirement_id` REFERENCES `requirements`(`id`)
 - **Indexes**
-  - `idx_npc_nodes_id` on (`npc_id`)
-  - `idx_npc_nodes_name` on (`npc_name`)
+  - None declared
 
 ## item_nodes
 
@@ -163,17 +165,36 @@ Represents item usage nodes that may trigger transitions to destination bounds.
   - `dest_min_y`: INTEGER, NULL
   - `dest_max_y`: INTEGER, NULL
   - `dest_plane`: INTEGER, NULL
+  - `cost`: INTEGER, NULL
   - `next_node_type`: TEXT, NULL, CHECK IN ('object','npc','ifslot','door','lodestone','item')
   - `next_node_id`: INTEGER, NULL
+  - `requirement_id`: INTEGER, NULL, REFERENCES `requirements`(`id`)
 - **Constraints**
   - CHECK constraint on `next_node_type` restricting values to 'object','npc','ifslot','door','lodestone','item'
 - **Foreign Keys**
-  - None declared
+  - `requirement_id` REFERENCES `requirements`(`id`)
 - **Indexes**
+  - None declared
+
+## requirements
+
+Represents requirement expressions referenced by node tables via `requirement_id`.
+
+- **Columns**
+  - `id`: INTEGER, PRIMARY KEY
+  - `metaInfo`: TEXT, NULL
+  - `key`: TEXT, NULL
+  - `value`: INTEGER, NULL
+  - `comparison`: TEXT, NULL
+ - **Foreign Keys**
+  - None declared
+ - **Indexes**
   - None declared
 
 ## Notes
 
-- There is no table named exactly `nodes` in `tiles.db`. Instead, node data is partitioned across the tables above. See also `tiles` for tile-level data.
-- No foreign key constraints are declared in these tables as per SQLite `PRAGMA foreign_key_list`.
+- There is no table named exactly `nodes` in `worldReachableTiles.db`. Instead, node data is partitioned across the tables above. See also `tiles` for tile-level data.
+- Foreign key references to `requirements(id)` are declared via the `requirement_id` column in each node table.
 - NOT NULLs, CHECK constraints, and defaults are captured directly from the schema.
+- The `requirements` comparison column will contain the following possible symbols '<', '=', '>', '<=', '>='.
+

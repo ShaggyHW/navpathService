@@ -17,7 +17,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from .cost import CostModel
 from .graph import Edge, GraphProvider
 from .options import SearchOptions
-from .path import ActionStep, PathResult, Tile
+from .path import ActionStep, PathResult, Tile, NodeRef
 
 
 @dataclass(slots=True)
@@ -141,15 +141,45 @@ def _reconstruct(end: Tile, parent: Dict[Tile, Tuple[Tile, Edge]]) -> Tuple[List
     actions: List[ActionStep] = []
     cur_from = rev_tiles[0]
     for edge in rev_edges:
-        step = ActionStep(
-            type=edge.type,
-            from_tile=cur_from,
-            to_tile=edge.to_tile,
-            cost_ms=edge.cost_ms,
-            node=edge.node,
-            metadata=edge.metadata,
-        )
-        actions.append(step)
-        cur_from = edge.to_tile
+        chain = []
+        try:
+            if isinstance(edge.metadata, dict):
+                chain = edge.metadata.get("chain") or []
+        except Exception:
+            chain = []
+
+        if chain:
+            # Emit each chain link as its own step. Intermediate links do not move tiles.
+            last_index = len(chain) - 1
+            for idx, link in enumerate(chain):
+                step_type = link.get("type", edge.type)
+                node_id = link.get("id")
+                link_meta = link.get("metadata", {}) if isinstance(link, dict) else {}
+                cost = int(link.get("cost_ms", 0)) if isinstance(link, dict) else 0
+
+                to_tile = edge.to_tile if idx == last_index else cur_from
+                step = ActionStep(
+                    type=step_type,
+                    from_tile=cur_from,
+                    to_tile=to_tile,
+                    cost_ms=cost,
+                    node=NodeRef(step_type, int(node_id)) if node_id is not None else edge.node,
+                    metadata=link_meta,
+                )
+                actions.append(step)
+            # After the last link, we've moved to edge.to_tile
+            cur_from = edge.to_tile
+        else:
+            # No chain: single step as before
+            step = ActionStep(
+                type=edge.type,
+                from_tile=cur_from,
+                to_tile=edge.to_tile,
+                cost_ms=edge.cost_ms,
+                node=edge.node,
+                metadata=edge.metadata,
+            )
+            actions.append(step)
+            cur_from = edge.to_tile
 
     return rev_tiles, actions, total_cost

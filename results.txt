@@ -594,8 +594,8 @@
         0
       ],
       "to":[
-        2953,
-        3146,
+        3024,
+        3218,
         0
       ],
       "cost_ms":600,
@@ -607,6 +607,78 @@
         "action":"Pay fare",
         "npc_id":376,
         "match_type":"id"
+      }
+    },
+    {
+      "type":"ifslot",
+      "from":[
+        3024,
+        3218,
+        0
+      ],
+      "to":[
+        3024,
+        3218,
+        0
+      ],
+      "cost_ms":0,
+      "node":{
+        "type":"ifslot",
+        "id":1
+      },
+      "metadata":{
+        "interface_id":1184,
+        "component_id":15,
+        "slot_id":-1,
+        "click_id":0
+      }
+    },
+    {
+      "type":"ifslot",
+      "from":[
+        3024,
+        3218,
+        0
+      ],
+      "to":[
+        3024,
+        3218,
+        0
+      ],
+      "cost_ms":0,
+      "node":{
+        "type":"ifslot",
+        "id":2
+      },
+      "metadata":{
+        "interface_id":1188,
+        "component_id":8,
+        "slot_id":-1,
+        "click_id":0
+      }
+    },
+    {
+      "type":"ifslot",
+      "from":[
+        3024,
+        3218,
+        0
+      ],
+      "to":[
+        2953,
+        3146,
+        0
+      ],
+      "cost_ms":0,
+      "node":{
+        "type":"ifslot",
+        "id":3
+      },
+      "metadata":{
+        "interface_id":1191,
+        "component_id":15,
+        "slot_id":-1,
+        "click_id":0
       }
     },
     {

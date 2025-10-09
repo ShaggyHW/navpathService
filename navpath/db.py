@@ -71,6 +71,7 @@ class DoorNodeRow:
     open_action: Optional[str]
     next_node_type: Optional[str]
     next_node_id: Optional[int]
+    requirement_id: Optional[int]
 
 
 @dataclass(slots=True)
@@ -83,6 +84,7 @@ class LodestoneNodeRow:
     cost: Optional[int]
     next_node_type: Optional[str]
     next_node_id: Optional[int]
+    requirement_id: Optional[int]
 
 
 @dataclass(slots=True)
@@ -108,6 +110,7 @@ class ObjectNodeRow:
     cost: Optional[int]
     next_node_type: Optional[str]
     next_node_id: Optional[int]
+    requirement_id: Optional[int]
 
 
 @dataclass(slots=True)
@@ -127,6 +130,7 @@ class IfslotNodeRow:
     cost: Optional[int]
     next_node_type: Optional[str]
     next_node_id: Optional[int]
+    requirement_id: Optional[int]
 
 
 @dataclass(slots=True)
@@ -152,6 +156,7 @@ class NpcNodeRow:
     cost: Optional[int]
     next_node_type: Optional[str]
     next_node_id: Optional[int]
+    requirement_id: Optional[int]
 
 
 @dataclass(slots=True)
@@ -169,6 +174,18 @@ class ItemNodeRow:
     cost: Optional[int]
     next_node_type: Optional[str]
     next_node_id: Optional[int]
+    requirement_id: Optional[int]
+
+
+@dataclass(slots=True)
+class RequirementRow:
+    """Typed view of ``requirements``."""
+
+    id: int
+    metaInfo: Optional[str]
+    key: Optional[str]
+    value: Optional[int]
+    comparison: Optional[str]
 
 
 NodeRow = Union[
@@ -196,7 +213,7 @@ class Database:
         "tile_outside_x, tile_outside_y, tile_outside_plane, "
         "location_open_x, location_open_y, location_open_plane, "
         "location_closed_x, location_closed_y, location_closed_plane, "
-        "real_id_open, real_id_closed, cost, open_action, next_node_type, next_node_id "
+        "real_id_open, real_id_closed, cost, open_action, next_node_type, next_node_id, requirement_id "
         "FROM door_nodes WHERE id = ?"
     ))
     _sql_door_by_tile: str = field(init=False, default=(
@@ -204,7 +221,7 @@ class Database:
         "tile_outside_x, tile_outside_y, tile_outside_plane, "
         "location_open_x, location_open_y, location_open_plane, "
         "location_closed_x, location_closed_y, location_closed_plane, "
-        "real_id_open, real_id_closed, cost, open_action, next_node_type, next_node_id "
+        "real_id_open, real_id_closed, cost, open_action, next_node_type, next_node_id, requirement_id "
         "FROM door_nodes WHERE (tile_inside_x = ? AND tile_inside_y = ? AND tile_inside_plane = ?) "
         "OR (tile_outside_x = ? AND tile_outside_y = ? AND tile_outside_plane = ?)"
     ))
@@ -213,64 +230,64 @@ class Database:
         "tile_outside_x, tile_outside_y, tile_outside_plane, "
         "location_open_x, location_open_y, location_open_plane, "
         "location_closed_x, location_closed_y, location_closed_plane, "
-        "real_id_open, real_id_closed, cost, open_action, next_node_type, next_node_id "
+        "real_id_open, real_id_closed, cost, open_action, next_node_type, next_node_id, requirement_id "
         "FROM door_nodes"
     ))
     _sql_lodestone_by_id: str = field(init=False, default=(
-        "SELECT id, lodestone, dest_x, dest_y, dest_plane, cost, next_node_type, next_node_id "
+        "SELECT id, lodestone, dest_x, dest_y, dest_plane, cost, next_node_type, next_node_id, requirement_id "
         "FROM lodestone_nodes WHERE id = ?"
     ))
     _sql_all_lodestones: str = field(init=False, default=(
-        "SELECT id, lodestone, dest_x, dest_y, dest_plane, cost, next_node_type, next_node_id "
+        "SELECT id, lodestone, dest_x, dest_y, dest_plane, cost, next_node_type, next_node_id, requirement_id "
         "FROM lodestone_nodes"
     ))
     _sql_object_by_id: str = field(init=False, default=(
         "SELECT id, match_type, object_id, object_name, action, "
         "dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
         "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, "
-        "search_radius, cost, next_node_type, next_node_id "
+        "search_radius, cost, next_node_type, next_node_id, requirement_id "
         "FROM object_nodes WHERE id = ?"
     ))
     _sql_ifslot_by_id: str = field(init=False, default=(
         "SELECT id, interface_id, component_id, slot_id, click_id, "
-        "dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, next_node_type, next_node_id "
+        "dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, next_node_type, next_node_id, requirement_id "
         "FROM ifslot_nodes WHERE id = ?"
     ))
     _sql_npc_by_id: str = field(init=False, default=(
         "SELECT id, match_type, npc_id, npc_name, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
-        "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, search_radius, cost, next_node_type, next_node_id "
+        "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, search_radius, cost, next_node_type, next_node_id, requirement_id "
         "FROM npc_nodes WHERE id = ?"
     ))
     _sql_item_by_id: str = field(init=False, default=(
-        "SELECT id, item_id, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, next_node_type, next_node_id "
+        "SELECT id, item_id, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, next_node_type, next_node_id, requirement_id "
         "FROM item_nodes WHERE id = ?"
     ))
     _sql_all_ifslots: str = field(init=False, default=(
         "SELECT id, interface_id, component_id, slot_id, click_id, "
-        "dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, next_node_type, next_node_id "
+        "dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, next_node_type, next_node_id, requirement_id "
         "FROM ifslot_nodes"
     ))
     _sql_all_items: str = field(init=False, default=(
-        "SELECT id, item_id, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, next_node_type, next_node_id "
+        "SELECT id, item_id, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, next_node_type, next_node_id, requirement_id "
         "FROM item_nodes"
     ))
     _sql_all_objects: str = field(init=False, default=(
         "SELECT id, match_type, object_id, object_name, action, "
         "dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
         "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, "
-        "search_radius, cost, next_node_type, next_node_id "
+        "search_radius, cost, next_node_type, next_node_id, requirement_id "
         "FROM object_nodes"
     ))
     _sql_all_npcs: str = field(init=False, default=(
         "SELECT id, match_type, npc_id, npc_name, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
-        "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, search_radius, cost, next_node_type, next_node_id "
+        "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, search_radius, cost, next_node_type, next_node_id, requirement_id "
         "FROM npc_nodes"
     ))
     _sql_object_by_origin_tile: str = field(init=False, default=(
         "SELECT id, match_type, object_id, object_name, action, "
         "dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
         "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, "
-        "search_radius, cost, next_node_type, next_node_id "
+        "search_radius, cost, next_node_type, next_node_id, requirement_id "
         "FROM object_nodes "
         "WHERE (" 
         "  orig_min_x IS NOT NULL AND orig_max_x IS NOT NULL "
@@ -285,7 +302,7 @@ class Database:
     ))
     _sql_npc_by_origin_tile: str = field(init=False, default=(
         "SELECT id, match_type, npc_id, npc_name, action, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, "
-        "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, search_radius, cost, next_node_type, next_node_id "
+        "orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane, search_radius, cost, next_node_type, next_node_id, requirement_id "
         "FROM npc_nodes "
         "WHERE ("
         "  orig_min_x IS NOT NULL AND orig_max_x IS NOT NULL "
@@ -297,6 +314,10 @@ class Database:
         "  orig_min_x IS NULL OR orig_max_x IS NULL "
         "  OR orig_min_y IS NULL OR orig_max_y IS NULL"
         ")"
+    ))
+
+    _sql_requirement_by_id: str = field(init=False, default=(
+        "SELECT id, metaInfo, key, value, comparison FROM requirements WHERE id = ?"
     ))
 
     @classmethod
@@ -355,6 +376,7 @@ class Database:
                 cost=row["cost"],
                 next_node_type=row["next_node_type"],
                 next_node_id=row["next_node_id"],
+                requirement_id=row["requirement_id"],
             )
 
     # -- door helpers -------------------------------------------------
@@ -395,6 +417,7 @@ class Database:
             cost=row["cost"],
             next_node_type=row["next_node_type"],
             next_node_id=row["next_node_id"],
+            requirement_id=row["requirement_id"],
         )
 
     def iter_lodestone_nodes(self) -> Iterator[LodestoneNodeRow]:
@@ -414,6 +437,7 @@ class Database:
                 cost=row["cost"],
                 next_node_type=row["next_node_type"],
                 next_node_id=row["next_node_id"],
+                requirement_id=row["requirement_id"],
             )
 
     # -- object helpers -----------------------------------------------
@@ -443,6 +467,7 @@ class Database:
             cost=row["cost"],
             next_node_type=row["next_node_type"],
             next_node_id=row["next_node_id"],
+            requirement_id=row["requirement_id"],
         )
 
     def iter_object_nodes(self) -> Iterator[ObjectNodeRow]:
@@ -470,6 +495,7 @@ class Database:
                 cost=row["cost"],
                 next_node_type=row["next_node_type"],
                 next_node_id=row["next_node_id"],
+                requirement_id=row["requirement_id"],
             )
 
     # -- ifslot helpers -----------------------------------------------
@@ -493,6 +519,7 @@ class Database:
             cost=row["cost"],
             next_node_type=row["next_node_type"],
             next_node_id=row["next_node_id"],
+            requirement_id=row["requirement_id"],
         )
 
     def iter_ifslot_nodes(self) -> Iterator[IfslotNodeRow]:
@@ -514,6 +541,7 @@ class Database:
                 cost=row["cost"],
                 next_node_type=row["next_node_type"],
                 next_node_id=row["next_node_id"],
+                requirement_id=row["requirement_id"],
             )
 
     # -- npc helpers --------------------------------------------------
@@ -543,6 +571,7 @@ class Database:
             cost=row["cost"],
             next_node_type=row["next_node_type"],
             next_node_id=row["next_node_id"],
+            requirement_id=row["requirement_id"],
         )
 
     def iter_npc_nodes(self) -> Iterator[NpcNodeRow]:
@@ -570,6 +599,7 @@ class Database:
                 cost=row["cost"],
                 next_node_type=row["next_node_type"],
                 next_node_id=row["next_node_id"],
+                requirement_id=row["requirement_id"],
             )
 
     def iter_npc_nodes_touching(self, tile: Tile) -> Iterator[NpcNodeRow]:
@@ -603,6 +633,7 @@ class Database:
                 cost=row["cost"],
                 next_node_type=row["next_node_type"],
                 next_node_id=row["next_node_id"],
+                requirement_id=row["requirement_id"],
             )
 
     # -- item helpers -------------------------------------------------
@@ -624,6 +655,7 @@ class Database:
             cost=row["cost"],
             next_node_type=row["next_node_type"],
             next_node_id=row["next_node_id"],
+            requirement_id=row["requirement_id"],
         )
 
     def iter_item_nodes(self) -> Iterator[ItemNodeRow]:
@@ -643,7 +675,26 @@ class Database:
                 cost=row["cost"],
                 next_node_type=row["next_node_type"],
                 next_node_id=row["next_node_id"],
+                requirement_id=row["requirement_id"],
             )
+
+    # -- requirements helpers ----------------------------------------
+    def fetch_requirement(self, requirement_id: int) -> Optional[RequirementRow]:
+        """Return a requirement row by primary key from ``requirements``.
+
+        This is read-only and parameterized.
+        """
+
+        row = self.connection.execute(self._sql_requirement_by_id, (requirement_id,)).fetchone()
+        if row is None:
+            return None
+        return RequirementRow(
+            id=row["id"],
+            metaInfo=row["metaInfo"],
+            key=row["key"],
+            value=row["value"],
+            comparison=row["comparison"],
+        )
 
     # -- generic dispatch --------------------------------------------
     def fetch_node(self, node_type: str, node_id: int) -> Optional[NodeRow]:
@@ -691,4 +742,5 @@ def _make_door_node(row: sqlite3.Row) -> DoorNodeRow:
         open_action=row["open_action"],
         next_node_type=row["next_node_type"],
         next_node_id=row["next_node_id"],
+        requirement_id=row["requirement_id"],
     )

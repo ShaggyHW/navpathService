@@ -1,0 +1,21 @@
+{
+  "id": "approval_1759967393527_wrpe38x86",
+  "title": "Requirements v3: Requirements-aware Pathfinding (numeric values, booleans 0/1)",
+  "filePath": ".spec-workflow/specs/requirements-aware-pathfinding/requirements.md",
+  "type": "document",
+  "status": "needs-revision",
+  "createdAt": "2025-10-08T23:49:53.527Z",
+  "category": "spec",
+  "categoryName": "requirements-aware-pathfinding",
+  "response": "Feedback Summary (1 comments):\n\nGeneral Comments:\n1. Should we accept a relaxed mode that coerces booleans true/false to 1/0 at CLI for convenience, while still storing integers? \nYes coerce true/false to integers, for dev ease of use.\n\nDefault policy is strict integers only.\nAny additional operators beyond = != < <= > >=?\n\nThose are the only available\n\n",
+  "annotations": "{\n  \"decision\": \"needs-revision\",\n  \"comments\": [\n    {\n      \"type\": \"general\",\n      \"comment\": \"Should we accept a relaxed mode that coerces booleans true/false to 1/0 at CLI for convenience, while still storing integers? \\nYes coerce true/false to integers, for dev ease of use.\\n\\nDefault policy is strict integers only.\\nAny additional operators beyond = != < <= > >=?\\n\\nThose are the only available\",\n      \"timestamp\": \"2025-10-08T23:51:48.381Z\",\n      \"id\": \"comment_1759967508381_9wp9f7a31\"\n    }\n  ],\n  \"summary\": \"Feedback Summary (1 comments):\\n\\nGeneral Comments:\\n1. Should we accept a relaxed mode that coerces booleans true/false to 1/0 at CLI for convenience, while still storing integers? \\nYes coerce true/false to integers, for dev ease of use.\\n\\nDefault policy is strict integers only.\\nAny additional operators beyond = != < <= > >=?\\n\\nThose are the only available\\n\\n\",\n  \"timestamp\": \"2025-10-08T23:51:50.118Z\"\n}",
+  "respondedAt": "2025-10-08T23:51:50.121Z",
+  "comments": [
+    {
+      "type": "general",
+      "comment": "Should we accept a relaxed mode that coerces booleans true/false to 1/0 at CLI for convenience, while still storing integers? \nYes coerce true/false to integers, for dev ease of use.\n\nDefault policy is strict integers only.\nAny additional operators beyond = != < <= > >=?\n\nThose are the only available",
+      "timestamp": "2025-10-08T23:51:48.381Z",
+      "id": "comment_1759967508381_9wp9f7a31"
+    }
+  ]
+}

@@ -11,6 +11,7 @@ from .db import Database, LodestoneNodeRow
 from .nodes import NodeChainResolver, Bounds2D
 from .options import SearchOptions
 from .path import NodeRef, StepType, Tile
+from .requirements import evaluate_requirement
 
 LOGGER = logging.getLogger(__name__)
 
@@ -93,12 +94,18 @@ class SqliteGraphProvider:
         # are NOT chain-heads and must not be invoked directly as starting nodes.
         self._non_head_nodes: Dict[str, Set[int]] = {}
         self._chain_head_index_built: bool = False
+        # Requirements gating state
+        self.req_filtered_count: int = 0
+        self._requirement_cache: Dict[int, object] = {}
 
     def neighbors(self, tile: Tile, goal: Tile, options: SearchOptions) -> Iterable[Edge]:
         """Return edges reachable from ``tile`` according to the options."""
 
         # Ensure we have computed chain-head restrictions before generating edges
         self._ensure_chain_head_index()
+
+        # Build requirement context map from options extras
+        ctx_map = self._build_ctx_map(options)
 
         tile_row = self._db.fetch_tile(*tile)
         if tile_row is None:
@@ -108,18 +115,18 @@ class SqliteGraphProvider:
         edges: List[Edge] = []
         edges.extend(self._movement_edges(tile, tile_row))
         if options.use_doors:
-            edges.extend(self._door_edges(tile))
+            edges.extend(self._door_edges(tile, ctx_map))
         if options.use_lodestones:
-            edges.extend(self._lodestone_edges(tile, options))
+            edges.extend(self._lodestone_edges(tile, options, ctx_map))
         # Action edges via portal semantics and chain resolution
         if options.use_objects:
-            edges.extend(self._object_edges(tile, options))
+            edges.extend(self._object_edges(tile, options, ctx_map))
         if options.use_ifslots:
-            edges.extend(self._ifslot_edges(tile, options))
+            edges.extend(self._ifslot_edges(tile, options, ctx_map))
         if options.use_npcs:
-            edges.extend(self._npc_edges(tile, options))
+            edges.extend(self._npc_edges(tile, options, ctx_map))
         if options.use_items:
-            edges.extend(self._item_edges(tile, options))
+            edges.extend(self._item_edges(tile, options, ctx_map))
         return edges
 
     # ------------------------------------------------------------------
@@ -158,10 +165,13 @@ class SqliteGraphProvider:
 
         return edges
 
-    def _door_edges(self, tile: Tile) -> List[Edge]:
+    def _door_edges(self, tile: Tile, ctx_map: Dict[str, int]) -> List[Edge]:
         edges: List[Edge] = []
         seen: Set[Tuple[Tile, int]] = set()
         for row in self._db.iter_door_nodes_touching(tile):
+            # Requirement gating (head-only)
+            if not self._passes_requirement(getattr(row, "requirement_id", None), ctx_map):
+                continue
             # Skip doors that are referenced by next_node (non-head)
             if self._is_non_head("door", row.id):
                 continue
@@ -208,7 +218,7 @@ class SqliteGraphProvider:
         edges.sort(key=lambda edge: (edge.to_tile, edge.node.id if edge.node else -1))
         return edges
 
-    def _lodestone_edges(self, tile: Tile, options: SearchOptions) -> List[Edge]:
+    def _lodestone_edges(self, tile: Tile, options: SearchOptions, ctx_map: Dict[str, int]) -> List[Edge]:
         self._ensure_lodestone_cache()
 
         # Only generate global lodestone teleports from the start tile. Since
@@ -226,6 +236,9 @@ class SqliteGraphProvider:
         for target in sorted(self._lodestone_nodes_cache or [], key=lambda node: node.id):
             # Skip lodestones that are referenced by next_node (non-head)
             if self._is_non_head("lodestone", target.id):
+                continue
+            # Requirement gating (head-only)
+            if not self._passes_requirement(getattr(target, "requirement_id", None), ctx_map):
                 continue
             if not self._lodestone_dest_valid.get(target.id, False):
                 LOGGER.debug(
@@ -276,11 +289,14 @@ class SqliteGraphProvider:
 
     # ------------------------------------------------------------------
     # Action edges (object/ifslot/npc/item) using NodeChainResolver
-    def _object_edges(self, tile: Tile, options: SearchOptions) -> List[Edge]:
+    def _object_edges(self, tile: Tile, options: SearchOptions, ctx_map: Dict[str, int]) -> List[Edge]:
         edges: List[Edge] = []
         resolver = NodeChainResolver(self._db, self._cost_model, options)
         seen: Set[Tuple[int, Tile]] = set()
         for row in self._db.iter_object_nodes_touching(tile):
+            # Requirement gating before resolving chains
+            if not self._passes_requirement(getattr(row, "requirement_id", None), ctx_map):
+                continue
             if self._is_non_head("object", row.id):
                 continue
             ref = NodeRef("object", row.id)
@@ -304,6 +320,8 @@ class SqliteGraphProvider:
                 obj_meta["object_name"] = row.object_name
             if row.match_type is not None:
                 obj_meta["match_type"] = row.match_type
+            # Embed chain sequence for output reconstruction
+            obj_meta["chain"] = self._build_chain_metadata(resolution)
             edges.append(
                 Edge(
                     type="object",
@@ -317,11 +335,14 @@ class SqliteGraphProvider:
         edges.sort(key=lambda e: (e.node.id if e.node else -1, e.to_tile))
         return edges
 
-    def _ifslot_edges(self, tile: Tile, options: SearchOptions) -> List[Edge]:
+    def _ifslot_edges(self, tile: Tile, options: SearchOptions, ctx_map: Dict[str, int]) -> List[Edge]:
         edges: List[Edge] = []
         resolver = NodeChainResolver(self._db, self._cost_model, options)
         self._ensure_ifslot_cache()
         for row in self._ifslot_nodes_cache or []:
+            # Requirement gating before resolving chains
+            if not self._passes_requirement(getattr(row, "requirement_id", None), ctx_map):
+                continue
             if self._is_non_head("ifslot", row.id):
                 continue
             ref = NodeRef("ifslot", row.id)
@@ -341,6 +362,8 @@ class SqliteGraphProvider:
                 if_meta["slot_id"] = row.slot_id
             if row.click_id is not None:
                 if_meta["click_id"] = row.click_id
+            # Embed chain sequence
+            if_meta["chain"] = self._build_chain_metadata(resolution)
             edges.append(
                 Edge(
                     type="ifslot",
@@ -354,11 +377,14 @@ class SqliteGraphProvider:
         edges.sort(key=lambda e: (e.node.id if e.node else -1, e.to_tile))
         return edges
 
-    def _npc_edges(self, tile: Tile, options: SearchOptions) -> List[Edge]:
+    def _npc_edges(self, tile: Tile, options: SearchOptions, ctx_map: Dict[str, int]) -> List[Edge]:
         edges: List[Edge] = []
         resolver = NodeChainResolver(self._db, self._cost_model, options)
         seen: Set[Tuple[int, Tile]] = set()
         for row in self._db.iter_npc_nodes_touching(tile):
+            # Requirement gating before resolving chains
+            if not self._passes_requirement(getattr(row, "requirement_id", None), ctx_map):
+                continue
             if self._is_non_head("npc", row.id):
                 continue
             ref = NodeRef("npc", row.id)
@@ -382,6 +408,8 @@ class SqliteGraphProvider:
                 npc_meta["npc_name"] = row.npc_name
             if row.match_type is not None:
                 npc_meta["match_type"] = row.match_type
+            # Embed chain sequence
+            npc_meta["chain"] = self._build_chain_metadata(resolution)
             edges.append(
                 Edge(
                     type="npc",
@@ -395,11 +423,14 @@ class SqliteGraphProvider:
         edges.sort(key=lambda e: (e.node.id if e.node else -1, e.to_tile))
         return edges
 
-    def _item_edges(self, tile: Tile, options: SearchOptions) -> List[Edge]:
+    def _item_edges(self, tile: Tile, options: SearchOptions, ctx_map: Dict[str, int]) -> List[Edge]:
         edges: List[Edge] = []
         resolver = NodeChainResolver(self._db, self._cost_model, options)
         self._ensure_item_cache()
         for row in self._item_nodes_cache or []:
+            # Requirement gating before resolving chains
+            if not self._passes_requirement(getattr(row, "requirement_id", None), ctx_map):
+                continue
             if self._is_non_head("item", row.id):
                 continue
             ref = NodeRef("item", row.id)
@@ -415,6 +446,8 @@ class SqliteGraphProvider:
                 item_meta["action"] = row.action
             if row.item_id is not None:
                 item_meta["item_id"] = row.item_id
+            # Embed chain sequence
+            item_meta["chain"] = self._build_chain_metadata(resolution)
             edges.append(
                 Edge(
                     type="item",
@@ -456,6 +489,70 @@ class SqliteGraphProvider:
             return
         self._item_nodes_cache = list(self._db.iter_item_nodes())
         self._item_nodes_cache.sort(key=lambda n: n.id)
+
+    def _build_chain_metadata(self, resolution: NodeChainResolver.resolve.__annotations__.get('return')) -> List[dict]:
+        """Convert a ChainResolution into a JSON-friendly chain list.
+
+        Each entry contains: {"type", "id", "cost_ms", "metadata"} with metadata
+        tailored to the node type.
+        """
+        chain: List[dict] = []
+        for link in resolution.links:
+            ltype = link.ref.type
+            meta: dict[str, object] = {}
+            row = link.row
+            # Attach per-type metadata similar to head edge construction
+            if ltype == "object":
+                if getattr(row, "action", None) is not None:
+                    meta["action"] = row.action
+                if getattr(row, "object_id", None) is not None:
+                    meta["object_id"] = row.object_id
+                if getattr(row, "object_name", None) is not None:
+                    meta["object_name"] = row.object_name
+                if getattr(row, "match_type", None) is not None:
+                    meta["match_type"] = row.match_type
+            elif ltype == "ifslot":
+                if getattr(row, "interface_id", None) is not None:
+                    meta["interface_id"] = row.interface_id
+                if getattr(row, "component_id", None) is not None:
+                    meta["component_id"] = row.component_id
+                if getattr(row, "slot_id", None) is not None:
+                    meta["slot_id"] = row.slot_id
+                if getattr(row, "click_id", None) is not None:
+                    meta["click_id"] = row.click_id
+            elif ltype == "npc":
+                if getattr(row, "action", None) is not None:
+                    meta["action"] = row.action
+                if getattr(row, "npc_id", None) is not None:
+                    meta["npc_id"] = row.npc_id
+                if getattr(row, "npc_name", None) is not None:
+                    meta["npc_name"] = row.npc_name
+                if getattr(row, "match_type", None) is not None:
+                    meta["match_type"] = row.match_type
+            elif ltype == "item":
+                if getattr(row, "action", None) is not None:
+                    meta["action"] = row.action
+                if getattr(row, "item_id", None) is not None:
+                    meta["item_id"] = row.item_id
+            elif ltype == "door":
+                if getattr(row, "direction", None) is not None:
+                    meta["door_direction"] = row.direction
+                if getattr(row, "real_id_open", None) is not None:
+                    meta["real_id_open"] = row.real_id_open
+                if getattr(row, "real_id_closed", None) is not None:
+                    meta["real_id_closed"] = row.real_id_closed
+                if getattr(row, "open_action", None) is not None:
+                    meta["action"] = row.open_action
+            elif ltype == "lodestone":
+                if getattr(row, "lodestone", None) is not None:
+                    meta["lodestone"] = row.lodestone
+            chain.append({
+                "type": ltype,
+                "id": link.ref.id,
+                "cost_ms": link.cost_ms,
+                "metadata": meta,
+            })
+        return chain
 
     # ------------------------------------------------------------------
     # Chain-head filtering helpers
@@ -507,6 +604,45 @@ class SqliteGraphProvider:
 
     def _is_non_head(self, node_type: str, node_id: int) -> bool:
         return int(node_id) in self._non_head_nodes.get(node_type.strip().lower(), set())
+
+    # ------------------------------------------------------------------
+    # Requirements helpers
+    def _build_ctx_map(self, options: SearchOptions) -> Dict[str, int]:
+        extras = options.extras if hasattr(options, "extras") and isinstance(options.extras, dict) else {}
+        # Prefer pre-normalized map from API
+        ctx_map = {}
+        req_map = extras.get("requirements_map")
+        if isinstance(req_map, dict):
+            for k, v in req_map.items():
+                if isinstance(k, str) and isinstance(v, int):
+                    ctx_map[k] = int(v)
+        elif isinstance(extras.get("requirements"), list):
+            for item in extras["requirements"]:
+                if isinstance(item, dict):
+                    k = item.get("key")
+                    v = item.get("value")
+                    if isinstance(k, str) and isinstance(v, int):
+                        ctx_map[k] = int(v)
+        return ctx_map
+
+    def _fetch_requirement_cached(self, requirement_id: int):
+        if requirement_id in self._requirement_cache:
+            return self._requirement_cache[requirement_id]
+        req = self._db.fetch_requirement(int(requirement_id))
+        self._requirement_cache[requirement_id] = req
+        return req
+
+    def _passes_requirement(self, requirement_id: Optional[int], ctx_map: Dict[str, int]) -> bool:
+        if requirement_id is None:
+            return True
+        req = self._fetch_requirement_cached(int(requirement_id))
+        if req is None:
+            self.req_filtered_count += 1
+            return False
+        ok = evaluate_requirement(req, ctx_map)
+        if not ok:
+            self.req_filtered_count += 1
+        return ok
 
 
 def _decode_allowed_mask(value: Optional[object]) -> int:

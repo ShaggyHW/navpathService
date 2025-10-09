@@ -66,6 +66,24 @@ def find_path(
         if not isinstance(opts.extras, dict):
             opts.extras = {}
         opts.extras["start_tile"] = start
+        # Normalize requirements list to a dict map for fast lookups (R3)
+        req_list = opts.extras.get("requirements")
+        if isinstance(req_list, list):
+            req_map: dict[str, int] = {}
+            for item in req_list:
+                try:
+                    # Expect objects with {key, value}
+                    key = item.get("key") if isinstance(item, dict) else None
+                    val = item.get("value") if isinstance(item, dict) else None
+                except Exception:
+                    key = None
+                    val = None
+                if isinstance(key, str) and key:
+                    # Only accept ints; upstream CLI coerces booleans to ints
+                    if isinstance(val, int):
+                        req_map[key] = int(val)
+            if req_map:
+                opts.extras["requirements_map"] = req_map
     except Exception:
         # Fallback safety: ensure extras exists
         opts.extras = {"start_tile": start}
@@ -79,7 +97,7 @@ def find_path(
         if db.fetch_tile(*start) is None or db.fetch_tile(*goal) is None:
             duration_ms = int((time.perf_counter_ns() - t0_ns) / 1_000_000)
             LOGGER.info(
-                "find_path metrics: start=%s goal=%s reason=%s expanded=%d path_len=%d total_cost_ms=%d duration_ms=%d db=%s",
+                "find_path metrics: start=%s goal=%s reason=%s expanded=%d path_len=%d total_cost_ms=%d duration_ms=%d req_filtered=%d db=%s",
                 start,
                 goal,
                 "tile-not-found",
@@ -87,6 +105,7 @@ def find_path(
                 0,
                 0,
                 duration_ms,
+                0,
                 str(effective_db_path),
             )
             return PathResult(path=None, actions=[], reason="tile-not-found", expanded=0, cost_ms=0)
@@ -96,10 +115,11 @@ def find_path(
 
         duration_ms = int((time.perf_counter_ns() - t0_ns) / 1_000_000)
         path_len = len(result.path) if result.path is not None else 0
+        req_filtered = getattr(graph, "req_filtered_count", 0)
 
         # Summary metrics (Requirement 5.3)
         LOGGER.info(
-            "find_path metrics: start=%s goal=%s reason=%s expanded=%d path_len=%d total_cost_ms=%d duration_ms=%d db=%s",
+            "find_path metrics: start=%s goal=%s reason=%s expanded=%d path_len=%d total_cost_ms=%d duration_ms=%d req_filtered=%d db=%s",
             start,
             goal,
             result.reason,
@@ -107,6 +127,7 @@ def find_path(
             path_len,
             result.cost_ms,
             duration_ms,
+            req_filtered,
             str(effective_db_path),
         )
         return result
