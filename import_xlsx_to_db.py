@@ -16,6 +16,7 @@ Usage:
   python import_xlsx_to_db.py --xlsx ImportSpreadSheet.xlsx [--db worldReachableTiles.db]
   python import_xlsx_to_db.py --xlsx ImportSpreadSheet.xlsx --dry-run
   python import_xlsx_to_db.py --xlsx ImportSpreadSheet.xlsx --truncate requirements door_nodes
+  python import_xlsx_to_db.py --xlsx "https://docs.google.com/spreadsheets/d/<sheet_id>/edit?gid=<gid>#gid=<gid>"
 
 Notes:
 - Requires: openpyxl (pip install openpyxl)
@@ -30,6 +31,10 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse, parse_qs
+from urllib.request import urlopen, Request
+import tempfile
+import os
 
 # Lazy import openpyxl with a friendly error if missing
 try:
@@ -41,6 +46,52 @@ except Exception as e:  # pragma: no cover
 ALLOWED_NEXT_NODE_TYPES = {"object", "npc", "ifslot", "door", "lodestone", "item"}
 ALLOWED_DOOR_DIRECTIONS = {"IN", "OUT"}
 ALLOWED_REQUIREMENT_COMPARISONS = {"=", "!=", "<", "<=", ">", ">="}
+
+
+def is_google_sheets_url(s: str) -> bool:
+    try:
+        p = urlparse(s)
+    except Exception:
+        return False
+    return (
+        p.scheme in {"http", "https"}
+        and "docs.google.com" in (p.netloc or "")
+        and "/spreadsheets/" in (p.path or "")
+    )
+
+
+def build_gsheet_export_url(doc_url: str) -> str:
+    p = urlparse(doc_url)
+    # Typical path: /spreadsheets/d/<sheet_id>/edit
+    parts = [seg for seg in (p.path or "").split("/") if seg]
+    sheet_id: Optional[str] = None
+    for i, seg in enumerate(parts):
+        if seg == "d" and i + 1 < len(parts):
+            sheet_id = parts[i + 1]
+            break
+    if not sheet_id:
+        raise ValueError("Unable to parse Google Sheets ID from URL")
+
+    query = parse_qs(p.query or "")
+    gid = query.get("gid", [None])[0]
+    base = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    if gid:
+        return f"{base}&gid={gid}"
+    return base
+
+
+def download_google_sheet_as_xlsx(doc_url: str) -> Path:
+    export_url = build_gsheet_export_url(doc_url)
+    req = Request(export_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req) as resp:
+        data = resp.read()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    try:
+        tmp.write(data)
+        tmp.flush()
+    finally:
+        tmp.close()
+    return Path(tmp.name)
 
 
 @dataclass
@@ -322,19 +373,37 @@ def import_workbook(xlsx_path: Path, db_path: Path, truncate: Sequence[str], dry
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import .xlsx worksheets into SQLite tables")
-    parser.add_argument("--xlsx", required=True, type=Path, help="Path to .xlsx file")
+    parser.add_argument("--xlsx", required=True, type=str, help="Path to .xlsx file or Google Sheets URL")
     parser.add_argument("--db", default=Path("worldReachableTiles.db"), type=Path, help="Path to SQLite DB (default: worldReachableTiles.db)")
     parser.add_argument("--dry-run", action="store_true", help="Parse and validate only; do not modify the DB")
     parser.add_argument("--truncate", nargs="*", default=[], help="Tables to DELETE FROM before inserting (by name, e.g., requirements door_nodes)")
     parser.add_argument("--sheets", nargs="*", default=None, help="Only import the specified sheets/tables")
     args = parser.parse_args()
 
-    if not args.xlsx.exists():
-        raise SystemExit(f"XLSX file not found: {args.xlsx}")
+    # Determine local path vs Google Sheets URL
+    downloaded_temp = False
+    if is_google_sheets_url(args.xlsx):
+        print("Downloading Google Sheet as .xlsx ...")
+        try:
+            xlsx_path = download_google_sheet_as_xlsx(args.xlsx)
+            downloaded_temp = True
+        except Exception as e:
+            raise SystemExit(f"Failed to download Google Sheet: {e}")
+    else:
+        xlsx_path = Path(args.xlsx)
+        if not xlsx_path.exists():
+            raise SystemExit(f"XLSX file not found: {xlsx_path}")
     if not args.db.exists():
         raise SystemExit(f"SQLite DB not found: {args.db}")
 
-    import_workbook(args.xlsx, args.db, args.truncate, args.dry_run, args.sheets)
+    try:
+        import_workbook(xlsx_path, args.db, args.truncate, args.dry_run, args.sheets)
+    finally:
+        if downloaded_temp:
+            try:
+                os.unlink(xlsx_path)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
