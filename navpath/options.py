@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 DEFAULT_MAX_EXPANSIONS = 250_000_000
 DEFAULT_TIMEOUT_MS = 1_000_000_000
-DEFAULT_MAX_CHAIN_DEPTH = 8
+DEFAULT_MAX_CHAIN_DEPTH = 20
 
 
 @dataclass(slots=True)

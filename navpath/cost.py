@@ -64,8 +64,25 @@ class CostModel:
         return self._with_override(self.options.item_cost_override, db_cost)
 
     def heuristic(self, current: Tile, goal: Tile) -> int:
-        """Return the admissible Chebyshev heuristic scaled by step cost."""
+        """Return an admissible heuristic.
 
+        When any non-movement edges (lodestones, objects, ifslots, NPCs, items)
+        are enabled, teleports/actions can reduce true path cost below the
+        Chebyshev movement distance, making distance-based heuristics
+        non-admissible. To guarantee optimality, fall back to Dijkstra
+        (h=0) in those cases. Otherwise, use Chebyshev distance scaled by
+        step cost for efficient movement-only searches.
+        """
+
+        opts = self.options
+        if (
+            getattr(opts, "use_lodestones", True)
+            or getattr(opts, "use_objects", True)
+            or getattr(opts, "use_ifslots", True)
+            or getattr(opts, "use_npcs", True)
+            or getattr(opts, "use_items", True)
+        ):
+            return 0
         return self.chebyshev_distance(current, goal) * self.step_cost_ms
 
     @staticmethod

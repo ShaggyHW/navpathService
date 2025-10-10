@@ -100,12 +100,12 @@ def astar(
             neighbor = edge.to_tile
             tentative_g = g + edge.cost_ms
 
-            # If visited with better or equal cost, skip
+            # Only proceed when we have found a strictly better path.
+            # We intentionally allow re-opening nodes even if they were
+            # previously closed, because heuristics that include teleports
+            # can be inconsistent. The pop-time check against g_score will
+            # discard stale entries safely.
             if tentative_g >= g_score.get(neighbor, inf):
-                continue
-
-            # Do not revisit nodes from closed with worse g
-            if closed.get(neighbor, False):
                 continue
 
             g_score[neighbor] = tentative_g
