@@ -175,10 +175,13 @@ class SqliteGraphProvider:
             # Skip doors that are referenced by next_node (non-head)
             if self._is_non_head("door", row.id):
                 continue
+            computed_dir: Optional[str] = None
             if tile == row.tile_inside:
                 dest = row.tile_outside
+                computed_dir = "OUT"
             elif tile == row.tile_outside:
                 dest = row.tile_inside
+                computed_dir = "IN"
             else:
                 continue
 
@@ -198,7 +201,8 @@ class SqliteGraphProvider:
 
             cost = self._cost_model.door_cost(row.cost)
             door_meta: dict[str, object] = {
-                "door_direction": row.direction,
+                "door_direction": (computed_dir or row.direction),
+                "db_door_direction": row.direction,
                 "real_id_open": row.real_id_open,
                 "real_id_closed": row.real_id_closed,
             }

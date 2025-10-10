@@ -60,7 +60,7 @@ class DoorNodeRow:
     """Typed view across the columns used from ``door_nodes``."""
 
     id: int
-    direction: str
+    direction: Optional[str]
     tile_inside: Tile
     tile_outside: Tile
     location_open: Tile
