@@ -1,9 +1,0 @@
-I've updated the database so that now we have a requirements table.
-
-We need to change the api so that when querying a path it takes into consideration the requirements.
-
-We also need for the command to take in a json (Format not determined yet), that will contain the data for the validation of requirements.
-
-For example we have a key and value, maybe the json just has a field with key and value as well, that is then used to compare with the values in the data base for the pathfinder to utilize or ignore. if a requirement isn't met it should ignore that node.
-
-If there is no data on the json for that req we should assume its not available and the node be ignored.
