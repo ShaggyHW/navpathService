@@ -45,6 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # IO
     p.add_argument("--db", type=str, default=None, help="Path to SQLite DB (defaults to worldReachableTiles.db)")
     p.add_argument("--json", action="store_true", help="Output result as JSON")
+    p.add_argument("--json-actions-only", action="store_true", help="Output only the actions array as JSON")
     p.add_argument("--out", "--output", dest="out_path", type=str, default=None, help="Write output to file instead of stdout")
 
     # Limits
@@ -219,7 +220,10 @@ def main(argv: list[str] | None = None) -> int:
 
     result = find_path(args.start, args.goal, options=options, db_path=args.db)
 
-    if args.json:
+    if getattr(args, "json_actions_only", False):
+        out_payload = [a.to_json_dict() for a in result.actions]
+        out_text = json.dumps(out_payload, separators=(",", ":"), indent=2) + "\n"
+    elif args.json:
         out_text = json.dumps(result.to_json_dict(), separators=(",", ":"), indent=2) + "\n"
     else:
         out_text = _format_human(result)

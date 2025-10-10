@@ -8,7 +8,7 @@ from typing import Optional
 from .options import SearchOptions
 from .path import Tile
 
-DEFAULT_STEP_COST_MS = 600
+DEFAULT_STEP_COST_MS = 100
 DEFAULT_NODE_COST_MS = 600
 
 

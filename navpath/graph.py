@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 
 from .cost import CostModel
@@ -204,6 +204,11 @@ class SqliteGraphProvider:
             }
             if getattr(row, "open_action", None) is not None:
                 door_meta["action"] = row.open_action
+            # Include full DB row data
+            try:
+                door_meta["db_row"] = asdict(row)
+            except Exception:
+                pass
             edges.append(
                 Edge(
                     type="door",
@@ -261,6 +266,8 @@ class SqliteGraphProvider:
                     metadata={
                         "lodestone": target.lodestone,
                         "target_lodestone": target.lodestone,
+                        # Include full DB row data
+                        "db_row": (asdict(target) if target is not None else {}),
                     },
                 )
             )
@@ -320,6 +327,11 @@ class SqliteGraphProvider:
                 obj_meta["object_name"] = row.object_name
             if row.match_type is not None:
                 obj_meta["match_type"] = row.match_type
+            # Include full DB row data
+            try:
+                obj_meta["db_row"] = asdict(row)
+            except Exception:
+                pass
             # Embed chain sequence for output reconstruction
             obj_meta["chain"] = self._build_chain_metadata(resolution)
             edges.append(
@@ -362,6 +374,11 @@ class SqliteGraphProvider:
                 if_meta["slot_id"] = row.slot_id
             if row.click_id is not None:
                 if_meta["click_id"] = row.click_id
+            # Include full DB row data
+            try:
+                if_meta["db_row"] = asdict(row)
+            except Exception:
+                pass
             # Embed chain sequence
             if_meta["chain"] = self._build_chain_metadata(resolution)
             edges.append(
@@ -408,6 +425,11 @@ class SqliteGraphProvider:
                 npc_meta["npc_name"] = row.npc_name
             if row.match_type is not None:
                 npc_meta["match_type"] = row.match_type
+            # Include full DB row data
+            try:
+                npc_meta["db_row"] = asdict(row)
+            except Exception:
+                pass
             # Embed chain sequence
             npc_meta["chain"] = self._build_chain_metadata(resolution)
             edges.append(
@@ -446,6 +468,11 @@ class SqliteGraphProvider:
                 item_meta["action"] = row.action
             if row.item_id is not None:
                 item_meta["item_id"] = row.item_id
+            # Include full DB row data
+            try:
+                item_meta["db_row"] = asdict(row)
+            except Exception:
+                pass
             # Embed chain sequence
             item_meta["chain"] = self._build_chain_metadata(resolution)
             edges.append(
@@ -546,6 +573,11 @@ class SqliteGraphProvider:
             elif ltype == "lodestone":
                 if getattr(row, "lodestone", None) is not None:
                     meta["lodestone"] = row.lodestone
+            # Include full DB row data for each link
+            try:
+                meta["db_row"] = asdict(row)
+            except Exception:
+                pass
             chain.append({
                 "type": ltype,
                 "id": link.ref.id,

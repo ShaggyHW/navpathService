@@ -67,10 +67,56 @@ class ActionStep:
     def to_json_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable dictionary for this action step."""
 
+        def _rect_from_tile(tile: Tile) -> Dict[str, List[int]]:
+            x, y, p = tile
+            return {"min": [x, y, p], "max": [x, y, p]}
+
+        def _rect_from_bounds(prefix: str, fallback_plane: int, row: Dict[str, Any]) -> Optional[Dict[str, List[int]]]:
+            try:
+                min_x = row.get(f"{prefix}_min_x")
+                max_x = row.get(f"{prefix}_max_x")
+                min_y = row.get(f"{prefix}_min_y")
+                max_y = row.get(f"{prefix}_max_y")
+                plane = row.get(f"{prefix}_plane")
+            except Exception:
+                return None
+            if (
+                isinstance(min_x, int)
+                and isinstance(max_x, int)
+                and isinstance(min_y, int)
+                and isinstance(max_y, int)
+            ):
+                p = plane if isinstance(plane, int) else fallback_plane
+                return {"min": [int(min_x), int(min_y), int(p)], "max": [int(max_x), int(max_y), int(p)]}
+            return None
+
+        db_row: Optional[Dict[str, Any]] = None
+        try:
+            if isinstance(self.metadata, dict):
+                maybe = self.metadata.get("db_row")
+                if isinstance(maybe, dict):
+                    db_row = maybe
+        except Exception:
+            db_row = None
+
+        from_rect = _rect_from_tile(self.from_tile)
+        to_rect = _rect_from_tile(self.to_tile)
+
+        if db_row is not None:
+            # Prefer explicit origin/destination bounds when provided by node rows
+            maybe_from = _rect_from_bounds("orig", self.from_tile[2], db_row)
+            if maybe_from is not None:
+                from_rect = maybe_from
+            # Only expand 'to' to destination bounds when the step actually moves
+            if self.from_tile != self.to_tile:
+                maybe_to = _rect_from_bounds("dest", self.to_tile[2], db_row)
+                if maybe_to is not None:
+                    to_rect = maybe_to
+
         payload = {
             "type": self.type,
-            "from": list(self.from_tile),
-            "to": list(self.to_tile),
+            "from": from_rect,
+            "to": to_rect,
             "cost_ms": self.cost_ms,
         }
         if self.node is not None:
