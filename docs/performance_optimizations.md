@@ -14,7 +14,7 @@ This document outlines actionable optimizations to speed up the pathfinding serv
 
 ## High-impact optimizations
 
-- **Tile existence fast-path (avoid per-neighbor DB lookups)**
+- **Tile existence fast-path (avoid per-neighbor DB lookups)** (COMPLETE)
   - Current: `SqliteGraphProvider._movement_edges()` calls `db.fetch_tile()` for each of up to 8 neighbors and `_select_dest_tile()` scans tiles via `db.fetch_tile()` inside loops.
   - Change: Build an in-memory existence map per plane once, using `Database.iter_tiles_by_plane(plane)`.
     - Add to `SqliteGraphProvider`: `_tile_exists(x, y, plane) -> bool` using `set[(x,y)]` or a compact bitset per plane.
