@@ -37,3 +37,4 @@ Desktop.ini
 /dist/
 /out/
 /node_modules/
+/target/
