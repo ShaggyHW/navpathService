@@ -36,7 +36,10 @@ This document describes how to run `navpath` as a long‑lived service to reuse 
       "db_path": "optional path to SQLite DB"
     }
     ```
-  - Response: `navpath/path.py::PathResult.to_json_dict()` (or actions‑only variant if `options.extras["actions_only"]` is set or a query flag is used).
+  - Response: `navpath/path.py::PathResult.to_json_dict()`
+    - Actions‑only variant supported when either body or query indicates it:
+      - Body: `options.extras["only_actions"]` or `options.extras["actions_only"]` is truthy
+      - Query: `?only_actions=true` (alias: `?actions_only=true`)
 
 - GET `/healthz`
   - Returns 200 if the process is up.
@@ -128,6 +131,42 @@ Response (condensed):
   "path": [[3200,3200,0], ...],
   "actions": [{"type": "move", ...}, {"type": "door", ...}]
 }
+```
+
+### Actions‑only responses
+
+If you only need the `actions` array (matching the Python behavior), request the actions‑only variant via query or body extras.
+
+Examples:
+
+```bash
+# Query flag (preferred)
+curl -s -X POST 'http://127.0.0.1:8080/find_path?only_actions=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"start":[3200,3200,0],"goal":[3210,3211,0]}' | jq
+
+# Query alias
+curl -s -X POST 'http://127.0.0.1:8080/find_path?actions_only=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"start":[3200,3200,0],"goal":[3210,3211,0]}' | jq
+
+# Body extras (boolean)
+curl -s -X POST http://127.0.0.1:8080/find_path \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start": [3200, 3200, 0],
+    "goal": [3210, 3211, 0],
+    "options": { "extras": { "only_actions": true } }
+  }' | jq
+
+# Body extras alias and coercion ("1" is accepted)
+curl -s -X POST http://127.0.0.1:8080/find_path \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start": [3200, 3200, 0],
+    "goal": [3210, 3211, 0],
+    "options": { "extras": { "actions_only": "1" } }
+  }' | jq
 ```
 
 ## Notes and trade‑offs

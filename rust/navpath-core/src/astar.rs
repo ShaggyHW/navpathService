@@ -5,6 +5,7 @@ use crate::cost::CostModel;
 use crate::graph::provider::{Edge as GEdge, GraphProvider};
 use crate::models::{ActionStep, NodeRef, Rect, Tile};
 use crate::options::SearchOptions;
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TileKey(i32, i32, i32);
@@ -17,6 +18,7 @@ struct CameFromEntry {
     edge_type: String,
     node: Option<NodeRef>,
     cost_ms: i64,
+    metadata: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -85,7 +87,7 @@ impl<'a, P: GraphProvider> AStar<'a, P> {
                 let best = g_score.get(&nk).copied();
                 if best.map(|bg| tentative_g < bg).unwrap_or(true) {
                     g_score.insert(nk, tentative_g);
-                    came_from.insert(nk, CameFromEntry { prev: qn.tile, edge_type: e.type_.clone(), node: e.node.clone(), cost_ms: e.cost_ms });
+                    came_from.insert(nk, CameFromEntry { prev: qn.tile, edge_type: e.type_.clone(), node: e.node.clone(), cost_ms: e.cost_ms, metadata: e.metadata.clone() });
                     let h = self.cost_model.heuristic(e.to_tile, goal);
                     seq += 1;
                     let f = tentative_g + h;
@@ -109,13 +111,40 @@ fn reconstruct(came_from: &HashMap<TileKey, CameFromEntry>, start: Tile, mut cur
         // Prepend tile
         tiles.push(prev);
         // Build action step for this edge
+        // Default rects are single-tile bounds
+        let mut from_rect = Rect { min: prev, max: prev };
+        let mut to_rect = Rect { min: current, max: current };
+        // If metadata carries a db_row with explicit orig/dest bounds, prefer those
+        if let Some(Value::Object(map)) = &entry.metadata {
+            if let Some(Value::Object(db_row)) = map.get("db_row") {
+                // Helper to read bounds prefix ("orig" or "dest")
+                let read_bounds = |prefix: &str, fallback_plane: i32| -> Option<Rect> {
+                    let k = |s: &str| format!("{}_{}", prefix, s);
+                    let min_x = db_row.get(&k("min_x")).and_then(Value::as_i64).map(|v| v as i32);
+                    let max_x = db_row.get(&k("max_x")).and_then(Value::as_i64).map(|v| v as i32);
+                    let min_y = db_row.get(&k("min_y")).and_then(Value::as_i64).map(|v| v as i32);
+                    let max_y = db_row.get(&k("max_y")).and_then(Value::as_i64).map(|v| v as i32);
+                    let plane = db_row.get(&k("plane")).and_then(Value::as_i64).map(|v| v as i32).unwrap_or(fallback_plane);
+                    match (min_x, max_x, min_y, max_y) {
+                        (Some(ax), Some(bx), Some(ay), Some(by)) => Some(Rect { min: [ax, ay, plane], max: [bx, by, plane] }),
+                        _ => None,
+                    }
+                };
+                // Use orig bounds for from_rect when available
+                if let Some(r) = read_bounds("orig", prev[2]) { from_rect = r; }
+                // Only expand to_rect when this step moves tiles
+                if prev != current {
+                    if let Some(r) = read_bounds("dest", current[2]) { to_rect = r; }
+                }
+            }
+        }
         let step = ActionStep {
             type_: entry.edge_type.clone(),
-            from_rect: Rect { min: prev, max: prev },
-            to_rect: Rect { min: current, max: current },
+            from_rect,
+            to_rect,
             cost_ms: entry.cost_ms,
             node: entry.node.clone(),
-            metadata: None,
+            metadata: entry.metadata.clone(),
         };
         actions.push(step);
         total_cost += entry.cost_ms;
@@ -137,7 +166,7 @@ mod tests {
             let mut edges = Vec::new();
             let [x,y,p] = tile;
             let to = [x+1,y,p];
-            edges.push(GEdge { type_: "move".into(), from_tile: tile, to_tile: to, cost_ms: 200, node: None });
+            edges.push(GEdge { type_: "move".into(), from_tile: tile, to_tile: to, cost_ms: 200, node: None, metadata: None });
             Ok(edges)
         }
     }
@@ -166,8 +195,8 @@ mod tests {
             fn neighbors(&self, tile: Tile, _goal: Tile, _options: &SearchOptions) -> rusqlite::Result<Vec<GEdge>> {
                 let [x,y,p] = tile;
                 Ok(vec![
-                    GEdge { type_: "move".into(), from_tile: tile, to_tile: [x+1,y,p], cost_ms: 200, node: None },
-                    GEdge { type_: "move".into(), from_tile: tile, to_tile: [x,y+1,p], cost_ms: 200, node: None },
+                    GEdge { type_: "move".into(), from_tile: tile, to_tile: [x+1,y,p], cost_ms: 200, node: None, metadata: None },
+                    GEdge { type_: "move".into(), from_tile: tile, to_tile: [x,y+1,p], cost_ms: 200, node: None, metadata: None },
                 ])
             }
         }

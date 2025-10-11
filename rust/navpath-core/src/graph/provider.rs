@@ -8,7 +8,7 @@ use crate::graph::touch_cache::TouchingNodesCache;
 use crate::models::{NodeRef, Tile};
 use crate::nodes::NodeChainResolver;
 use crate::options::SearchOptions;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edge {
@@ -17,6 +17,7 @@ pub struct Edge {
     pub to_tile: Tile,
     pub cost_ms: i64,
     pub node: Option<NodeRef>,
+    pub metadata: Option<Value>,
 }
 
 pub trait GraphProvider {
@@ -70,7 +71,14 @@ impl SqliteGraphProvider {
             let key = (r.id, dest);
             if !seen.insert(key) { continue; }
             let cost = res.total_cost_ms;
-            edges.push(Edge { type_: "object".into(), from_tile: tile, to_tile: dest, cost_ms: cost, node: Some(NodeRef { type_: "object".into(), id: r.id }) });
+            let meta = json!({
+                "action": r.action,
+                "object_id": r.object_id,
+                "object_name": r.object_name,
+                "match_type": r.match_type,
+                "db_row": &r,
+            });
+            edges.push(Edge { type_: "object".into(), from_tile: tile, to_tile: dest, cost_ms: cost, node: Some(NodeRef { type_: "object".into(), id: r.id }), metadata: Some(meta) });
         }
         edges.sort_by(|a, b| (
             a.node.as_ref().map(|n| n.id).unwrap_or(-1),
@@ -103,7 +111,12 @@ impl SqliteGraphProvider {
             let key = (r.id, dest);
             if !seen.insert(key) { continue; }
             let cost = res.total_cost_ms;
-            edges.push(Edge { type_: "item".into(), from_tile: tile, to_tile: dest, cost_ms: cost, node: Some(NodeRef { type_: "item".into(), id: r.id }) });
+            let meta = json!({
+                "action": r.action,
+                "item_id": r.item_id,
+                "db_row": &r,
+            });
+            edges.push(Edge { type_: "item".into(), from_tile: tile, to_tile: dest, cost_ms: cost, node: Some(NodeRef { type_: "item".into(), id: r.id }), metadata: Some(meta) });
         }
         edges.sort_by(|a, b| (
             a.node.as_ref().map(|n| n.id).unwrap_or(-1),
@@ -141,7 +154,14 @@ impl SqliteGraphProvider {
             let key = (r.id, dest);
             if !seen.insert(key) { continue; }
             let cost = res.total_cost_ms;
-            edges.push(Edge { type_: "npc".into(), from_tile: tile, to_tile: dest, cost_ms: cost, node: Some(NodeRef { type_: "npc".into(), id: r.id }) });
+            let meta = json!({
+                "action": r.action,
+                "npc_id": r.npc_id,
+                "npc_name": r.npc_name,
+                "match_type": r.match_type,
+                "db_row": &r,
+            });
+            edges.push(Edge { type_: "npc".into(), from_tile: tile, to_tile: dest, cost_ms: cost, node: Some(NodeRef { type_: "npc".into(), id: r.id }), metadata: Some(meta) });
         }
         edges.sort_by(|a, b| (
             a.node.as_ref().map(|n| n.id).unwrap_or(-1),
@@ -174,7 +194,14 @@ impl SqliteGraphProvider {
             let key = (r.id, dest);
             if !seen.insert(key) { continue; }
             let cost = res.total_cost_ms;
-            edges.push(Edge { type_: "ifslot".into(), from_tile: tile, to_tile: dest, cost_ms: cost, node: Some(NodeRef { type_: "ifslot".into(), id: r.id }) });
+            let meta = json!({
+                "interface_id": r.interface_id,
+                "component_id": r.component_id,
+                "slot_id": r.slot_id,
+                "click_id": r.click_id,
+                "db_row": &r,
+            });
+            edges.push(Edge { type_: "ifslot".into(), from_tile: tile, to_tile: dest, cost_ms: cost, node: Some(NodeRef { type_: "ifslot".into(), id: r.id }), metadata: Some(meta) });
         }
         edges.sort_by(|a, b| (
             a.node.as_ref().map(|n| n.id).unwrap_or(-1),
@@ -220,6 +247,7 @@ impl SqliteGraphProvider {
                 to_tile: dest,
                 cost_ms: cost,
                 node: None,
+                metadata: None,
             });
         }
         Ok(edges)
@@ -234,10 +262,10 @@ impl SqliteGraphProvider {
             if index.is_non_head("door", r.id) {
                 continue;
             }
-            let dest = if r.tile_inside == tile {
-                r.tile_outside
+            let (dest, computed_dir) = if r.tile_inside == tile {
+                (r.tile_outside, Some("OUT".to_string()))
             } else if r.tile_outside == tile {
-                r.tile_inside
+                (r.tile_inside, Some("IN".to_string()))
             } else {
                 continue;
             };
@@ -245,6 +273,14 @@ impl SqliteGraphProvider {
                 continue;
             }
             let cost = self.cost_model.door_cost(r.cost);
+            let meta = json!({
+                "door_direction": computed_dir.unwrap_or_else(|| r.direction.clone().unwrap_or_default()),
+                "db_door_direction": r.direction,
+                "real_id_open": r.real_id_open,
+                "real_id_closed": r.real_id_closed,
+                "action": r.open_action,
+                "db_row": &r,
+            });
             edges.push(Edge {
                 type_: "door".into(),
                 from_tile: tile,
@@ -254,6 +290,7 @@ impl SqliteGraphProvider {
                     type_: "door".into(),
                     id: r.id,
                 }),
+                metadata: Some(meta),
             });
         }
         // Deterministic sort by (to_tile, node id)
@@ -313,6 +350,11 @@ impl SqliteGraphProvider {
                 continue;
             }
             let cost = self.cost_model.lodestone_cost(r.cost);
+            let meta = json!({
+                "lodestone": r.lodestone,
+                "target_lodestone": r.lodestone,
+                "db_row": &r,
+            });
             edges.push(Edge {
                 type_: "lodestone".into(),
                 from_tile: tile,
@@ -322,6 +364,7 @@ impl SqliteGraphProvider {
                     type_: "lodestone".into(),
                     id: r.id,
                 }),
+                metadata: Some(meta),
             });
         }
 

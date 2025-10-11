@@ -1,4 +1,5 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
+use axum::extract::Query;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{error, info, info_span};
@@ -19,6 +20,12 @@ pub struct FindPathRequest {
     pub goal: Tile,
     pub options: Option<SearchOptions>,
     pub db_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FindPathQuery {
+    #[serde(default, alias = "actions_only")]
+    pub only_actions: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,7 +60,7 @@ async fn version() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"service_version": svc_version, "core_version": core_version})))
 }
 
-async fn find_path(State(state): State<AppState>, Json(req): Json<FindPathRequest>) -> impl IntoResponse {
+async fn find_path(State(state): State<AppState>, Query(params): Query<FindPathQuery>, Json(req): Json<FindPathRequest>) -> impl IntoResponse {
     let span = info_span!("find_path", db = req.db_path.as_deref().unwrap_or("<default>"));
     let _enter = span.enter();
 
@@ -77,6 +84,20 @@ async fn find_path(State(state): State<AppState>, Json(req): Json<FindPathReques
         Ok(res) => {
             let path_len = res.path.as_ref().map(|p| p.len()).unwrap_or(0);
             info!(reason=?res.reason, expanded=res.expanded, path_len, total_cost_ms=res.cost_ms, "find_path done");
+            // Check query flag OR body options.extras.only_actions for parity
+            let body_only_actions = {
+                let val = options.extras.get("only_actions").or_else(|| options.extras.get("actions_only"));
+                val.map(|v| {
+                    v.as_bool()
+                        .unwrap_or_else(|| {
+                            if let Some(n) = v.as_i64() { n == 1 } else { false }
+                        })
+                        || v.as_str().map(|s| s.eq_ignore_ascii_case("true") || s == "1").unwrap_or(false)
+                }).unwrap_or(false)
+            };
+            if params.only_actions || body_only_actions {
+                return (StatusCode::OK, Json(res.actions)).into_response();
+            }
             (StatusCode::OK, Json(res)).into_response()
         }
         Err(e) => {

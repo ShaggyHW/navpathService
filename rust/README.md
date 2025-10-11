@@ -156,3 +156,126 @@ rust/
     ├── src/
     └── Cargo.toml
 ```
+
+## API schemas
+
+- **FindPathRequest** (`rust/navpath-service/src/routes.rs`):
+  ```json
+  {
+    "start": [x, y, plane],
+    "goal": [x, y, plane],
+    "options": { /* optional; see SearchOptions */ },
+    "db_path": "/optional/override.db"
+  }
+  ```
+- **SearchOptions** (`rust/navpath-core/src/options.rs`) defaults:
+  - `use_doors=true`
+  - `use_lodestones=true`
+  - `use_objects=true`
+  - `use_ifslots=true`
+  - `use_npcs=true`
+  - `use_items=true`
+  - `max_expansions=1000000`
+  - `timeout_ms=5000`
+  - `max_chain_depth=5000`
+  - Cost overrides (if present): `door=600`, `lodestone=17000`, `object=2000`, `ifslot=1000`, `npc=1000`, `item=3000`
+  - `extras` map (the service injects `start_tile=[sx,sy,sp]` automatically)
+
+#### Requirements context (for requirement-gated nodes)
+
+Provide player/context stats via `options.extras` so requirement checks can pass:
+
+- Preferred: `extras.requirements_map` as an object map of key → integer value
+  ```json
+  {
+    "options": {
+      "extras": {
+        "requirements_map": { "magic": 55, "agility": 60 }
+      }
+    }
+  }
+  ```
+- Alternative: `extras.requirements` as an array of `{key, value}` pairs
+  ```json
+  {
+    "options": {
+      "extras": {
+        "requirements": [
+          { "key": "magic", "value": 55 },
+          { "key": "agility", "value": 60 }
+        ]
+      }
+    }
+  }
+  ```
+
+Notes:
+- Keys must match the `requirements.key` values in the DB. Comparisons are defined in the DB (`==`, `!=`, `>=`, `>`, `<=`, `<`).
+- If a DB requirement has no key or value, it is treated as passed. If a key is missing from the provided context, that requirement fails.
+
+- **PathResult** (`rust/navpath-core/src/models.rs`):
+  ```json
+  {
+    "path": [[x,y,plane], ...] | null,
+    "actions": [
+      {
+        "type": "move|door|lodestone|object|ifslot|npc|item",
+        "from": { "min": [x,y,p], "max": [x2,y2,p2] },
+        "to":   { "min": [x,y,p], "max": [x2,y2,p2] },
+        "cost_ms": 0,
+        "node": { "type": "door|...", "id": 123 } | null,
+        "metadata": { /* omitted when empty */ }
+      }
+    ],
+    "reason": "string or null",
+    "expanded": 0,
+    "cost_ms": 0
+  }
+  ```
+
+### Example response
+```json
+{
+  "path": [[3200,3200,0],[3201,3200,0]],
+  "actions": [
+    {
+      "type": "move",
+      "from": { "min": [3200,3200,0], "max": [3200,3200,0] },
+      "to":   { "min": [3201,3200,0], "max": [3201,3200,0] },
+      "cost_ms": 600
+    }
+  ],
+  "reason": null,
+  "expanded": 42,
+  "cost_ms": 5
+}
+```
+
+## Error responses
+
+- **/readyz** with no `NAVPATH_DB` set: `503` body `{"ready": false, "error": "..."}`
+- **/find_path** errors (e.g., missing DB): `500` body `{"error": "..."}`
+
+## Provider and DB management
+
+- **Default DB** comes from `NAVPATH_DB` (`rust/navpath-service/src/config.rs`).
+- **Per-request override** via `db_path` in the request body.
+- Providers are managed by `ProviderManager` (`rust/navpath-service/src/provider_manager.rs`): one long-lived `SqliteGraphProvider` per DB path with internal caches. Use `GET /readyz` once after startup to warm the default provider.
+
+## Production build and run
+
+```bash
+cargo build -p navpath-service --release
+./target/release/navpath-service
+```
+
+## Troubleshooting
+
+- **No DB configured**: set `NAVPATH_DB` or pass `db_path` in the request. Error message will include: "no db_path provided and NAVPATH_DB not set".
+- **Bind address in use**: change `NAVPATH_PORT` or stop the conflicting process.
+- **Validate service is up**:
+  ```bash
+  curl -s http://127.0.0.1:8080/healthz
+  curl -s http://127.0.0.1:8080/version | jq
+  ```
+

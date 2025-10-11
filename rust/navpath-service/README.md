@@ -63,6 +63,9 @@ Request shape matches `FindPathRequest` in `rust/navpath-service/src/routes.rs`:
 - `options` fields correspond to `SearchOptions` in `rust/navpath-core/src/options.rs`.
 - If `db_path` is omitted, the default `NAVPATH_DB` is used.
 - The service injects `options.extras["start_tile"] = [start_x, start_y, start_plane]` automatically for provider gating.
+- Actions-only variant is supported when either body or query indicates it:
+  - Body: `options.extras["only_actions"]` or `options.extras["actions_only"]` is truthy
+  - Query: `?only_actions=true` (alias: `?actions_only=true`)
 
 Examples:
 ```bash
@@ -96,6 +99,40 @@ curl -s -X POST http://127.0.0.1:8080/find_path \
       "item_cost_override": 3000,
       "extras": {}
     }
+  }' | jq
+```
+
+### Actions-only responses
+
+If you only need the `actions` array, request the actions-only variant via query or body extras.
+
+```bash
+# Query flag (preferred)
+curl -s -X POST 'http://127.0.0.1:8080/find_path?only_actions=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"start":[3200,3200,0],"goal":[3210,3211,0]}' | jq
+
+# Query alias
+curl -s -X POST 'http://127.0.0.1:8080/find_path?actions_only=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"start":[3200,3200,0],"goal":[3210,3211,0]}' | jq
+
+# Body extras (boolean)
+curl -s -X POST http://127.0.0.1:8080/find_path \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start": [3200, 3200, 0],
+    "goal": [3210, 3211, 0],
+    "options": { "extras": { "only_actions": true } }
+  }' | jq
+
+# Body extras alias and coercion ("1" is accepted)
+curl -s -X POST http://127.0.0.1:8080/find_path \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start": [3200, 3200, 0],
+    "goal": [3210, 3211, 0],
+    "options": { "extras": { "actions_only": "1" } }
   }' | jq
 ```
 
