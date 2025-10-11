@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 
@@ -68,6 +69,61 @@ _MOVEMENT_ORDER: Sequence[str] = (
 _MOVEMENT_BY_NAME = {movement.name: movement for movement in _MOVEMENTS}
 
 
+# Precompute fast lookup from 8-bit tiledata (RuneApps collision bits)
+# to this module's movement bitmask. The external tiledata mapping is:
+#   bit0=west, bit1=north, bit2=east, bit3=south,
+#   bit4=northwest, bit5=northeast, bit6=southeast, bit7=southwest
+# Our internal bit positions are bound to _MOVEMENTS definitions.
+def _build_tiledata_lookup() -> tuple[int, ...]:
+    table = [0] * 256
+    b_west = _MOVEMENT_BY_NAME["west"].bit
+    b_north = _MOVEMENT_BY_NAME["north"].bit
+    b_east = _MOVEMENT_BY_NAME["east"].bit
+    b_south = _MOVEMENT_BY_NAME["south"].bit
+    b_northwest = _MOVEMENT_BY_NAME["northwest"].bit
+    b_northeast = _MOVEMENT_BY_NAME["northeast"].bit
+    b_southeast = _MOVEMENT_BY_NAME["southeast"].bit
+    b_southwest = _MOVEMENT_BY_NAME["southwest"].bit
+    for v in range(256):
+        m = 0
+        if v & (1 << 0):
+            m |= b_west
+        if v & (1 << 1):
+            m |= b_north
+        if v & (1 << 2):
+            m |= b_east
+        if v & (1 << 3):
+            m |= b_south
+        if v & (1 << 4):
+            m |= b_northwest
+        if v & (1 << 5):
+            m |= b_northeast
+        if v & (1 << 6):
+            m |= b_southeast
+        if v & (1 << 7):
+            m |= b_southwest
+        table[v] = m
+    return tuple(table)
+
+
+_TILEDATA_TO_MASK: tuple[int, ...] = _build_tiledata_lookup()
+
+
+def _mask_from_tiledata(value: Optional[object]) -> Optional[int]:
+    """Return internal movement mask mapped from 8-bit tiledata, or None.
+
+    Accepts ints or numeric-like values; returns None if value is None or not
+    coercible to int. Values are masked to 0..255.
+    """
+    if value is None:
+        return None
+    try:
+        iv = int(value) & 0xFF
+    except Exception:
+        return None
+    return _TILEDATA_TO_MASK[iv]
+
+
 class TileNotFoundError(LookupError):
     """Raised when neighbor generation is attempted for a missing tile."""
 
@@ -97,6 +153,10 @@ class SqliteGraphProvider:
         # Requirements gating state
         self.req_filtered_count: int = 0
         self._requirement_cache: Dict[int, object] = {}
+        # Per-plane tile existence cache (x,y) set with small LRU eviction
+        self._plane_tile_sets: Dict[int, Set[Tuple[int, int]]] = {}
+        self._plane_lru: "OrderedDict[int, None]" = OrderedDict()
+        self._plane_cache_capacity: int = 8
 
     def neighbors(self, tile: Tile, goal: Tile, options: SearchOptions) -> Iterable[Edge]:
         """Return edges reachable from ``tile`` according to the options."""
@@ -131,7 +191,10 @@ class SqliteGraphProvider:
 
     # ------------------------------------------------------------------
     def _movement_edges(self, tile: Tile, tile_row) -> List[Edge]:
-        mask = _decode_allowed_mask(tile_row.allowed_directions)
+        # Prefer integer tiledata mapping for performance; fallback to legacy
+        # allowed_directions parsing when tiledata is absent.
+        td_mask = _mask_from_tiledata(getattr(tile_row, "tiledata", None))
+        mask = td_mask if td_mask is not None else _decode_allowed_mask(tile_row.allowed_directions)
         if mask == 0:
             return []
 
@@ -145,7 +208,7 @@ class SqliteGraphProvider:
                 tile[1] + movement.delta[1],
                 tile[2] + movement.delta[2],
             )
-            if self._db.fetch_tile(*dest) is None:
+            if not self._tile_exists(dest[0], dest[1], dest[2]):
                 LOGGER.debug(
                     "Skipping movement %s from %s due to missing destination tile %s",
                     movement.name,
@@ -505,9 +568,47 @@ class SqliteGraphProvider:
         for x in range(bounds.min_x, bounds.max_x + 1):
             for y in range(bounds.min_y, bounds.max_y + 1):
                 candidate = (x, y, plane)
-                if self._db.fetch_tile(*candidate) is not None:
+                if self._tile_exists(candidate[0], candidate[1], candidate[2]):
                     return candidate
         return None
+
+    # ------------------------------------------------------------------
+    # Tile existence cache
+    def _tile_exists(self, x: int, y: int, plane: int) -> bool:
+        """Fast-path existence check using a per-plane (x,y) set.
+
+        Lazily builds the set for the plane on first use via
+        ``Database.iter_tiles_by_plane`` and keeps a small LRU of planes.
+        """
+        self._ensure_plane_tile_set(plane)
+        s = self._plane_tile_sets.get(plane)
+        return (x, y) in s if s is not None else False
+
+    def _ensure_plane_tile_set(self, plane: int) -> None:
+        # Cache hit: refresh LRU order
+        if plane in self._plane_tile_sets:
+            try:
+                self._plane_lru.move_to_end(plane)
+            except Exception:
+                pass
+            return
+        # Build the set from DB stream
+        tiles: Set[Tuple[int, int]] = set()
+        try:
+            for row in self._db.iter_tiles_by_plane(plane):
+                tiles.add((row.x, row.y))
+        except Exception:
+            tiles = set()
+        self._plane_tile_sets[plane] = tiles
+        self._plane_lru[plane] = None
+        # Enforce LRU capacity
+        if len(self._plane_lru) > self._plane_cache_capacity:
+            try:
+                evict_plane = next(iter(self._plane_lru))
+                self._plane_lru.pop(evict_plane, None)
+                self._plane_tile_sets.pop(evict_plane, None)
+            except StopIteration:
+                pass
 
     def _ensure_ifslot_cache(self) -> None:
         if self._ifslot_nodes_cache is not None:

@@ -1,17 +1,35 @@
-# worldReachableTiles.db Node Tables Schema
+# worldReachableTiles.db Schema (Tiles and Node Tables)
 
-This document describes the structure of the node-related tables present in `worldReachableTiles.db`.
+This document describes the structure of the tiles and node-related tables present in `worldReachableTiles.db`.
 
-- tables inspected: `door_nodes`, `lodestone_nodes`, `object_nodes`, `ifslot_nodes`, `npc_nodes`, `item_nodes`, plus supporting table `requirements`
+- tables inspected: `tiles`, `door_nodes`, `lodestone_nodes`, `object_nodes`, `ifslot_nodes`, `npc_nodes`, `item_nodes`, plus supporting table `requirements`
 - inspection source: SQLite PRAGMA and schema introspection run against `worldReachableTiles.db`
 
+## tiles
+
+Represents per-tile metadata and directional constraints.
+
+- **Columns**
+  - `x`: INTEGER, NOT NULL
+  - `y`: INTEGER, NOT NULL
+  - `plane`: INTEGER, NOT NULL
+  - `tiledata`: INTEGER, NULL
+  - `category`: TEXT, NULL
+  - `allowed_directions`: TEXT, NULL
+  - `blocked_directions`: TEXT, NULL
+- **Constraints**
+  - PRIMARY KEY (`x`, `y`, `plane`)
+- **Foreign Keys**
+  - None declared
+- **Indexes**
+  - None declared
 ## door_nodes
 
 Represents door interaction nodes with details for both open and closed states.
 
 - **Columns**
   - `id`: INTEGER, PRIMARY KEY AUTOINCREMENT, nullable in schema (implicit non-null as PK)
-  - `direction`: TEXT, NOT NULL, CHECK `direction` IN ('IN','OUT')
+  - `direction`: TEXT, NULL, CHECK `direction` IN ('IN','OUT')
   - `real_id_open`: INTEGER, NOT NULL
   - `real_id_closed`: INTEGER, NOT NULL
   - `location_open_x`: INTEGER, NOT NULL
@@ -34,6 +52,7 @@ Represents door interaction nodes with details for both open and closed states.
 - **Constraints**
   - CHECK constraint on `direction` restricting values to 'IN' or 'OUT'
   - CHECK constraint on `next_node_type` restricting values to 'object','npc','ifslot','door','lodestone','item'
+  - Note: `direction` has no NOT NULL constraint in schema; NULL is allowed
 - **Foreign Keys**
   - `requirement_id` REFERENCES `requirements`(`id`)
 - **Indexes**

@@ -1,0 +1,22 @@
+{
+  "filePath": ".spec-workflow/specs/navmesh/design.md",
+  "currentVersion": 2,
+  "snapshots": [
+    {
+      "version": 1,
+      "filename": "snapshot-001.json",
+      "timestamp": "2025-10-10T17:58:37.639Z",
+      "trigger": "initial",
+      "approvalId": "approval_1760119117638_3s91t4m8b",
+      "approvalTitle": "Approve Design for navmesh spec (region-based navmesh)"
+    },
+    {
+      "version": 2,
+      "filename": "snapshot-002.json",
+      "timestamp": "2025-10-10T18:02:32.618Z",
+      "trigger": "approved",
+      "approvalId": "approval_1760119288935_t815j93l1",
+      "approvalTitle": "Approve Revised Design for navmesh spec (tests removed)"
+    }
+  ]
+}

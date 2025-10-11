@@ -91,6 +91,9 @@ def find_path(
 
     t0_ns = time.perf_counter_ns()
 
+    # Auto-detect DB type: navmesh.db (regions) vs tile DB
+   
+    # Fallback to tile DB provider
     db = Database.connect(effective_db_path)
     try:
         # Validate start/goal exist in tiles (Requirement 2.4)

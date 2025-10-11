@@ -52,7 +52,9 @@ class TileRow:
     x: int
     y: int
     plane: int
+    tiledata: Optional[int]
     allowed_directions: Optional[int]
+    blocked_directions: Optional[int]
 
 
 @dataclass(slots=True)
@@ -205,8 +207,15 @@ class Database:
     connection: SqlConnection = field(repr=False)
 
     _sql_tile_by_coord: str = field(init=False, default=(
-        "SELECT x, y, plane, allowed_directions FROM tiles "
+        "SELECT x, y, plane, tiledata, allowed_directions, blocked_directions FROM tiles "
         "WHERE x = ? AND y = ? AND plane = ?"
+    ))
+    _sql_distinct_planes: str = field(init=False, default=(
+        "SELECT DISTINCT plane FROM tiles ORDER BY plane ASC"
+    ))
+    _sql_tiles_by_plane: str = field(init=False, default=(
+        "SELECT x, y, plane, tiledata, allowed_directions, blocked_directions FROM tiles "
+        "WHERE plane = ? ORDER BY y ASC, x ASC"
     ))
     _sql_door_by_id: str = field(init=False, default=(
         "SELECT id, direction, tile_inside_x, tile_inside_y, tile_inside_plane, "
@@ -342,8 +351,32 @@ class Database:
             x=row["x"],
             y=row["y"],
             plane=row["plane"],
+            tiledata=row["tiledata"],
             allowed_directions=row["allowed_directions"],
+            blocked_directions=row["blocked_directions"],
         )
+
+    # -- tile streaming helpers --------------------------------------
+    def iter_planes(self) -> Iterator[int]:
+        """Yield distinct plane identifiers in ascending order."""
+
+        cursor = self.connection.execute(self._sql_distinct_planes)
+        for row in cursor:
+            yield int(row[0])
+
+    def iter_tiles_by_plane(self, plane: int) -> Iterator[TileRow]:
+        """Yield tiles on ``plane`` ordered by (y ASC, x ASC)."""
+
+        cursor = self.connection.execute(self._sql_tiles_by_plane, (plane,))
+        for row in cursor:
+            yield TileRow(
+                x=row["x"],
+                y=row["y"],
+                plane=row["plane"],
+                tiledata=row["tiledata"],
+                allowed_directions=row["allowed_directions"],
+                blocked_directions=row["blocked_directions"],
+            )
 
     def iter_object_nodes_touching(self, tile: Tile) -> Iterator[ObjectNodeRow]:
         """Yield object nodes whose origin bounds include ``tile``.

@@ -1,0 +1,12 @@
+{
+  "id": "approval_1760119117638_3s91t4m8b",
+  "title": "Approve Design for navmesh spec (region-based navmesh)",
+  "filePath": ".spec-workflow/specs/navmesh/design.md",
+  "type": "document",
+  "status": "rejected",
+  "createdAt": "2025-10-10T17:58:37.638Z",
+  "category": "spec",
+  "categoryName": "navmesh",
+  "response": "we don't need tests.",
+  "respondedAt": "2025-10-10T17:59:34.651Z"
+}

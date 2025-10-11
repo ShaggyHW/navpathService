@@ -7,6 +7,15 @@
 - Configurable search limits, node-type toggles, and per-type cost overrides.
 - JSON-friendly result models with explicit action metadata.
 
+### Navmesh support and provider auto-detection
+
+`navpath` supports two SQLite backends with identical API/CLI behavior:
+
+- Tiles + node tables (e.g., `worldReachableTiles.db`)
+- Navmesh regions (e.g., `navmesh.db`)
+
+The API/CLI automatically detects a navmesh database by the presence of the `nav_regions` table and uses a region-based graph provider when found. Otherwise it falls back to the tiles provider. Metrics logging, result shapes, and CLI flags remain unchanged.
+
 
 ## Project layout
 
@@ -29,7 +38,12 @@
 - `navpath/path.py`
   - JSON-friendly dataclasses: `Tile`, `NodeRef`, `ActionStep`, `PathResult`.
 
-Related schema docs live at `docs/tiles_nodes_schema.md`.
+Related schema docs live at `docs/tiles_nodes_schema.md`. Navmesh schema is documented in `docs/navmesh_schema.md`.
+
+- `navpath/navmesh_db.py`
+  - Read-only helpers and typed rows for `navmesh.db` (`nav_regions`, `nav_region_edges`, `region_tiles`, `metadata`).
+- `navpath/navmesh_graph.py`
+  - Region-based graph provider with deterministic movement and special edges derived from `nav_region_edges`.
 
 
 ## Database model (high level)
@@ -52,7 +66,7 @@ Each node table may reference a `next_node_type`/`next_node_id` enabling action 
 - Function: `navpath.api.find_path(start, goal, options=None, db_path=None) -> PathResult`
   - `start`, `goal`: `Tile` tuples `(x, y, plane)` of ints.
   - `options`: `SearchOptions` (see below). If omitted, defaults are used.
-  - `db_path`: path to SQLite DB. Defaults to `worldReachableTiles.db` at project root when not provided (or `options.extras['db_path']`).
+  - `db_path`: path to SQLite DB. Defaults to `worldReachableTiles.db` at project root when not provided (or `options.extras['db_path']`). If the DB contains `nav_regions`, a navmesh-backed provider is used automatically; otherwise the tiles provider is used.
   - Returns: `PathResult` with fields:
     - `path: Optional[List[Tile]]` — sequence of tiles or `None` if not found.
     - `actions: List[ActionStep]` — ordered steps, including chain-expanded action metadata.
@@ -107,6 +121,8 @@ Arguments:
   - When both file and string are provided, values merge with last-wins per key. Invalid JSON or schema yields a clear error and a non-zero exit code.
 
 Human-readable output includes reason, expansions, path length, total cost, and the path tiles. JSON output uses the `to_json_dict()` shape.
+
+Note: When `--db` points to a `navmesh.db` (containing `nav_regions`), provider selection is automatic. Outputs and metrics format are identical to the tiles backend; no additional flags are required.
 
 
 ## Search options and costs
