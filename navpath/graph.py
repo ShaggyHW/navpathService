@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 
 from .cost import CostModel
-from .db import Database, LodestoneNodeRow
+from .db import Database, LodestoneNodeRow, ObjectNodeRow, NpcNodeRow
 from .nodes import NodeChainResolver, Bounds2D
 from .options import SearchOptions
 from .path import NodeRef, StepType, Tile
@@ -157,6 +157,15 @@ class SqliteGraphProvider:
         self._plane_tile_sets: Dict[int, Set[Tuple[int, int]]] = {}
         self._plane_lru: "OrderedDict[int, None]" = OrderedDict()
         self._plane_cache_capacity: int = 8
+        # Per-tile touching node caches to avoid repeated SQLite hits during expansion
+        self._touch_cache_capacity: int = 4096
+        self._obj_touch_cache: Dict[Tile, List[ObjectNodeRow]] = {}
+        self._obj_touch_lru: "OrderedDict[Tile, None]" = OrderedDict()
+        self._npc_touch_cache: Dict[Tile, List[NpcNodeRow]] = {}
+        self._npc_touch_lru: "OrderedDict[Tile, None]" = OrderedDict()
+        # Reusable NodeChainResolver and per-provider chain resolution memo
+        self._resolver: Optional[NodeChainResolver] = None
+        self._chain_resolution_cache: Dict[Tuple[str, int], object] = {}
 
     def neighbors(self, tile: Tile, goal: Tile, options: SearchOptions) -> Iterable[Edge]:
         """Return edges reachable from ``tile`` according to the options."""
@@ -188,6 +197,23 @@ class SqliteGraphProvider:
         if options.use_items:
             edges.extend(self._item_edges(tile, options, ctx_map))
         return edges
+
+    # ------------------------------------------------------------------
+    # Resolver/memoization helpers
+    def _get_resolver(self, options: SearchOptions) -> NodeChainResolver:
+        # Create once per provider; options are stable for a search lifecycle.
+        if self._resolver is None:
+            self._resolver = NodeChainResolver(self._db, self._cost_model, options)
+        return self._resolver
+
+    def _resolve_chain_cached(self, ref: NodeRef, resolver: NodeChainResolver):
+        key = (ref.type.strip().lower(), int(ref.id))
+        cached = self._chain_resolution_cache.get(key)
+        if cached is not None:
+            return cached
+        resolution = resolver.resolve(ref)
+        self._chain_resolution_cache[key] = resolution
+        return resolution
 
     # ------------------------------------------------------------------
     def _movement_edges(self, tile: Tile, tile_row) -> List[Edge]:
@@ -365,16 +391,16 @@ class SqliteGraphProvider:
     # Action edges (object/ifslot/npc/item) using NodeChainResolver
     def _object_edges(self, tile: Tile, options: SearchOptions, ctx_map: Dict[str, int]) -> List[Edge]:
         edges: List[Edge] = []
-        resolver = NodeChainResolver(self._db, self._cost_model, options)
+        resolver = self._get_resolver(options)
         seen: Set[Tuple[int, Tile]] = set()
-        for row in self._db.iter_object_nodes_touching(tile):
+        for row in self._get_object_nodes_touching_cached(tile):
             # Requirement gating before resolving chains
             if not self._passes_requirement(getattr(row, "requirement_id", None), ctx_map):
                 continue
             if self._is_non_head("object", row.id):
                 continue
             ref = NodeRef("object", row.id)
-            resolution = resolver.resolve(ref)
+            resolution = self._resolve_chain_cached(ref, resolver)
             if not resolution.is_success or resolution.destination is None:
                 continue
             dest = self._select_dest_tile(resolution.destination, fallback_plane=tile[2])
@@ -416,7 +442,7 @@ class SqliteGraphProvider:
 
     def _ifslot_edges(self, tile: Tile, options: SearchOptions, ctx_map: Dict[str, int]) -> List[Edge]:
         edges: List[Edge] = []
-        resolver = NodeChainResolver(self._db, self._cost_model, options)
+        resolver = self._get_resolver(options)
         self._ensure_ifslot_cache()
         for row in self._ifslot_nodes_cache or []:
             # Requirement gating before resolving chains
@@ -425,7 +451,7 @@ class SqliteGraphProvider:
             if self._is_non_head("ifslot", row.id):
                 continue
             ref = NodeRef("ifslot", row.id)
-            resolution = resolver.resolve(ref)
+            resolution = self._resolve_chain_cached(ref, resolver)
             if not resolution.is_success or resolution.destination is None:
                 continue
             dest = self._select_dest_tile(resolution.destination, fallback_plane=tile[2])
@@ -463,16 +489,16 @@ class SqliteGraphProvider:
 
     def _npc_edges(self, tile: Tile, options: SearchOptions, ctx_map: Dict[str, int]) -> List[Edge]:
         edges: List[Edge] = []
-        resolver = NodeChainResolver(self._db, self._cost_model, options)
+        resolver = self._get_resolver(options)
         seen: Set[Tuple[int, Tile]] = set()
-        for row in self._db.iter_npc_nodes_touching(tile):
+        for row in self._get_npc_nodes_touching_cached(tile):
             # Requirement gating before resolving chains
             if not self._passes_requirement(getattr(row, "requirement_id", None), ctx_map):
                 continue
             if self._is_non_head("npc", row.id):
                 continue
             ref = NodeRef("npc", row.id)
-            resolution = resolver.resolve(ref)
+            resolution = self._resolve_chain_cached(ref, resolver)
             if not resolution.is_success or resolution.destination is None:
                 continue
             dest = self._select_dest_tile(resolution.destination, fallback_plane=tile[2])
@@ -514,7 +540,7 @@ class SqliteGraphProvider:
 
     def _item_edges(self, tile: Tile, options: SearchOptions, ctx_map: Dict[str, int]) -> List[Edge]:
         edges: List[Edge] = []
-        resolver = NodeChainResolver(self._db, self._cost_model, options)
+        resolver = self._get_resolver(options)
         self._ensure_item_cache()
         for row in self._item_nodes_cache or []:
             # Requirement gating before resolving chains
@@ -523,7 +549,7 @@ class SqliteGraphProvider:
             if self._is_non_head("item", row.id):
                 continue
             ref = NodeRef("item", row.id)
-            resolution = resolver.resolve(ref)
+            resolution = self._resolve_chain_cached(ref, resolver)
             if not resolution.is_success or resolution.destination is None:
                 continue
             dest = self._select_dest_tile(resolution.destination, fallback_plane=tile[2])
@@ -621,6 +647,50 @@ class SqliteGraphProvider:
             return
         self._item_nodes_cache = list(self._db.iter_item_nodes())
         self._item_nodes_cache.sort(key=lambda n: n.id)
+
+    # ------------------------------------------------------------------
+    # Per-tile touching node LRU caches
+    def _get_object_nodes_touching_cached(self, tile: Tile) -> List[ObjectNodeRow]:
+        key: Tile = (int(tile[0]), int(tile[1]), int(tile[2]))
+        cached = self._obj_touch_cache.get(key)
+        if cached is not None:
+            try:
+                self._obj_touch_lru.move_to_end(key)
+            except Exception:
+                pass
+            return cached
+        rows = list(self._db.iter_object_nodes_touching(key))
+        self._obj_touch_cache[key] = rows
+        self._obj_touch_lru[key] = None
+        if len(self._obj_touch_lru) > self._touch_cache_capacity:
+            try:
+                evict_key = next(iter(self._obj_touch_lru))
+                self._obj_touch_lru.pop(evict_key, None)
+                self._obj_touch_cache.pop(evict_key, None)
+            except StopIteration:
+                pass
+        return rows
+
+    def _get_npc_nodes_touching_cached(self, tile: Tile) -> List[NpcNodeRow]:
+        key: Tile = (int(tile[0]), int(tile[1]), int(tile[2]))
+        cached = self._npc_touch_cache.get(key)
+        if cached is not None:
+            try:
+                self._npc_touch_lru.move_to_end(key)
+            except Exception:
+                pass
+            return cached
+        rows = list(self._db.iter_npc_nodes_touching(key))
+        self._npc_touch_cache[key] = rows
+        self._npc_touch_lru[key] = None
+        if len(self._npc_touch_lru) > self._touch_cache_capacity:
+            try:
+                evict_key = next(iter(self._npc_touch_lru))
+                self._npc_touch_lru.pop(evict_key, None)
+                self._npc_touch_cache.pop(evict_key, None)
+            except StopIteration:
+                pass
+        return rows
 
     def _build_chain_metadata(self, resolution: NodeChainResolver.resolve.__annotations__.get('return')) -> List[dict]:
         """Convert a ChainResolution into a JSON-friendly chain list.

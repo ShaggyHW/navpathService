@@ -21,30 +21,28 @@ This document outlines actionable optimizations to speed up the pathfinding serv
     - Replace `db.fetch_tile(*dest) is None` checks in `graph.py::_movement_edges()` and `_select_dest_tile()` with the in-memory map.
     - Memory strategy: lazily build per plane on first touch; optionally evict planes via LRU if memory is a concern.
 
-- **Reuse node chain resolver and memoize resolutions**
-  - Current: `_object_edges()`, `_ifslot_edges()`, `_npc_edges()`, `_item_edges()` create a new `NodeChainResolver` each call and resolve chains repeatedly.
-  - Change: Create one resolver per `SqliteGraphProvider` instance and reuse across `neighbors()` calls, e.g., `self._resolver`.
-  - Add memoization inside provider: `self._chain_resolution_cache[(type, id)] -> ChainResolution` to avoid re-resolving identical heads.
-  - In `NodeChainResolver`, add a tiny requirement cache to avoid repeated `fetch_requirement()` per link (graph already has a cache for head gating; this covers per-link checks).
-
-- **Cache “touching” node queries by tile**
+- **Reuse node chain resolver and memoize resolutions** (COMPLETE)
+  - Implemented in `navpath/graph.py`: a single `NodeChainResolver` is created per `SqliteGraphProvider` via `self._get_resolver()` and reused across `neighbors()` calls.
+  - Added provider-level memo: `self._chain_resolution_cache[(type, id)] -> ChainResolution` with `_resolve_chain_cached()` to avoid duplicate resolutions.
+  - Implemented a tiny per-resolver requirement cache in `navpath/nodes.py::NodeChainResolver` to avoid repeated `Database.fetch_requirement()` calls during per-link gating.
+- **Cache “touching” node queries by tile** (COMPLETE)
   - Current: `Database.iter_object_nodes_touching(tile)` and `iter_npc_nodes_touching(tile)` hit SQLite per expansion.
   - Change: Add a small LRU cache (e.g., capacity 4096 tiles) in `SqliteGraphProvider` keyed by `tile` with values of the rows list for objects/NPCs.
   - Invalidate only on DB changes (not expected at runtime as we open in RO mode).
 
-- **Reduce heavy metadata copying**
+  - **Reduce heavy metadata copying**
   - Current: edges attach `asdict(row)` into `metadata["db_row"]` across `graph.py` methods.
   - Change: Make this optional behind an option flag, e.g., `options.extras["include_db_row"] = False` by default for speed. Keep minimal metadata fields only.
 
 - **Persist provider across requests**
   - Current: `navpath/api.py::find_path()` creates a new `Database` and `SqliteGraphProvider` per call, discarding caches.
   - Change: If used in a long-lived process, host a tiny service layer that keeps a single `Database` and `SqliteGraphProvider` per DB path and reuses them, preserving: lodestone cache, ifslot/item cache, chain-head index, tile-existence map, and touching-node LRU.
+  - See `docs/navpath_service.md` for the full service-mode design, endpoints, concurrency model, and implementation plan.
 
 ## A* search efficiency
 
 - **Heuristic improvements (keep optimality)**
   - Current: `CostModel.heuristic()` returns 0 when any of `use_lodestones/objects/ifslots/npcs/items` is enabled, degrading to Dijkstra.
-  - Options:
     - Keep admissible but informative: `h = max(chebyshev*step_cost - best_teleport_discount, 0)`, where `best_teleport_discount` is a conservative upper bound (e.g., `min_lodestone_cost` if only one teleport can apply). Mark as experimental and guarded by an option because correctness proof depends on constraints.
     - Movement-only fast path: when all action edges are disabled, keep current Chebyshev heuristic (already implemented) and consider enabling Jump Point Search for grid moves only.
 

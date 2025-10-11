@@ -152,6 +152,8 @@ class NodeChainResolver:
         self._max_depth = self._options.max_chain_depth
         # Build requirement context map from options.extras (prefer normalized map)
         self._ctx_map: Dict[str, int] = self._build_ctx_map(self._options)
+        # Tiny per-resolver requirement cache to avoid repeated DB fetches per link
+        self._req_cache: Dict[int, object] = {}
 
     def resolve(self, start: NodeRef) -> ChainResolution:
         """Resolve a chain beginning at ``start``.
@@ -204,7 +206,7 @@ class NodeChainResolver:
             # Requirement gating per link: abort chain if unmet
             req_id = getattr(row, "requirement_id", None)
             if req_id is not None:
-                req = self._db.fetch_requirement(int(req_id))
+                req = self._fetch_requirement_cached(int(req_id))
                 if req is None or not evaluate_requirement(req, self._ctx_map):
                     failure_reason = "requirement-unmet"
                     break
@@ -256,6 +258,19 @@ class NodeChainResolver:
                     if isinstance(k, str) and isinstance(v, int):
                         ctx_map[k] = int(v)
         return ctx_map
+
+    def _fetch_requirement_cached(self, requirement_id: int):
+        """Return requirement row with a tiny in-resolver cache.
+
+        This avoids repeated Database.fetch_requirement calls when resolving
+        chains that reference the same requirement across multiple links.
+        """
+        rid = int(requirement_id)
+        if rid in self._req_cache:
+            return self._req_cache[rid]
+        req = self._db.fetch_requirement(rid)
+        self._req_cache[rid] = req
+        return req
 
     def _normalise_type(self, node_type: str) -> str:
         return node_type.strip().lower()
