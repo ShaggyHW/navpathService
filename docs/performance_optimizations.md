@@ -92,12 +92,6 @@ This document outlines actionable optimizations to speed up the pathfinding serv
 - **Logging**
   - Avoid `LOGGER.debug` inside hot loops unless debug logging is enabled. Guard with `if LOGGER.isEnabledFor(logging.DEBUG):` where costful formatting occurs.
 
-## Optional: Region-graph (navmesh) mode
-
-- Introduce a region-level graph to dramatically shrink search space:
-  - Precompute flood-filled regions with a hard cap per block (e.g., 64x64 tiles) and create door endpoint micro-regions (1x1) to ensure mapping for inside/outside tiles.
-  - Build a separate `navmesh.db` (regions and portals) and a `RegionGraphProvider` that expands region nodes instead of tiles, then refines locally to emit final tile paths.
-  - This approach respects plane filters and keeps determinism. It can reduce expansions by orders of magnitude on large maps.
 
 ## Quick wins (implementation order)
 

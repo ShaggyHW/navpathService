@@ -1,7 +1,7 @@
 
 /navpath/__pycache__/
 # Compiled output
-/target/
+/rust/target/
 
 # Cargo package metadata
 **/*.rs.bk
@@ -32,9 +32,9 @@ ehthumbs.db
 Desktop.ini
 
 # Other tools
-/.cargo/
-/coverage/
-/dist/
-/out/
-/node_modules/
-/target/
+/rust/.cargo/
+/rust/coverage/
+/rust/dist/
+/rust/out/
+/rust/node_modules/
+/.spec-workflow

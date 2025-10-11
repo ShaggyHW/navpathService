@@ -90,8 +90,6 @@ def find_path(
     cost_model = CostModel(options=opts)
 
     t0_ns = time.perf_counter_ns()
-
-    # Auto-detect DB type: navmesh.db (regions) vs tile DB
    
     # Fallback to tile DB provider
     db = Database.connect(effective_db_path)
