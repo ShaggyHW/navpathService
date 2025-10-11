@@ -1,2 +1,39 @@
 
 /navpath/__pycache__/
+# Compiled output
+/target/
+
+# Cargo package metadata
+**/*.rs.bk
+Cargo.lock
+# (Optional: keep Cargo.lock for binaries, ignore for libraries)
+# Uncomment the next line if your project is a library crate:
+# Cargo.lock
+
+# Build scripts & temporary files
+*.log
+*.tmp
+
+# IDE / Editor settings
+# VS Code
+.vscode/
+# IntelliJ / CLion / RustRover
+.idea/
+# Sublime
+*.sublime-workspace
+*.sublime-project
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Other tools
+/.cargo/
+/coverage/
+/dist/
+/out/
+/node_modules/
