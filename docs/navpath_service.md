@@ -91,6 +91,63 @@ Recommendation: start with approach A for correctness and simplicity; optimize l
   - `NAVPATH_LOG_LEVEL=INFO`
   - Optional cache tunables (e.g., plane LRU size, touching‑node LRU capacity).
 
+## Single DB Startup
+
+The service runs against a single SQLite database selected at startup. Provide the database path via CLI or environment variable.
+
+- Precedence: CLI flag wins over environment variable when both are set.
+- Read-only: The database is opened read-only and safe PRAGMAs may be applied (e.g., query_only, cache_size, mmap_size, temp_store) based on environment. This improves safety and performance without altering the DB.
+
+CLI examples:
+
+```bash
+# Absolute path required
+navpath-service --db /abs/path/to/worldReachableTiles.db
+
+# Also supported
+navpath-service --db=/abs/path/to/worldReachableTiles.db
+```
+
+Environment variable example:
+
+```bash
+export NAVPATH_DB=/abs/path/to/worldReachableTiles.db
+navpath-service
+```
+
+Systemd unit example:
+
+```ini
+[Unit]
+Description=navpath-service
+After=network.target
+
+[Service]
+Type=simple
+Environment=NAVPATH_DB=/var/lib/navpath/worldReachableTiles.db
+ExecStart=/usr/local/bin/navpath-service
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Docker examples:
+
+```bash
+# Pass database via environment variable
+docker run --rm -p 8080:8080 \
+  -v /host/navpath:/data:ro \
+  -e NAVPATH_DB=/data/worldReachableTiles.db \
+  navpath-service:latest
+
+# Or pass database via CLI args (takes precedence if both provided)
+docker run --rm -p 8080:8080 \
+  -v /host/navpath:/data:ro \
+  navpath-service:latest \
+  --db /data/worldReachableTiles.db
+```
+
 ## Implementation plan
 
 1. Create `navpath/service.py` with a FastAPI app.

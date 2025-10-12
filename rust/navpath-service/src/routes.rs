@@ -4,15 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{error, info, info_span};
 
+use std::sync::atomic::Ordering;
+
 use navpath_core::{astar::AStar, CostModel, PathResult, SearchOptions, Tile};
- // trait bound
+use navpath_core::db::{self, Database};
+use navpath_core::graph::provider::SqliteGraphProvider;
 
-use crate::provider_manager::ProviderManager;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub providers: ProviderManager,
-}
+use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct FindPathRequest {
@@ -26,6 +24,10 @@ pub struct FindPathRequest {
 pub struct FindPathQuery {
     #[serde(default, alias = "actions_only")]
     pub only_actions: bool,
+    #[serde(default)]
+    pub db: Option<String>,
+    #[serde(default, alias = "db_path")]
+    pub db_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,13 +47,10 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    match state.providers.warm_default() {
-        Ok(()) => (StatusCode::OK, Json(json!({"ready": true}))).into_response(),
-        Err(e) => {
-            error!(error=%e.to_string(), "readyz failed");
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ready": false, "error": e.to_string()}))).into_response()
-        }
+    if !state.ready.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ready": false}))).into_response();
     }
+    (StatusCode::OK, Json(json!({"ready": true}))).into_response()
 }
 
 async fn version() -> impl IntoResponse {
@@ -61,7 +60,15 @@ async fn version() -> impl IntoResponse {
 }
 
 async fn find_path(State(state): State<AppState>, Query(params): Query<FindPathQuery>, Json(req): Json<FindPathRequest>) -> impl IntoResponse {
-    let span = info_span!("find_path", db = req.db_path.as_deref().unwrap_or("<default>"));
+    // Reject per-request DB selection
+    if params.db.is_some() || params.db_path.is_some() || req.db_path.is_some() {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "ERR_DB_SELECTION_UNSUPPORTED",
+            "message": "Selecting database per request is not supported"
+        }))).into_response();
+    }
+
+    let span = info_span!("find_path");
     let _enter = span.enter();
 
     let start: Tile = req.start;
@@ -70,15 +77,19 @@ async fn find_path(State(state): State<AppState>, Query(params): Query<FindPathQ
     // Optionally embed start_tile for lodestone gating logic parity
     options.extras.entry("start_tile".into()).or_insert(serde_json::json!([start[0], start[1], start[2]]));
 
-    let result = state.providers.with_provider(req.db_path.as_deref(), |prov| {
-        // Build cost model per request and set on provider
-        let cm = CostModel::new(options.clone());
-        prov.set_cost_model(cm.clone());
-        // Run A*
-        let astar = AStar::new(prov, &cm);
-        let res = astar.find_path(start, goal, &options)?;
-        Ok::<PathResult, anyhow::Error>(res)
-    });
+    // Open DB read-only per request and build a provider with per-request CostModel
+    let conn = match db::open::open_read_only_with_config(&state.db_path, &state.db_open_config) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error=%e.to_string(), "db open failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    };
+    let db = Database::from_connection(conn);
+    let cm = CostModel::new(options.clone());
+    let provider = SqliteGraphProvider::new(db, cm.clone());
+    let astar = AStar::new(&provider, &cm);
+    let result: Result<PathResult, anyhow::Error> = astar.find_path(start, goal, &options).map_err(|e| e.into());
 
     match result {
         Ok(res) => {

@@ -1,5 +1,9 @@
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use anyhow::bail;
+use navpath_core::db::open::DbOpenConfig;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -15,4 +19,27 @@ impl Config {
         let default_db = env::var("NAVPATH_DB").ok();
         Self { addr, default_db }
     }
+}
+
+pub fn resolve_db_path() -> anyhow::Result<PathBuf> {
+    let mut args = env::args().skip(1);
+    let mut cli: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if arg == "--db" {
+            if let Some(p) = args.next() { cli = Some(p); }
+            break;
+        } else if let Some(rest) = arg.strip_prefix("--db=") {
+            cli = Some(rest.to_string());
+            break;
+        }
+    }
+    let chosen = if let Some(p) = cli { p } else if let Ok(p) = env::var("NAVPATH_DB") { p } else { bail!("database path not provided: use --db <PATH> or set NAVPATH_DB") };
+    if chosen.trim().is_empty() { bail!("database path is empty"); }
+    let pb = PathBuf::from(chosen);
+    if !pb.is_absolute() { bail!("database path must be absolute"); }
+    Ok(pb)
+}
+
+pub fn load_db_open_config() -> DbOpenConfig {
+    DbOpenConfig::from_env()
 }
