@@ -168,6 +168,8 @@ NODE_TABLES = {
 
 DIR_TOKENS = {"N","NE","E","SE","S","SW","W","NW","NORTH","EAST","SOUTH","WEST","NORTHEAST","NORTHWEST","SOUTHEAST","SOUTHWEST"}
 
+MAX_POLY_EXTENT = 64
+
 def is_tile_walkable(allowed: Optional[str], blocked: Optional[str]) -> bool:
     """
     Conservative walkability: a tile is walkable if it has *any* allowed directions token.
@@ -193,6 +195,70 @@ def tiles_to_polygons(tiles: Iterable[Tuple[int,int]]) -> List[Polygon]:
         return [p for p in merged.geoms if isinstance(p, Polygon)]
     # Fallback: filter polys from collections
     return [g for g in getattr(merged, "geoms", []) if isinstance(g, Polygon)]
+
+
+def split_polygon_by_extent(poly: Polygon, max_extent: int) -> List[Polygon]:
+    minx, miny, maxx, maxy = poly.bounds
+    if (maxx - minx) <= max_extent and (maxy - miny) <= max_extent:
+        return [poly]
+    xmin = math.floor(minx)
+    ymin = math.floor(miny)
+    xmax = math.ceil(maxx)
+    ymax = math.ceil(maxy)
+    pieces: List[Polygon] = []
+    for x0 in range(xmin, xmax, max_extent):
+        x1 = min(x0 + max_extent, xmax)
+        for y0 in range(ymin, ymax, max_extent):
+            y1 = min(y0 + max_extent, ymax)
+            cell = box(x0, y0, x1, y1)
+            clipped = poly.intersection(cell)
+            if clipped.is_empty:
+                continue
+            if isinstance(clipped, Polygon):
+                if clipped.area > 1e-6:
+                    pieces.append(clipped)
+            else:
+                for g in getattr(clipped, "geoms", []):
+                    if isinstance(g, Polygon) and not g.is_empty and g.area > 1e-6:
+                        pieces.append(g)
+    return pieces or [poly]
+
+
+def enforce_polygon_extent(polys: Iterable[Polygon], max_extent: int) -> List[Polygon]:
+    out: List[Polygon] = []
+    for poly in polys:
+        out.extend(split_polygon_by_extent(poly, max_extent))
+    return out
+
+
+def tiles_to_rectangles(tiles: Iterable[Tuple[int,int]], max_w: int, max_h: int) -> List[Polygon]:
+    """
+    Greedy maximal rectangles over contiguous tiles, with caps on width/height.
+    Produces convex cells and prevents 'mega-polygons'.
+    """
+    occ = set(tiles)
+    visited = set()
+    rects: List[Polygon] = []
+    for (x0,y0) in sorted(occ, key=lambda p: (p[1], p[0])):
+        if (x0,y0) in visited:
+            continue
+        # grow right
+        x1 = x0
+        while (x1+1, y0) in occ and (x1+1, y0) not in visited and (x1+1 - x0) < max_w:
+            x1 += 1
+        # grow down while full rows cover [x0..x1]
+        y1 = y0
+        while (y1 + 1 - y0) < max_h:
+            ny = y1 + 1
+            if all((x, ny) in occ and (x, ny) not in visited for x in range(x0, x1+1)):
+                y1 = ny
+            else:
+                break
+        for yy in range(y0, y1+1):
+            for xx in range(x0, x1+1):
+                visited.add((xx, yy))
+        rects.append(box(x0, y0, x1+1, y1+1))
+    return rects
 
 
 def triangles_from_polygon(poly: Polygon) -> List[Polygon]:
@@ -438,15 +504,21 @@ def find_cells_intersecting_rect(cur: sqlite3.Cursor, plane: int, rect_poly: Pol
 
 def build_navmesh_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection,
                             plane: int, mode: str, triangulate_flag: bool,
-                            bbox: Optional[Dict[str,int]]):
+                            bbox: Optional[Dict[str,int]],
+                            cell_shape: str, rect_max_w: int, rect_max_h: int):
     print(f"[plane {plane}] Fetching tiles ...")
     tiles = fetch_tiles(in_conn, plane, bbox)
     if not tiles:
         print(f"[plane {plane}] No walkable tiles.")
         return
 
-    print(f"[plane {plane}] Merging tiles into polygons ...")
-    polys = tiles_to_polygons(tiles)
+    if cell_shape == "rects" and not triangulate_flag:
+        print(f"[plane {plane}] Packing tiles into rectangles (max {rect_max_w}x{rect_max_h}) ...")
+        polys = tiles_to_rectangles(tiles, rect_max_w, rect_max_h)
+    else:
+        print(f"[plane {plane}] Merging tiles into polygons ...")
+        polys = tiles_to_polygons(tiles)
+        polys = enforce_polygon_extent(polys, MAX_POLY_EXTENT)
 
     cur = out_conn.cursor()
 
@@ -726,6 +798,10 @@ def main():
                     help="polys: merge tiles into polygons (default)")
     ap.add_argument("--triangulate", action="store_true",
                     help="Triangulate polygons into triangles and build portal adjacency (optional)")
+    ap.add_argument("--cell-shape", choices=["polys","rects"], default="polys",
+                    help="Cellization strategy when not triangulating: 'polys' (merged) or 'rects' (maximal rectangles). Default: rects")
+    ap.add_argument("--rect-max-w", type=int, default=64, help="Max rectangle width in tiles (rects mode)")
+    ap.add_argument("--rect-max-h", type=int, default=64, help="Max rectangle height in tiles (rects mode)")
     ap.add_argument("--bbox", type=str, default=None,
                     help='Optional crop: "plane=0,xmin=...,xmax=...,ymin=...,ymax=..."')
     ap.add_argument("--resolve-crossplane", action="store_true",
@@ -753,7 +829,8 @@ def main():
     for plane in planes:
         if bbox and "plane" in bbox and plane != int(bbox["plane"]):
             continue
-        build_navmesh_for_plane(in_conn, out_conn, plane, args.mode, args.triangulate, bbox)
+        build_navmesh_for_plane(in_conn, out_conn, plane, args.mode, args.triangulate, bbox,
+                                args.cell_shape, args.rect_max_w, args.rect_max_h)
 
     if args.resolve_crossplane:
         resolve_crossplane(in_conn, out_conn)
