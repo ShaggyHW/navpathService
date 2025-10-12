@@ -1,16 +1,34 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::time::Instant;
 
 use crate::cost::CostModel;
 use crate::graph::provider::{Edge as GEdge, GraphProvider};
 use crate::models::{ActionStep, NodeRef, Rect, Tile};
 use crate::options::SearchOptions;
 use serde_json::Value;
+use crate::jps::{JpsConfig, JpsPruner};
+use tracing::info;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TileKey(i32, i32, i32);
 impl From<Tile> for TileKey { fn from(t: Tile) -> Self { TileKey(t[0], t[1], t[2]) } }
 impl From<TileKey> for Tile { fn from(k: TileKey) -> Self { [k.0, k.1, k.2] } }
+
+fn jps_config_from_options(options: &SearchOptions) -> JpsConfig {
+    let mut cfg = JpsConfig::default();
+    // Flat keys
+    if let Some(v) = options.extras.get("jps_enabled").and_then(Value::as_bool) { cfg.enabled = v; }
+    if let Some(v) = options.extras.get("jps_allow_diagonals").and_then(Value::as_bool) { cfg.allow_diagonals = v; }
+    if let Some(v) = options.extras.get("jps_max_jump").and_then(Value::as_i64) { if v >= 0 { cfg.max_jump = Some(v as u32); } }
+    // Nested object: { jps: { enabled, allow_diagonals, max_jump } }
+    if let Some(obj) = options.extras.get("jps").and_then(Value::as_object) {
+        if let Some(v) = obj.get("enabled").and_then(Value::as_bool) { cfg.enabled = v; }
+        if let Some(v) = obj.get("allow_diagonals").and_then(Value::as_bool) { cfg.allow_diagonals = v; }
+        if let Some(v) = obj.get("max_jump").and_then(Value::as_i64) { if v >= 0 { cfg.max_jump = Some(v as u32); } }
+    }
+    cfg
+}
 
 #[derive(Clone, Debug)]
 struct CameFromEntry {
@@ -50,8 +68,13 @@ impl<'a, P: GraphProvider> AStar<'a, P> {
     pub fn new(provider: &'a P, cost_model: &'a CostModel) -> Self { Self { provider, cost_model } }
 
     pub fn find_path(&self, start: Tile, goal: Tile, options: &SearchOptions) -> rusqlite::Result<crate::models::PathResult> {
+        let started_at = Instant::now();
+        info!(start=?start, goal=?goal, movement_only=options.movement_only(), max_expansions=options.max_expansions, timeout_ms=options.timeout_ms, "astar_start");
         if start == goal {
-            return Ok(crate::models::PathResult { path: Some(vec![start]), actions: vec![], reason: None, expanded: 0, cost_ms: 0 });
+            let out = crate::models::PathResult { path: Some(vec![start]), actions: vec![], reason: None, expanded: 0, cost_ms: 0 };
+            let duration_ms = started_at.elapsed().as_millis() as u64;
+            info!(expanded=out.expanded, jps_pruned_edges=0u64, duration_ms, neighbor_calls=0u64, total_neighbor_edges=0u64, avg_neighbors=0.0, max_neighbors=0usize, max_open_len=0usize, path_len=out.path.as_ref().map(|p| p.len()).unwrap_or(0), actions_len=out.actions.len(), reason=?out.reason, "astar_done");
+            return Ok(out);
         }
 
         let mut open = BinaryHeap::new();
@@ -59,28 +82,79 @@ impl<'a, P: GraphProvider> AStar<'a, P> {
         let mut came_from: HashMap<TileKey, CameFromEntry> = HashMap::new();
         let mut expanded: u64 = 0;
         let mut seq: u64 = 0;
+        let mut jps_pruned_edges: u64 = 0;
+        let mut neighbor_calls: u64 = 0;
+        let mut total_neighbor_edges: u64 = 0;
+        let mut max_neighbors: usize = 0;
+        let mut max_open_len: usize = 0;
 
         let h0 = self.cost_model.heuristic(start, goal);
         open.push(QueueNode { tile: start.into(), f: h0, g: 0, h: h0, seq });
         g_score.insert(start.into(), 0);
+        max_open_len = max_open_len.max(open.len());
 
         while let Some(qn) = open.pop() {
             // Discard stale
             if let Some(best_g) = g_score.get(&qn.tile) { if qn.g > *best_g { continue; } }
             expanded += 1;
             if expanded > options.max_expansions {
-                return Ok(crate::models::PathResult { path: None, actions: vec![], reason: Some("expansion-limit".into()), expanded, cost_ms: 0 });
+                let out = crate::models::PathResult { path: None, actions: vec![], reason: Some("expansion-limit".into()), expanded, cost_ms: 0 };
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                let avg_neighbors = if neighbor_calls > 0 { total_neighbor_edges as f64 / neighbor_calls as f64 } else { 0.0 };
+                info!(expanded=out.expanded, jps_pruned_edges, duration_ms, neighbor_calls, total_neighbor_edges, avg_neighbors, max_neighbors, max_open_len, path_len=out.path.as_ref().map(|p| p.len()).unwrap_or(0), actions_len=out.actions.len(), reason=?out.reason, "astar_done");
+                return Ok(out);
             }
 
             let current: Tile = qn.tile.into();
             if current == goal {
                 // reconstruct
                 let (path, actions, total_cost) = reconstruct(&came_from, start, current);
-                return Ok(crate::models::PathResult { path: Some(path), actions, reason: None, expanded, cost_ms: total_cost });
+                let out = crate::models::PathResult { path: Some(path), actions, reason: None, expanded, cost_ms: total_cost };
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                let avg_neighbors = if neighbor_calls > 0 { total_neighbor_edges as f64 / neighbor_calls as f64 } else { 0.0 };
+                let path_len = out.path.as_ref().map(|p| p.len()).unwrap_or(0);
+                let actions_len = out.actions.len();
+                info!(expanded=out.expanded, jps_pruned_edges, duration_ms, neighbor_calls, total_neighbor_edges, avg_neighbors, max_neighbors, max_open_len, path_len, actions_len, reason=?out.reason, "astar_done");
+                return Ok(out);
             }
 
-            // Neighbors
-            let neighbors: Vec<GEdge> = self.provider.neighbors(current, goal, options)?;
+            // Neighbors (optionally pruned via JPS for movement-only scenarios)
+            let mut neighbors: Vec<GEdge> = self.provider.neighbors(current, goal, options)?;
+            let prune_with_actions = options
+                .extras
+                .get("jps_prune_with_actions")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if options.movement_only() || prune_with_actions {
+                let jps_cfg = jps_config_from_options(options);
+                if jps_cfg.enabled {
+                    let has_diagonal = neighbors.iter().any(|e| e.type_ == "move" && {
+                        let dx = e.to_tile[0] - e.from_tile[0];
+                        let dy = e.to_tile[1] - e.from_tile[1];
+                        dx != 0 && dy != 0
+                    });
+                    if has_diagonal {
+                        if let Some(entry) = came_from.get(&qn.tile) {
+                            if entry.edge_type == "move" {
+                                let parent_opt: Option<Tile> = Some(entry.prev.into());
+                                let before_moves = neighbors.iter().filter(|e| e.type_ == "move").count();
+                                let pruner = JpsPruner::new(self.provider, goal, options, jps_cfg);
+                                neighbors = pruner.prune_neighbors(current, parent_opt, neighbors);
+                                let after_moves = neighbors.iter().filter(|e| e.type_ == "move").count();
+                                if after_moves < before_moves {
+                                    jps_pruned_edges += (before_moves - after_moves) as u64;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            neighbor_calls += 1;
+            let neighbor_count = neighbors.len();
+            total_neighbor_edges += neighbor_count as u64;
+            if neighbor_count > max_neighbors {
+                max_neighbors = neighbor_count;
+            }
             for e in neighbors {
                 let tentative_g = qn.g + e.cost_ms;
                 let nk: TileKey = e.to_tile.into();
@@ -92,11 +166,19 @@ impl<'a, P: GraphProvider> AStar<'a, P> {
                     seq += 1;
                     let f = tentative_g + h;
                     open.push(QueueNode { tile: nk, f, g: tentative_g, h, seq });
+                    let open_len = open.len();
+                    if open_len > max_open_len {
+                        max_open_len = open_len;
+                    }
                 }
             }
         }
 
-        Ok(crate::models::PathResult { path: None, actions: vec![], reason: Some("no-path".into()), expanded, cost_ms: 0 })
+        let out = crate::models::PathResult { path: None, actions: vec![], reason: Some("no-path".into()), expanded, cost_ms: 0 };
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        let avg_neighbors = if neighbor_calls > 0 { total_neighbor_edges as f64 / neighbor_calls as f64 } else { 0.0 };
+        info!(expanded=out.expanded, jps_pruned_edges, duration_ms, neighbor_calls, total_neighbor_edges, avg_neighbors, max_neighbors, max_open_len, path_len=out.path.as_ref().map(|p| p.len()).unwrap_or(0), actions_len=out.actions.len(), reason=?out.reason, "astar_done");
+        Ok(out)
     }
 }
 
@@ -208,5 +290,41 @@ mod tests {
         let res2 = astar.find_path([0,0,0],[1,1,0], &opts).unwrap();
         assert_eq!(res1.path, res2.path);
         assert_eq!(res1.actions, res2.actions);
+    }
+
+    #[test]
+    fn jps_toggle_does_not_change_path_in_basic_grid() {
+        struct GridProvider;
+        impl GraphProvider for GridProvider {
+            fn neighbors(&self, tile: Tile, _goal: Tile, _options: &SearchOptions) -> rusqlite::Result<Vec<GEdge>> {
+                let [x,y,p] = tile;
+                // Simple 2D grid: allow east and north moves
+                Ok(vec![
+                    GEdge { type_: "move".into(), from_tile: tile, to_tile: [x+1,y,p], cost_ms: 200, node: None, metadata: None },
+                    GEdge { type_: "move".into(), from_tile: tile, to_tile: [x,y+1,p], cost_ms: 200, node: None, metadata: None },
+                ])
+            }
+        }
+        let provider = GridProvider;
+        let mut opts_legacy = SearchOptions::default();
+        // Movement-only to allow JPS pruning path, but disabled here
+        opts_legacy.use_doors = false;
+        opts_legacy.use_lodestones = false;
+        opts_legacy.use_objects = false;
+        opts_legacy.use_ifslots = false;
+        opts_legacy.use_npcs = false;
+        opts_legacy.use_items = false;
+
+        let mut opts_jps = opts_legacy.clone();
+        opts_jps.extras.insert("jps_enabled".into(), Value::from(true));
+
+        let cm_legacy = CostModel::new(opts_legacy.clone());
+        let cm_jps = CostModel::new(opts_jps.clone());
+        let astar_legacy = AStar::new(&provider, &cm_legacy);
+        let astar_jps = AStar::new(&provider, &cm_jps);
+        let res_legacy = astar_legacy.find_path([0,0,0],[2,2,0], &opts_legacy).unwrap();
+        let res_jps = astar_jps.find_path([0,0,0],[2,2,0], &opts_jps).unwrap();
+        assert_eq!(res_legacy.path, res_jps.path);
+        assert_eq!(res_legacy.actions, res_jps.actions);
     }
 }

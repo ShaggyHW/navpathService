@@ -11,6 +11,7 @@ use navpath_core::db::{self, Database};
 use navpath_core::graph::provider::SqliteGraphProvider;
 
 use crate::state::AppState;
+use crate::config::JpsMode;
 
 #[derive(Debug, Deserialize)]
 pub struct FindPathRequest {
@@ -77,6 +78,14 @@ async fn find_path(State(state): State<AppState>, Query(params): Query<FindPathQ
     // Optionally embed start_tile for lodestone gating logic parity
     options.extras.entry("start_tile".into()).or_insert(serde_json::json!([start[0], start[1], start[2]]));
 
+    // Apply deployment-time JPS mode (service-wide). Off forces JPS disabled regardless of request.
+    match state.jps_mode {
+        JpsMode::Off => {
+            options.extras.insert("jps_enabled".into(), serde_json::Value::from(false));
+        }
+        JpsMode::Auto => { /* leave request/default behavior */ }
+    }
+
     // Open DB read-only per request and build a provider with per-request CostModel
     let conn = match db::open::open_read_only_with_config(&state.db_path, &state.db_open_config) {
         Ok(c) => c,
@@ -94,7 +103,12 @@ async fn find_path(State(state): State<AppState>, Query(params): Query<FindPathQ
     match result {
         Ok(res) => {
             let path_len = res.path.as_ref().map(|p| p.len()).unwrap_or(0);
-            info!(reason=?res.reason, expanded=res.expanded, path_len, total_cost_ms=res.cost_ms, "find_path done");
+            // Best-effort derived enabled flag for logging. Defaults to true in core when not specified.
+            let jps_enabled_log = match state.jps_mode {
+                JpsMode::Off => false,
+                JpsMode::Auto => options.extras.get("jps_enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+            };
+            info!(reason=?res.reason, expanded=res.expanded, path_len, total_cost_ms=res.cost_ms, jps_mode=?state.jps_mode, jps_enabled=jps_enabled_log, "find_path done");
             // Check query flag OR body options.extras.only_actions for parity
             let body_only_actions = {
                 let val = options.extras.get("only_actions").or_else(|| options.extras.get("actions_only"));

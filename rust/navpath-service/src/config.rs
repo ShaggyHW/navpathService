@@ -5,6 +5,24 @@ use std::path::PathBuf;
 use anyhow::bail;
 use navpath_core::db::open::DbOpenConfig;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JpsMode {
+    Auto,
+    Off,
+}
+
+impl Default for JpsMode {
+    fn default() -> Self { JpsMode::Auto }
+}
+
+pub fn jps_mode_from_env() -> JpsMode {
+    match env::var("NAVPATH_JPS_MODE").ok().map(|s| s.to_ascii_lowercase()) {
+        Some(ref s) if s == "off" => JpsMode::Off,
+        Some(ref s) if s == "auto" => JpsMode::Auto,
+        _ => JpsMode::Auto,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub addr: SocketAddr,

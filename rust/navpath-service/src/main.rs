@@ -21,7 +21,8 @@ async fn main() {
         }
     };
     let db_open_cfg = config::load_db_open_config();
-    tracing::info!(db_path=%db_path.display(), db_open_config=?db_open_cfg, "db configuration resolved");
+    let jps_mode = config::jps_mode_from_env();
+    tracing::info!(db_path=%db_path.display(), db_open_config=?db_open_cfg, jps_mode=?jps_mode, "db configuration resolved");
 
     // Open DB read-only with config to validate it can be opened
     if let Err(e) = navpath_core::db::open::open_read_only_with_config(&db_path, &db_open_cfg) {
@@ -30,7 +31,7 @@ async fn main() {
     }
 
     // Build service state
-    let app_state = state::AppState::new(db_path.clone(), db_open_cfg.clone());
+    let app_state = state::AppState::new(db_path.clone(), db_open_cfg.clone(), jps_mode);
     app_state.ready.store(true, Ordering::Relaxed);
 
     // Build routes with AppState and start server

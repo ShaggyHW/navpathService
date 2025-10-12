@@ -10,6 +10,8 @@ use crate::nodes::NodeChainResolver;
 use crate::options::SearchOptions;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::debug;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edge {
@@ -437,43 +439,72 @@ impl GraphProvider for SqliteGraphProvider {
         _goal: Tile,
         options: &SearchOptions,
     ) -> rusqlite::Result<Vec<Edge>> {
+        let started_at = Instant::now();
         // Ensure chain-head index built once
         let _ = self.chain_index.ensure_built(self.db.as_ref());
         // Fetch tile row or abort
         let row = match self.db.fetch_tile(tile[0], tile[1], tile[2])? {
             Some(r) => r,
-            None => return Ok(vec![]),
+            None => {
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                debug!(tile=?tile, duration_ms, "neighbors_missing_tile");
+                return Ok(vec![]);
+            }
         };
 
         let mut edges: Vec<Edge> = Vec::new();
+        let mut move_edges = 0usize;
+        let mut door_edges = 0usize;
+        let mut lodestone_edges = 0usize;
+        let mut object_edges = 0usize;
+        let mut ifslot_edges = 0usize;
+        let mut npc_edges = 0usize;
+        let mut item_edges = 0usize;
         // Movement
-        edges.extend(self.neighbors_movement(tile, &row)?);
+        let movement = self.neighbors_movement(tile, &row)?;
+        move_edges = movement.len();
+        edges.extend(movement);
         // Doors
         if options.use_doors {
-            edges.extend(self.neighbors_doors(tile)?);
+            let doors = self.neighbors_doors(tile)?;
+            door_edges = doors.len();
+            edges.extend(doors);
         }
         // Lodestones (start-tile gated inside neighbors_lodestones)
         if options.use_lodestones {
-            edges.extend(self.neighbors_lodestones(tile, options)?);
+            let lodestones = self.neighbors_lodestones(tile, options)?;
+            lodestone_edges = lodestones.len();
+            edges.extend(lodestones);
         }
         // Objects via resolver and touch-cache
         if options.use_objects {
-            edges.extend(self.neighbors_objects(tile, options)?);
+            let objects = self.neighbors_objects(tile, options)?;
+            object_edges = objects.len();
+            edges.extend(objects);
         }
         // Ifslots via resolver (table-wide)
         if options.use_ifslots {
-            edges.extend(self.neighbors_ifslots(tile, options)?);
+            let ifslots = self.neighbors_ifslots(tile, options)?;
+            ifslot_edges = ifslots.len();
+            edges.extend(ifslots);
         }
         // NPCs via resolver and touch-cache
         if options.use_npcs {
-            edges.extend(self.neighbors_npcs(tile, options)?);
+            let npcs = self.neighbors_npcs(tile, options)?;
+            npc_edges = npcs.len();
+            edges.extend(npcs);
         }
         // Items via resolver (table-wide)
         if options.use_items {
-            edges.extend(self.neighbors_items(tile, options)?);
+            let items = self.neighbors_items(tile, options)?;
+            item_edges = items.len();
+            edges.extend(items);
         }
         // Preserve deterministic per-type ordering: movement edges are emitted in MOVEMENT_ORDER;
         // other types are individually sorted within their neighbor functions.
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        let total_edges = edges.len();
+        debug!(tile=?tile, duration_ms, move_edges, door_edges, lodestone_edges, object_edges, ifslot_edges, npc_edges, item_edges, total_edges, "neighbors_done");
         Ok(edges)
     }
 }
