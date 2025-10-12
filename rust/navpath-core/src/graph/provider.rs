@@ -9,6 +9,7 @@ use crate::models::{NodeRef, Tile};
 use crate::nodes::NodeChainResolver;
 use crate::options::SearchOptions;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edge {
@@ -30,7 +31,7 @@ pub trait GraphProvider {
 }
 
 pub struct SqliteGraphProvider {
-    db: Database,
+    db: Arc<Database>,
     cost_model: CostModel,
     plane_cache: PlaneTileCache,
     touch_cache: TouchingNodesCache,
@@ -40,7 +41,7 @@ pub struct SqliteGraphProvider {
 impl SqliteGraphProvider {
     pub fn new(db: Database, cost_model: CostModel) -> Self {
         Self {
-            db,
+            db: Arc::new(db),
             cost_model,
             plane_cache: PlaneTileCache::new(),
             touch_cache: TouchingNodesCache::new(),
@@ -49,14 +50,14 @@ impl SqliteGraphProvider {
     }    
 
     fn neighbors_objects(&self, tile: Tile, options: &SearchOptions) -> rusqlite::Result<Vec<Edge>> {
-        let index = self.chain_index.ensure_built(&self.db);
+        let index = self.chain_index.ensure_built(self.db.as_ref());
         let rows_arc = self
             .touch_cache
-            .object_nodes_touching(&self.db, tile, |db, t| db.iter_object_nodes_touching(t))?;
+            .object_nodes_touching(self.db.as_ref(), tile, |db, t| db.iter_object_nodes_touching(t))?;
         let rows: &Vec<crate::db::rows::ObjectNodeRow> = &rows_arc;
         let mut edges: Vec<Edge> = Vec::new();
         let mut seen: std::collections::HashSet<(i32, Tile)> = std::collections::HashSet::new();
-        let mut resolver = NodeChainResolver::new(&self.db, &self.cost_model, options);
+        let mut resolver = NodeChainResolver::new(self.db.as_ref(), &self.cost_model, options);
 
         for r in rows.iter() {
             if index.is_non_head("object", r.id) { continue; }
@@ -67,7 +68,7 @@ impl SqliteGraphProvider {
             let dest_plane = bounds.plane.unwrap_or(tile[2]);
             let dest: Tile = [bounds.min_x, bounds.min_y, dest_plane];
             if dest == tile { continue; }
-            if !_tile_exists(&self.db, &self.plane_cache, dest[0], dest[1], dest[2])? { continue; }
+            if !_tile_exists(self.db.as_ref(), &self.plane_cache, dest[0], dest[1], dest[2])? { continue; }
             let key = (r.id, dest);
             if !seen.insert(key) { continue; }
             let cost = res.total_cost_ms;
@@ -91,11 +92,11 @@ impl SqliteGraphProvider {
     }
 
     fn neighbors_items(&self, tile: Tile, options: &SearchOptions) -> rusqlite::Result<Vec<Edge>> {
-        let index = self.chain_index.ensure_built(&self.db);
+        let index = self.chain_index.ensure_built(self.db.as_ref());
         let rows = self.db.iter_item_nodes()?;
         let mut edges: Vec<Edge> = Vec::new();
         let mut seen: std::collections::HashSet<(i32, Tile)> = std::collections::HashSet::new();
-        let mut resolver = NodeChainResolver::new(&self.db, &self.cost_model, options);
+        let mut resolver = NodeChainResolver::new(self.db.as_ref(), &self.cost_model, options);
 
         for r in rows.into_iter() {
             if index.is_non_head("item", r.id) { continue; }
@@ -107,7 +108,7 @@ impl SqliteGraphProvider {
             let dest_plane = bounds.plane.unwrap_or(tile[2]);
             let dest: Tile = [bounds.min_x, bounds.min_y, dest_plane];
             if dest == tile { continue; }
-            if !_tile_exists(&self.db, &self.plane_cache, dest[0], dest[1], dest[2])? { continue; }
+            if !_tile_exists(self.db.as_ref(), &self.plane_cache, dest[0], dest[1], dest[2])? { continue; }
             let key = (r.id, dest);
             if !seen.insert(key) { continue; }
             let cost = res.total_cost_ms;
@@ -129,14 +130,14 @@ impl SqliteGraphProvider {
     }
 
     fn neighbors_npcs(&self, tile: Tile, options: &SearchOptions) -> rusqlite::Result<Vec<Edge>> {
-        let index = self.chain_index.ensure_built(&self.db);
+        let index = self.chain_index.ensure_built(self.db.as_ref());
         let rows_arc = self
             .touch_cache
-            .npc_nodes_touching(&self.db, tile, |db, t| db.iter_npc_nodes_touching(t))?;
+            .npc_nodes_touching(self.db.as_ref(), tile, |db, t| db.iter_npc_nodes_touching(t))?;
         let rows: &Vec<crate::db::rows::NpcNodeRow> = &rows_arc;
         let mut edges: Vec<Edge> = Vec::new();
         let mut seen: std::collections::HashSet<(i32, Tile)> = std::collections::HashSet::new();
-        let mut resolver = NodeChainResolver::new(&self.db, &self.cost_model, options);
+        let mut resolver = NodeChainResolver::new(self.db.as_ref(), &self.cost_model, options);
 
         for r in rows.iter() {
             // Skip non-head NPCs
@@ -150,7 +151,7 @@ impl SqliteGraphProvider {
             let dest_plane = bounds.plane.unwrap_or(tile[2]);
             let dest: Tile = [bounds.min_x, bounds.min_y, dest_plane];
             if dest == tile { continue; }
-            if !_tile_exists(&self.db, &self.plane_cache, dest[0], dest[1], dest[2])? { continue; }
+            if !_tile_exists(self.db.as_ref(), &self.plane_cache, dest[0], dest[1], dest[2])? { continue; }
             let key = (r.id, dest);
             if !seen.insert(key) { continue; }
             let cost = res.total_cost_ms;
@@ -174,11 +175,11 @@ impl SqliteGraphProvider {
     }
 
     fn neighbors_ifslots(&self, tile: Tile, options: &SearchOptions) -> rusqlite::Result<Vec<Edge>> {
-        let index = self.chain_index.ensure_built(&self.db);
+        let index = self.chain_index.ensure_built(self.db.as_ref());
         let rows = self.db.iter_ifslot_nodes()?;
         let mut edges: Vec<Edge> = Vec::new();
         let mut seen: std::collections::HashSet<(i32, Tile)> = std::collections::HashSet::new();
-        let mut resolver = NodeChainResolver::new(&self.db, &self.cost_model, options);
+        let mut resolver = NodeChainResolver::new(self.db.as_ref(), &self.cost_model, options);
 
         for r in rows.into_iter() {
             if index.is_non_head("ifslot", r.id) { continue; }
@@ -190,7 +191,7 @@ impl SqliteGraphProvider {
             let dest_plane = bounds.plane.unwrap_or(tile[2]);
             let dest: Tile = [bounds.min_x, bounds.min_y, dest_plane];
             if dest == tile { continue; }
-            if !_tile_exists(&self.db, &self.plane_cache, dest[0], dest[1], dest[2])? { continue; }
+            if !_tile_exists(self.db.as_ref(), &self.plane_cache, dest[0], dest[1], dest[2])? { continue; }
             let key = (r.id, dest);
             if !seen.insert(key) { continue; }
             let cost = res.total_cost_ms;
@@ -220,7 +221,7 @@ impl SqliteGraphProvider {
     /// Warm provider caches that are safe to prebuild.
     pub fn warm(&self) -> rusqlite::Result<()> {
         // Build chain-head index once
-        let _ = self.chain_index.ensure_built(&self.db);
+        let _ = self.chain_index.ensure_built(self.db.as_ref());
         Ok(())
     }
 
@@ -237,7 +238,7 @@ impl SqliteGraphProvider {
                 continue;
             }
             let dest = [tile[0] + m.dx, tile[1] + m.dy, tile[2]];
-            if !_tile_exists(&self.db, &self.plane_cache, dest[0], dest[1], dest[2])? {
+            if !_tile_exists(self.db.as_ref(), &self.plane_cache, dest[0], dest[1], dest[2])? {
                 continue;
             }
             let cost = self.cost_model.movement_cost(tile, dest);
@@ -254,7 +255,7 @@ impl SqliteGraphProvider {
     }
 
     fn neighbors_doors(&self, tile: Tile) -> rusqlite::Result<Vec<Edge>> {
-        let index = self.chain_index.ensure_built(&self.db);
+        let index = self.chain_index.ensure_built(self.db.as_ref());
         let mut edges = Vec::new();
         let rows = self.db.iter_door_nodes_touching(tile)?;
         for r in rows {
@@ -269,7 +270,7 @@ impl SqliteGraphProvider {
             } else {
                 continue;
             };
-            if !_tile_exists(&self.db, &self.plane_cache, dest[0], dest[1], dest[2])? {
+            if !_tile_exists(self.db.as_ref(), &self.plane_cache, dest[0], dest[1], dest[2])? {
                 continue;
             }
             let cost = self.cost_model.door_cost(r.cost);
@@ -326,7 +327,7 @@ impl SqliteGraphProvider {
             return Ok(vec![]);
         }
 
-        let index = self.chain_index.ensure_built(&self.db);
+        let index = self.chain_index.ensure_built(self.db.as_ref());
         let mut edges = Vec::new();
         let rows = self.db.iter_lodestone_nodes()?;
 
@@ -346,7 +347,7 @@ impl SqliteGraphProvider {
             if dest == tile {
                 continue;
             }
-            if !_tile_exists(&self.db, &self.plane_cache, dest[0], dest[1], dest[2])? {
+            if !_tile_exists(self.db.as_ref(), &self.plane_cache, dest[0], dest[1], dest[2])? {
                 continue;
             }
             let cost = self.cost_model.lodestone_cost(r.cost);
@@ -437,7 +438,7 @@ impl GraphProvider for SqliteGraphProvider {
         options: &SearchOptions,
     ) -> rusqlite::Result<Vec<Edge>> {
         // Ensure chain-head index built once
-        let _ = self.chain_index.ensure_built(&self.db);
+        let _ = self.chain_index.ensure_built(self.db.as_ref());
         // Fetch tile row or abort
         let row = match self.db.fetch_tile(tile[0], tile[1], tile[2])? {
             Some(r) => r,

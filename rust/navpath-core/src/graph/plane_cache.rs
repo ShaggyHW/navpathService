@@ -11,6 +11,8 @@ use lru::LruCache;
 
 use crate::db::Database;
 
+pub const DEFAULT_PLANE_CACHE_CAPACITY: usize = 8;
+
 /// Configuration for the plane cache.
 #[derive(Copy, Clone, Debug)]
 pub struct PlaneTileCacheConfig {
@@ -19,7 +21,7 @@ pub struct PlaneTileCacheConfig {
 }
 
 impl Default for PlaneTileCacheConfig {
-    fn default() -> Self { Self { capacity: 8 } }
+    fn default() -> Self { Self { capacity: DEFAULT_PLANE_CACHE_CAPACITY } }
 }
 
 /// A thread-safe LRU cache of per-plane tile existence sets.

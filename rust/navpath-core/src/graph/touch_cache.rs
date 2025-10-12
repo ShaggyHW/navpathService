@@ -10,6 +10,9 @@ use crate::db::Database;
 use crate::models::Tile;
 use crate::db::rows::{ObjectNodeRow, NpcNodeRow};
 
+pub const DEFAULT_TOUCH_OBJECTS_CAPACITY: usize = 4096;
+pub const DEFAULT_TOUCH_NPCS_CAPACITY: usize = 4096;
+
 #[derive(Copy, Clone, Debug)]
 pub struct TouchCacheConfig {
     pub objects_capacity: usize,
@@ -18,7 +21,7 @@ pub struct TouchCacheConfig {
 
 impl Default for TouchCacheConfig {
     fn default() -> Self {
-        Self { objects_capacity: 4096, npcs_capacity: 4096 }
+        Self { objects_capacity: DEFAULT_TOUCH_OBJECTS_CAPACITY, npcs_capacity: DEFAULT_TOUCH_NPCS_CAPACITY }
     }
 }
 
