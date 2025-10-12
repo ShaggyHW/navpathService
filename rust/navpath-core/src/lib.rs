@@ -12,12 +12,15 @@ pub mod graph;
 pub mod nodes;
 pub mod astar;
 pub mod jps;
+pub mod geometry;
+pub mod funnel;
 
 pub use cost::CostModel;
 pub use models::{ActionStep, NodeRef, PathResult, Rect, Tile};
 pub use options::SearchOptions;
 pub use db::Database;
 pub use jps::JpsConfig;
+pub use crate::graph::navmesh_provider::NavmeshGraphProvider;
 
 /// Returns the crate version for basic linkage diagnostics.
 pub fn version() -> &'static str {

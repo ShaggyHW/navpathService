@@ -43,12 +43,12 @@ impl Default for SearchOptions {
             max_expansions: DEFAULT_MAX_EXPANSIONS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             max_chain_depth: DEFAULT_MAX_CHAIN_DEPTH,
-            door_cost_override: Some(600),
-            lodestone_cost_override: Some(17000),
-            object_cost_override: Some(2000),
-            ifslot_cost_override: Some(1000),
-            npc_cost_override: Some(1000),
-            item_cost_override: Some(3000),
+            door_cost_override: Some(1),
+            lodestone_cost_override: Some(1),
+            object_cost_override: Some(1),
+            ifslot_cost_override: Some(1),
+            npc_cost_override: Some(1),
+            item_cost_override: Some(1),
             extras: HashMap::new(),
         }
     }

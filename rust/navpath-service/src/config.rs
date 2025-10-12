@@ -6,6 +6,24 @@ use anyhow::bail;
 use navpath_core::db::open::DbOpenConfig;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderMode {
+    Sqlite,
+    Navmesh,
+}
+
+impl Default for ProviderMode {
+    fn default() -> Self { ProviderMode::Sqlite }
+}
+
+pub fn provider_mode_from_env() -> ProviderMode {
+    match env::var("NAVPATH_PROVIDER").ok().map(|s| s.to_ascii_lowercase()) {
+        Some(ref s) if s == "navmesh" => ProviderMode::Navmesh,
+        Some(ref s) if s == "sqlite" => ProviderMode::Sqlite,
+        _ => ProviderMode::Navmesh,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JpsMode {
     Auto,
     Off,

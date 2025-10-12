@@ -7,6 +7,7 @@ use std::path::Path;
 pub mod rows;
 pub mod queries;
 pub mod open;
+pub mod navmesh;
 
 pub struct Database {
     conn: Connection,

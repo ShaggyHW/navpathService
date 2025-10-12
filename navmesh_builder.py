@@ -76,11 +76,13 @@ NODE_TABLES = {
     "object_nodes": {
         "key": "object",
         "has_origin": True,
-        "cols": ("id","dest_min_x","dest_max_x","dest_min_y","dest_max_y","dest_plane",
+        "cols": ("id","match_type","object_id","object_name","action",
+                 "dest_min_x","dest_max_x","dest_min_y","dest_max_y","dest_plane",
                  "orig_min_x","orig_max_x","orig_min_y","orig_max_y","orig_plane",
                  "search_radius","cost","next_node_type","next_node_id","requirement_id"),
         "sql": """
-            SELECT id, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
+            SELECT id, match_type, object_id, object_name, action,
+                   dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
                    orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane,
                    search_radius, cost, next_node_type, next_node_id, requirement_id
             FROM object_nodes
@@ -168,7 +170,7 @@ NODE_TABLES = {
 
 DIR_TOKENS = {"N","NE","E","SE","S","SW","W","NW","NORTH","EAST","SOUTH","WEST","NORTHEAST","NORTHWEST","SOUTHEAST","SOUTHWEST"}
 
-MAX_POLY_EXTENT = 64
+MAX_POLY_EXTENT = 16
 
 def is_tile_walkable(allowed: Optional[str], blocked: Optional[str]) -> bool:
     """
@@ -319,6 +321,14 @@ CREATE TABLE IF NOT EXISTS meta(
   value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS requirements(
+  id INTEGER PRIMARY KEY,
+  metaInfo TEXT,
+  key TEXT,
+  value INTEGER,
+  comparison TEXT
+);
+
 CREATE TABLE IF NOT EXISTS cells(
   id INTEGER PRIMARY KEY,
   plane INTEGER NOT NULL,
@@ -463,6 +473,7 @@ def build_adjacency(cells: Dict[int, Polygon], plane: int, cur: sqlite3.Cursor):
 def find_cell_containing_point(cur: sqlite3.Cursor, plane: int, pt: Point) -> Optional[int]:
     x = float(pt.x); y = float(pt.y)
     # RTree coarse filter
+    conn = cur.connection
     for (cid,) in cur.execute(
         """
         SELECT r.id
@@ -474,7 +485,7 @@ def find_cell_containing_point(cur: sqlite3.Cursor, plane: int, pt: Point) -> Op
         """,
         (plane, x, x, y, y),
     ):
-        (wkb_bytes,) = cur.execute("SELECT wkb FROM cells WHERE id=?", (cid,)).fetchone()
+        (wkb_bytes,) = conn.execute("SELECT wkb FROM cells WHERE id=?", (cid,)).fetchone()
         geom = wkb.loads(wkb_bytes)
         if geom.contains(pt):
             return cid
@@ -484,6 +495,7 @@ def find_cell_containing_point(cur: sqlite3.Cursor, plane: int, pt: Point) -> Op
 def find_cells_intersecting_rect(cur: sqlite3.Cursor, plane: int, rect_poly: Polygon) -> List[int]:
     minx, miny, maxx, maxy = bbox_of_geom(rect_poly)
     hits = []
+    conn = cur.connection
     for (cid,) in cur.execute(
         """
         SELECT r.id
@@ -495,7 +507,7 @@ def find_cells_intersecting_rect(cur: sqlite3.Cursor, plane: int, rect_poly: Pol
         """,
         (plane, maxx, minx, maxy, miny),
     ):
-        (wkb_bytes,) = cur.execute("SELECT wkb FROM cells WHERE id=?", (cid,)).fetchone()
+        (wkb_bytes,) = conn.execute("SELECT wkb FROM cells WHERE id=?", (cid,)).fetchone()
         geom = wkb.loads(wkb_bytes)
         if geom.intersects(rect_poly):
             hits.append(cid)
@@ -564,6 +576,7 @@ def rect_to_poly(ixmin: int, ixmax: int, iymin: int, iymax: int) -> Polygon:
 
 def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection, plane: int):
     cur = out_conn.cursor()
+    req_ids: set = set()
 
     # Helper: insert offmesh row
     def add_offmesh(link_type: str, node_table: str, node_id: int, req_id: Optional[int],
@@ -578,10 +591,12 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
             VALUES(?,?,?,?,?,?,?,?,?,?)
         """, (link_type, node_table, node_id, req_id, cost,
               plane_from, plane_to, src_cell_id, dst_cell_id, json.dumps(meta, separators=(",",":"))))
+        if req_id is not None:
+            req_ids.add(int(req_id))
 
     # Lodestones (point destination)
     rows = in_conn.execute(NODE_TABLES["lodestone_nodes"]["sql"])
-    for node_id, lodename, dx, dy, dplane, cost, _, _, req_id in rows:
+    for node_id, lodename, dx, dy, dplane, cost, next_node_type, next_node_id, req_id in rows:
         if dplane != plane:
             continue
         pt = Point(float(dx)+0.5, float(dy)+0.5)
@@ -589,8 +604,15 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
         if dst_id is None:
             continue
         # Origin is the start tile only ⇒ src_cell_id NULL
-        add_offmesh("lodestone","lodestone_nodes",node_id,req_id,cost,None,plane,None,dst_id,
-                    {"lodestone": lodename, "dest_point":[dx,dy,dplane]})
+        add_offmesh(
+            "lodestone","lodestone_nodes",node_id,req_id,cost,None,plane,None,dst_id,
+            {
+                "lodestone": lodename,
+                "dest_point":[dx,dy,dplane],
+                "next_node_type": next_node_type,
+                "next_node_id": next_node_id,
+            }
+        )
 
     # Doors (connect inside/outside tiles)
     rows = in_conn.execute(NODE_TABLES["door_nodes"]["sql"])
@@ -608,7 +630,10 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
             b_id = find_cell_containing_point(cur, plane, b_pt)
 
         meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action,
-                "real_id_open": real_open, "real_id_closed": real_closed}
+                "real_id_open": real_open, "real_id_closed": real_closed,
+                "direction": direction,
+                "location_open_x": lox, "location_open_y": loy, "location_open_plane": lop,
+                "location_closed_x": lcx, "location_closed_y": lcy, "location_closed_plane": lcp}
 
         # Same-plane: add both directions when both endpoints are in this plane
         if ip == op == plane and a_id is not None and b_id is not None:
@@ -629,23 +654,24 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
         rows = in_conn.execute(specs["sql"])
         for row in rows:
             if table_name == "object_nodes":
-                (node_id, dminx, dmaxx, dminy, dmaxy, dplane,
+                (node_id, match_type, object_id, object_name, action,
+                 dminx, dmaxx, dminy, dmaxy, dplane,
                  ominx, omaxx, ominy, omaxy, oplane,
-                 search_radius, cost, _, _, req_id) = row
+                 search_radius, cost, next_node_type, next_node_id, req_id) = row
             elif table_name == "npc_nodes":
                 (node_id, match_type, npc_id, npc_name, action,
                  dminx, dmaxx, dminy, dmaxy, dplane,
                  search_radius, cost, ominx, omaxx, ominy, omaxy, oplane,
-                 _, _, req_id) = row
+                 next_node_type, next_node_id, req_id) = row
             elif table_name == "ifslot_nodes":
                 (node_id, interface_id, component_id, slot_id, click_id,
                  dminx, dmaxx, dminy, dmaxy, dplane,
-                 cost, _, _, req_id) = row
+                 cost, next_node_type, next_node_id, req_id) = row
                 ominx=omaxx=ominy=omaxy=oplane=None
             else:  # item_nodes
                 (node_id, item_id, action,
                  dminx, dmaxx, dminy, dmaxy, dplane,
-                 cost, _, _, req_id) = row
+                 cost, next_node_type, next_node_id, req_id) = row
                 ominx=omaxx=ominy=omaxy=oplane=None
 
             if dplane != plane:
@@ -672,12 +698,50 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
             meta = {"dest_rect":[dminx,dmaxx,dminy,dmaxy,dplane]}
             if table_name in ("object_nodes","npc_nodes") and oplane is not None and ominx is not None:
                 meta["orig_rect"] = [ominx,omaxx,ominy,omaxy,oplane]
+            # Per-type enrichment for OG metadata parity
+            if table_name == "object_nodes":
+                meta.update({
+                    "action": action,
+                    "object_id": object_id,
+                    "object_name": object_name,
+                    "match_type": match_type,
+                    "next_node_type": next_node_type,
+                    "next_node_id": next_node_id,
+                })
+            elif table_name == "npc_nodes":
+                meta.update({
+                    "action": action,
+                    "npc_id": npc_id,
+                    "npc_name": npc_name,
+                    "match_type": match_type,
+                    "next_node_type": next_node_type,
+                    "next_node_id": next_node_id,
+                })
+            elif table_name == "ifslot_nodes":
+                meta.update({
+                    "interface_id": interface_id,
+                    "component_id": component_id,
+                    "slot_id": slot_id,
+                    "click_id": click_id,
+                    "next_node_type": next_node_type,
+                    "next_node_id": next_node_id,
+                })
+            else:  # item_nodes
+                meta.update({
+                    "item_id": item_id,
+                    "action": action,
+                    "next_node_type": next_node_type,
+                    "next_node_id": next_node_id,
+                })
 
             for dst_id in dst_ids:
                 for src_id in src_ids:
                     add_offmesh(specs["key"], table_name, node_id, req_id, cost,
                                 plane if src_id is not None else None, plane,
                                 src_id, dst_id, meta)
+
+    # Ensure requirements referenced by any added offmesh rows exist in output DB
+    copy_requirements(in_conn, out_conn, req_ids)
 
     out_conn.commit()
 
@@ -716,6 +780,30 @@ def cell_ids_for_rect(out_conn: sqlite3.Connection, plane: int,
     return find_cells_intersecting_rect(cur, plane, rect)
 
 
+def copy_requirements(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection, req_ids: set):
+    """
+    Ensure that all requirement rows referenced by offmesh links exist in the output DB.
+    Missing rows in the source DB are skipped gracefully.
+    """
+    if not req_ids:
+        return
+    cur_out = out_conn.cursor()
+    for rid in sorted({int(r) for r in req_ids if r is not None}):
+        try:
+            row = in_conn.execute(
+                "SELECT id, metaInfo, key, value, comparison FROM requirements WHERE id = ?",
+                (rid,),
+            ).fetchone()
+        except Exception:
+            row = None
+        if row is None:
+            continue
+        cur_out.execute(
+            "INSERT OR IGNORE INTO requirements(id, metaInfo, key, value, comparison) VALUES(?,?,?,?,?)",
+            (row[0], row[1], row[2], row[3], row[4]),
+        )
+
+
 def ensure_offmesh(out_conn: sqlite3.Connection, link_type: str, node_table: str, node_id: int,
                    requirement_id: Optional[int], cost: Optional[float],
                    plane_from: Optional[int], plane_to: int,
@@ -746,12 +834,15 @@ def ensure_offmesh(out_conn: sqlite3.Connection, link_type: str, node_table: str
 
 def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection):
     print("[resolve] Resolving cross-plane doors and origin→dest links ...")
+    req_ids: set = set()
 
     # Doors: ensure both directions with concrete src/dst ids
     rows = in_conn.execute(NODE_TABLES["door_nodes"]["sql"])
     for (node_id, direction, real_open, real_closed,
          lox, loy, lop, lcx, lcy, lcp,
          ix, iy, ip, ox, oy, op, open_action, cost, _, _, req_id) in rows:
+        if req_id is not None:
+            req_ids.add(int(req_id))
         a_id = cell_id_for_tile(out_conn, ip, ix, iy)
         b_id = cell_id_for_tile(out_conn, op, ox, oy)
         meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action,
@@ -766,7 +857,8 @@ def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection
         rows = in_conn.execute(NODE_TABLES[table_name]["sql"])
         for row in rows:
             if table_name == "object_nodes":
-                (node_id, dminx, dmaxx, dminy, dmaxy, dplane,
+                (node_id, match_type, object_id, object_name, action,
+                 dminx, dmaxx, dminy, dmaxy, dplane,
                  ominx, omaxx, ominy, omaxy, oplane,
                  search_radius, cost, _, _, req_id) = row
             else:
@@ -774,6 +866,8 @@ def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection
                  dminx, dmaxx, dminy, dmaxy, dplane,
                  search_radius, cost, ominx, omaxx, ominy, omaxy, oplane,
                  _, _, req_id) = row
+            if req_id is not None:
+                req_ids.add(int(req_id))
             # Need both planes known
             if None in (ominx, omaxx, ominy, omaxy, oplane, dplane):
                 continue
@@ -787,6 +881,9 @@ def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection
                 for dst_id in d_ids:
                     ensure_offmesh(out_conn, NODE_TABLES[table_name]["key"], table_name, node_id,
                                    req_id, cost, oplane, dplane, src_id, dst_id, meta)
+
+    # Copy any referenced requirement rows into the output DB
+    copy_requirements(in_conn, out_conn, req_ids)
 
     print("[resolve] Done.")
 

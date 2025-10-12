@@ -1,8 +1,8 @@
 use crate::models::Tile;
 use crate::options::SearchOptions;
 
-pub const DEFAULT_STEP_COST_MS: i64 = 200;
-pub const DEFAULT_NODE_COST_MS: i64 = 600;
+pub const DEFAULT_STEP_COST_MS: i64 = 2;
+pub const DEFAULT_NODE_COST_MS: i64 = 6;
 
 #[derive(Clone, Debug)]
 pub struct CostModel {

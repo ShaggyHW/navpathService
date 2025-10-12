@@ -6,12 +6,14 @@ use tracing::{error, info, info_span};
 
 use std::sync::atomic::Ordering;
 
-use navpath_core::{astar::AStar, CostModel, PathResult, SearchOptions, Tile};
+use navpath_core::{astar::AStar, CostModel, PathResult, SearchOptions, Tile, ActionStep, Rect};
 use navpath_core::db::{self, Database};
 use navpath_core::graph::provider::SqliteGraphProvider;
+use navpath_core::graph::navmesh_provider::NavmeshGraphProvider;
+use navpath_core::funnel::string_pull;
 
 use crate::state::AppState;
-use crate::config::JpsMode;
+use crate::config::{JpsMode, ProviderMode};
 
 #[derive(Debug, Deserialize)]
 pub struct FindPathRequest {
@@ -96,19 +98,96 @@ async fn find_path(State(state): State<AppState>, Query(params): Query<FindPathQ
     };
     let db = Database::from_connection(conn);
     let cm = CostModel::new(options.clone());
-    let provider = SqliteGraphProvider::new(db, cm.clone());
-    let astar = AStar::new(&provider, &cm);
-    let result: Result<PathResult, anyhow::Error> = astar.find_path(start, goal, &options).map_err(|e| e.into());
+    let result: Result<PathResult, anyhow::Error> = match state.provider_mode {
+        ProviderMode::Sqlite => {
+            let provider = SqliteGraphProvider::new(db, cm.clone());
+            let astar = AStar::new(&provider, &cm);
+            astar.find_path(start, goal, &options).map_err(|e| e.into())
+        }
+        ProviderMode::Navmesh => {
+            // Map incoming tile centers to navmesh cells
+            let provider = NavmeshGraphProvider::new(db, cm.clone());
+            let start_xy = [start[0] as f64 + 0.5, start[1] as f64 + 0.5];
+            let goal_xy = [goal[0] as f64 + 0.5, goal[1] as f64 + 0.5];
+            let s_cell = match provider.map_point_to_tile(start_xy[0], start_xy[1], start[2]) {
+                Ok(Some(t)) => t,
+                _ => {
+                    return (StatusCode::BAD_REQUEST, Json(json!({
+                        "error": "ERR_START_NOT_ON_NAVMESH",
+                        "message": "Start tile center does not map to any navmesh cell"
+                    }))).into_response();
+                }
+            };
+            let g_cell = match provider.map_point_to_tile(goal_xy[0], goal_xy[1], goal[2]) {
+                Ok(Some(t)) => t,
+                _ => {
+                    return (StatusCode::BAD_REQUEST, Json(json!({
+                        "error": "ERR_GOAL_NOT_ON_NAVMESH",
+                        "message": "Goal tile center does not map to any navmesh cell"
+                    }))).into_response();
+                }
+            };
+            let astar = AStar::new(&provider, &cm);
+            match astar.find_path(s_cell, g_cell, &options).map_err(|e| e.into()) {
+                Ok(mut res) => {
+                    // Derive world-space waypoints from portal metadata
+                    let mut portals: Vec<([f64; 2], [f64; 2])> = Vec::new();
+                    for a in &res.actions {
+                        if a.type_ == "move" {
+                            if let Some(m) = a.metadata.as_ref() {
+                                if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
+                                    m.get("x1").and_then(|v| v.as_f64()),
+                                    m.get("y1").and_then(|v| v.as_f64()),
+                                    m.get("x2").and_then(|v| v.as_f64()),
+                                    m.get("y2").and_then(|v| v.as_f64()),
+                                ) {
+                                    portals.push(([x1, y1], [x2, y2]));
+                                }
+                            }
+                        }
+                    }
+                    let waypoints = string_pull(start_xy, &portals, goal_xy, 1e-9);
+                    // Append synthetic action step carrying waypoints so clients can render a world path without schema change
+                    let synth = ActionStep {
+                        type_: "waypoints".into(),
+                        from_rect: Rect { min: start, max: start },
+                        to_rect: Rect { min: goal, max: goal },
+                        cost_ms: 0,
+                        node: None,
+                        metadata: Some(json!({ "waypoints": waypoints })),
+                    };
+                    res.actions.push(synth);
+                    Ok(res)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    };
 
     match result {
-        Ok(res) => {
+        Ok(mut res) => {
+            for a in res.actions.iter_mut() {
+                if a.type_ != "move" && a.type_ != "waypoints" {
+                    if let Some(m) = a.metadata.take() {
+                        if let serde_json::Value::Object(map) = m {
+                            if let Some(db_row) = map.get("db_row").cloned() {
+                                a.metadata = Some(json!({ "db_row": db_row }));
+                            } else {
+                                a.metadata = None;
+                            }
+                        } else {
+                            a.metadata = None;
+                        }
+                    }
+                }
+            }
             let path_len = res.path.as_ref().map(|p| p.len()).unwrap_or(0);
             // Best-effort derived enabled flag for logging. Defaults to true in core when not specified.
             let jps_enabled_log = match state.jps_mode {
                 JpsMode::Off => false,
                 JpsMode::Auto => options.extras.get("jps_enabled").and_then(|v| v.as_bool()).unwrap_or(true),
             };
-            info!(reason=?res.reason, expanded=res.expanded, path_len, total_cost_ms=res.cost_ms, jps_mode=?state.jps_mode, jps_enabled=jps_enabled_log, "find_path done");
+            info!(reason=?res.reason, expanded=res.expanded, path_len, total_cost_ms=res.cost_ms, jps_mode=?state.jps_mode, provider_mode=?state.provider_mode, jps_enabled=jps_enabled_log, "find_path done");
             // Check query flag OR body options.extras.only_actions for parity
             let body_only_actions = {
                 let val = options.extras.get("only_actions").or_else(|| options.extras.get("actions_only"));
