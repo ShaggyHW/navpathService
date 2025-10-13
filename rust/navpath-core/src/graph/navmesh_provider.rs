@@ -140,6 +140,10 @@ impl NavmeshGraphProvider {
                             let mut db_row = json!({
                                 "id": r.node_id,
                                 "direction": m.get("direction").cloned().unwrap_or(Value::Null),
+                                "real_id_open": m.get("real_id_open").cloned().unwrap_or(Value::Null),
+                                "real_id_closed": m.get("real_id_closed").cloned().unwrap_or(Value::Null),
+                                "openID": m.get("real_id_open").cloned().unwrap_or(Value::Null),
+                                "closedID": m.get("real_id_closed").cloned().unwrap_or(Value::Null),
                                 "location_open_x": Value::Null,
                                 "location_open_y": Value::Null,
                                 "location_open_plane": Value::Null,
@@ -179,6 +183,39 @@ impl NavmeshGraphProvider {
                             if let Some(v) = m.get("location_closed_x").cloned() { db_row["location_closed_x"] = v; }
                             if let Some(v) = m.get("location_closed_y").cloned() { db_row["location_closed_y"] = v; }
                             if let Some(v) = m.get("location_closed_plane").cloned() { db_row["location_closed_plane"] = v; }
+                            if let Ok(Some(drow)) = self.db.fetch_door_node(r.node_id) {
+                                let [ix, iy, ip] = drow.tile_inside;
+                                db_row["tile_inside_x"] = Value::from(ix);
+                                db_row["tile_inside_y"] = Value::from(iy);
+                                db_row["tile_inside_plane"] = Value::from(ip);
+                                let [ox, oy, op] = drow.tile_outside;
+                                db_row["tile_outside_x"] = Value::from(ox);
+                                db_row["tile_outside_y"] = Value::from(oy);
+                                db_row["tile_outside_plane"] = Value::from(op);
+                                let [lox, loy, lop] = drow.location_open;
+                                db_row["location_open_x"] = Value::from(lox);
+                                db_row["location_open_y"] = Value::from(loy);
+                                db_row["location_open_plane"] = Value::from(lop);
+                                let [lcx, lcy, lcp] = drow.location_closed;
+                                db_row["location_closed_x"] = Value::from(lcx);
+                                db_row["location_closed_y"] = Value::from(lcy);
+                                db_row["location_closed_plane"] = Value::from(lcp);
+                                if db_row.get("direction").and_then(Value::as_str).is_none() {
+                                    if let Some(dir) = drow.direction.clone() { db_row["direction"] = Value::from(dir); }
+                                }
+                                if db_row.get("open_action").and_then(Value::as_str).is_none() {
+                                    if let Some(act) = drow.open_action.clone() { db_row["open_action"] = Value::from(act); }
+                                }
+                                if db_row.get("next_node_type").and_then(Value::as_str).is_none() {
+                                    if let Some(nt) = drow.next_node_type.clone() { db_row["next_node_type"] = Value::from(nt); }
+                                }
+                                if db_row.get("next_node_id").and_then(Value::as_i64).is_none() {
+                                    if let Some(ni) = drow.next_node_id { db_row["next_node_id"] = Value::from(ni); }
+                                }
+                                if db_row.get("requirement_id").and_then(Value::as_i64).is_none() {
+                                    if let Some(rid) = drow.requirement_id { db_row["requirement_id"] = Value::from(rid); }
+                                }
+                            }
                             // Compute door direction at runtime using current cell and inside/outside cells
                             let mut computed_dir: Option<String> = None;
                             if let (Some(ix), Some(iy), Some(ip), Some(ox), Some(oy), Some(op)) = (

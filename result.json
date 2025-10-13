@@ -3,24 +3,24 @@
         "type": "lodestone",
         "from": {
             "min": [
-                -1,
+                732,
                 0,
                 0
             ],
             "max": [
-                -1,
+                732,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                408,
+                904,
                 0,
                 0
             ],
             "max": [
-                408,
+                904,
                 0,
                 0
             ]
@@ -28,22 +28,22 @@
         "cost_ms": 1,
         "node": {
             "type": "lodestone",
-            "id": 5
+            "id": 13
         },
         "metadata": {
             "db_row": {
                 "child_chain": [],
                 "cost": 1,
                 "dest": [
-                    2634,
-                    3348,
+                    3067,
+                    3505,
                     0
                 ],
-                "id": 5,
-                "lodestone": "ARDOUGNE",
+                "id": 13,
+                "lodestone": "EDGEVILLE",
                 "next_node_id": null,
                 "next_node_type": null,
-                "requirement_id": 14
+                "requirement_id": 8
             }
         }
     },
@@ -51,741 +51,307 @@
         "type": "move",
         "from": {
             "min": [
-                408,
+                904,
                 0,
                 0
             ],
             "max": [
-                408,
+                904,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                407,
+                933,
                 0,
                 0
             ],
             "max": [
-                407,
+                933,
                 0,
                 0
             ]
         },
         "cost_ms": 1,
         "metadata": {
-            "a_id": 407,
-            "b_id": 408,
+            "a_id": 904,
+            "b_id": 933,
             "length": 1.0,
             "plane": 0,
-            "portal_id": 2127,
-            "x1": 2648.0,
-            "x2": 2649.0,
-            "y1": 3318.0,
-            "y2": 3318.0
+            "portal_id": 5091,
+            "x1": 3077.0,
+            "x2": 3077.0,
+            "y1": 3489.0,
+            "y2": 3488.0
         }
     },
     {
-        "type": "move",
+        "type": "object",
         "from": {
             "min": [
-                407,
-                0,
+                3090,
+                3474,
                 0
             ],
             "max": [
-                407,
-                0,
+                3092,
+                3478,
                 0
             ]
         },
         "to": {
             "min": [
-                374,
-                0,
+                3153,
+                3921,
                 0
             ],
             "max": [
-                374,
-                0,
+                3156,
+                3929,
                 0
             ]
         },
         "cost_ms": 1,
+        "node": {
+            "type": "object",
+            "id": 2
+        },
         "metadata": {
-            "a_id": 374,
-            "b_id": 407,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 1965,
-            "x1": 2619.0,
-            "x2": 2619.0,
-            "y1": 3304.0,
-            "y2": 3303.0
+            "db_row": {
+                "action": "Pull",
+                "child_chain": [],
+                "cost": 1,
+                "dest_max_x": 3156,
+                "dest_max_y": 3929,
+                "dest_min_x": 3153,
+                "dest_min_y": 3921,
+                "dest_plane": 0,
+                "id": 2,
+                "match_type": "id",
+                "next_node_id": null,
+                "next_node_type": null,
+                "object_id": 1814,
+                "object_name": null,
+                "orig_max_x": 3092,
+                "orig_max_y": 3478,
+                "orig_min_x": 3090,
+                "orig_min_y": 3474,
+                "orig_plane": 0,
+                "requirement_id": null
+            }
         }
     },
     {
         "type": "move",
         "from": {
             "min": [
-                374,
+                1890,
                 0,
                 0
             ],
             "max": [
-                374,
+                1890,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                373,
+                1891,
                 0,
                 0
             ],
             "max": [
-                373,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 1,
-        "metadata": {
-            "a_id": 373,
-            "b_id": 374,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 1929,
-            "x1": 2592.0,
-            "x2": 2593.0,
-            "y1": 3278.0,
-            "y2": 3278.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                373,
-                0,
-                0
-            ],
-            "max": [
-                373,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                370,
-                0,
-                0
-            ],
-            "max": [
-                370,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 1,
-        "metadata": {
-            "a_id": 370,
-            "b_id": 373,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 1913,
-            "x1": 2615.0,
-            "x2": 2616.0,
-            "y1": 3238.0,
-            "y2": 3238.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                370,
-                0,
-                0
-            ],
-            "max": [
-                370,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                369,
-                0,
-                0
-            ],
-            "max": [
-                369,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 1,
-        "metadata": {
-            "a_id": 369,
-            "b_id": 370,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 1889,
-            "x1": 2582.0,
-            "x2": 2583.0,
-            "y1": 3198.0,
-            "y2": 3198.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                369,
-                0,
-                0
-            ],
-            "max": [
-                369,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                367,
-                0,
-                0
-            ],
-            "max": [
-                367,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 2,
-        "metadata": {
-            "a_id": 367,
-            "b_id": 369,
-            "length": 2.0,
-            "plane": 0,
-            "portal_id": 1879,
-            "x1": 2579.0,
-            "x2": 2581.0,
-            "y1": 3158.0,
-            "y2": 3158.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                367,
-                0,
-                0
-            ],
-            "max": [
-                367,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                324,
-                0,
-                0
-            ],
-            "max": [
-                324,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 1,
-        "metadata": {
-            "a_id": 324,
-            "b_id": 367,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 1637,
-            "x1": 2579.0,
-            "x2": 2579.0,
-            "y1": 3142.0,
-            "y2": 3141.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                324,
-                0,
-                0
-            ],
-            "max": [
-                324,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                277,
-                0,
-                0
-            ],
-            "max": [
-                277,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 1,
-        "metadata": {
-            "a_id": 277,
-            "b_id": 324,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 1345,
-            "x1": 2539.0,
-            "x2": 2539.0,
-            "y1": 3121.0,
-            "y2": 3120.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                277,
-                0,
-                0
-            ],
-            "max": [
-                277,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                271,
-                0,
-                0
-            ],
-            "max": [
-                271,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 4,
-        "metadata": {
-            "a_id": 271,
-            "b_id": 277,
-            "length": 4.0,
-            "plane": 0,
-            "portal_id": 1315,
-            "x1": 2505.0,
-            "x2": 2509.0,
-            "y1": 3118.0,
-            "y2": 3118.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                271,
-                0,
-                0
-            ],
-            "max": [
-                271,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                269,
-                0,
-                0
-            ],
-            "max": [
-                269,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 1,
-        "metadata": {
-            "a_id": 269,
-            "b_id": 271,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 1299,
-            "x1": 2501.0,
-            "x2": 2502.0,
-            "y1": 3078.0,
-            "y2": 3078.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                269,
-                0,
-                0
-            ],
-            "max": [
-                269,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                317,
-                0,
-                0
-            ],
-            "max": [
-                317,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 1,
-        "metadata": {
-            "a_id": 269,
-            "b_id": 317,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 1307,
-            "x1": 2539.0,
-            "x2": 2539.0,
-            "y1": 3068.0,
-            "y2": 3067.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                317,
-                0,
-                0
-            ],
-            "max": [
-                317,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                315,
-                0,
-                0
-            ],
-            "max": [
-                315,
+                1891,
                 0,
                 0
             ]
         },
         "cost_ms": 3,
         "metadata": {
-            "a_id": 315,
-            "b_id": 317,
+            "a_id": 1890,
+            "b_id": 1891,
             "length": 3.0,
             "plane": 0,
-            "portal_id": 1583,
-            "x1": 2560.0,
-            "x2": 2563.0,
-            "y1": 3038.0,
-            "y2": 3038.0
+            "portal_id": 9717,
+            "x1": 3154.0,
+            "x2": 3157.0,
+            "y1": 3947.0,
+            "y2": 3947.0
         }
     },
     {
-        "type": "move",
+        "type": "door",
         "from": {
             "min": [
-                315,
+                1891,
                 0,
                 0
             ],
             "max": [
-                315,
+                1891,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                314,
+                1634,
                 0,
                 0
             ],
             "max": [
-                314,
+                1634,
                 0,
                 0
             ]
         },
-        "cost_ms": 2,
+        "cost_ms": 1,
+        "node": {
+            "type": "door",
+            "id": 4
+        },
         "metadata": {
-            "a_id": 314,
-            "b_id": 315,
-            "length": 2.0,
-            "plane": 0,
-            "portal_id": 1571,
-            "x1": 2568.0,
-            "x2": 2570.0,
-            "y1": 2998.0,
-            "y2": 2998.0
+            "db_row": {
+                "child_chain": [],
+                "cost": 1,
+                "direction": "out",
+                "id": 4,
+                "location_closed_plane": 0,
+                "location_closed_x": 3158,
+                "location_closed_y": 3951,
+                "location_open_plane": 0,
+                "location_open_x": 3158,
+                "location_open_y": 3951,
+                "next_node_id": null,
+                "next_node_type": null,
+                "open_action": "Slash",
+                "requirement_id": null,
+                "tile_inside_plane": 0,
+                "tile_inside_x": 3158,
+                "tile_inside_y": 3950,
+                "tile_outside_plane": 0,
+                "tile_outside_x": 3158,
+                "tile_outside_y": 3952
+            }
         }
     },
     {
         "type": "move",
         "from": {
             "min": [
-                314,
+                1634,
                 0,
                 0
             ],
             "max": [
-                314,
+                1634,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                312,
+                1616,
                 0,
                 0
             ],
             "max": [
-                312,
+                1616,
                 0,
                 0
             ]
         },
-        "cost_ms": 2,
+        "cost_ms": 7,
         "metadata": {
-            "a_id": 312,
-            "b_id": 314,
-            "length": 2.0,
+            "a_id": 1616,
+            "b_id": 1634,
+            "length": 7.0,
             "plane": 0,
-            "portal_id": 1547,
-            "x1": 2551.0,
-            "x2": 2553.0,
-            "y1": 2958.0,
-            "y2": 2958.0
+            "portal_id": 8543,
+            "x1": 3132.0,
+            "x2": 3132.0,
+            "y1": 3944.0,
+            "y2": 3937.0
         }
     },
     {
         "type": "move",
         "from": {
             "min": [
-                312,
+                1616,
                 0,
                 0
             ],
             "max": [
-                312,
+                1616,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                266,
+                1593,
                 0,
                 0
             ],
             "max": [
-                266,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 2,
-        "metadata": {
-            "a_id": 266,
-            "b_id": 312,
-            "length": 2.0,
-            "plane": 0,
-            "portal_id": 1275,
-            "x1": 2539.0,
-            "x2": 2539.0,
-            "y1": 2958.0,
-            "y2": 2956.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                266,
-                0,
-                0
-            ],
-            "max": [
-                266,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                231,
-                0,
-                0
-            ],
-            "max": [
-                231,
+                1593,
                 0,
                 0
             ]
         },
         "cost_ms": 4,
         "metadata": {
-            "a_id": 231,
-            "b_id": 266,
+            "a_id": 1593,
+            "b_id": 1616,
             "length": 4.0,
             "plane": 0,
-            "portal_id": 997,
-            "x1": 2499.0,
-            "x2": 2499.0,
-            "y1": 2940.0,
-            "y2": 2936.0
+            "portal_id": 8419,
+            "x1": 3100.0,
+            "x2": 3100.0,
+            "y1": 3966.0,
+            "y2": 3962.0
         }
     },
     {
         "type": "move",
         "from": {
             "min": [
-                231,
+                1593,
                 0,
                 0
             ],
             "max": [
-                231,
+                1593,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                202,
+                1575,
                 0,
                 0
             ],
             "max": [
-                202,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 4,
-        "metadata": {
-            "a_id": 202,
-            "b_id": 231,
-            "length": 4.0,
-            "plane": 0,
-            "portal_id": 815,
-            "x1": 2459.0,
-            "x2": 2459.0,
-            "y1": 2922.0,
-            "y2": 2918.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                202,
-                0,
-                0
-            ],
-            "max": [
-                202,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                201,
-                0,
-                0
-            ],
-            "max": [
-                201,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 2,
-        "metadata": {
-            "a_id": 201,
-            "b_id": 202,
-            "length": 2.0,
-            "plane": 0,
-            "portal_id": 807,
-            "x1": 2457.0,
-            "x2": 2459.0,
-            "y1": 2918.0,
-            "y2": 2918.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                201,
-                0,
-                0
-            ],
-            "max": [
-                201,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                200,
-                0,
-                0
-            ],
-            "max": [
-                200,
+                1575,
                 0,
                 0
             ]
         },
         "cost_ms": 1,
         "metadata": {
-            "a_id": 200,
-            "b_id": 201,
+            "a_id": 1575,
+            "b_id": 1593,
             "length": 1.0,
             "plane": 0,
-            "portal_id": 801,
-            "x1": 2458.0,
-            "x2": 2459.0,
-            "y1": 2878.0,
-            "y2": 2878.0
+            "portal_id": 8311,
+            "x1": 3068.0,
+            "x2": 3068.0,
+            "y1": 3952.0,
+            "y2": 3951.0
         }
     }
 ]

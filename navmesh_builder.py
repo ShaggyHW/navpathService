@@ -70,7 +70,7 @@ FROM tiles
 WHERE plane = :plane
 """
 
-DISTINCT_PLANES_SQL = "SELECT DISTINCT plane FROM tiles"
+DISTINCT_PLANES_SQL = "SELECT DISTINCT plane FROM tiles ORDER BY plane"
 
 NODE_TABLES = {
     "object_nodes": {
@@ -170,7 +170,7 @@ NODE_TABLES = {
 
 DIR_TOKENS = {"N","NE","E","SE","S","SW","W","NW","NORTH","EAST","SOUTH","WEST","NORTHEAST","NORTHWEST","SOUTHEAST","SOUTHWEST"}
 
-MAX_POLY_EXTENT = 40
+MAX_POLY_EXTENT = 64
 
 def is_tile_walkable(allowed: Optional[str], blocked: Optional[str]) -> bool:
     """
@@ -501,6 +501,7 @@ def build_adjacency(cells: Dict[int, Polygon], plane: int, cur: sqlite3.Cursor):
     # For each cell, find neighbors with boundary overlap (LineString segment)
     # To avoid O(n^2) duplicates, only connect cid < nid
     for cid, geom in cells.items():
+        print(f"Processing cell {cid}/{len(cells)}")
         bb = bbox_of_geom(geom)
         for nid in sidx.intersects(bb):
             if nid <= cid:
@@ -837,23 +838,173 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
         # Two links: inside→outside on IP, outside→inside on OP
         if a_id is not None:
             cc = _build_child_chain(in_conn, next_node_type, next_node_id)
-            meta_a = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action, "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
+            db_row = {
+                "id": node_id,
+                "direction": direction,
+                "real_id_open": real_open,
+                "real_id_closed": real_closed,
+                "location_open_x": lox,
+                "location_open_y": loy,
+                "location_open_plane": lop,
+                "location_closed_x": lcx,
+                "location_closed_y": lcy,
+                "location_closed_plane": lcp,
+                "tile_inside_x": ix,
+                "tile_inside_y": iy,
+                "tile_inside_plane": ip,
+                "tile_outside_x": ox,
+                "tile_outside_y": oy,
+                "tile_outside_plane": op,
+                "open_action": open_action,
+                "cost": cost,
+                "next_node_type": next_node_type,
+                "next_node_id": next_node_id,
+                "requirement_id": req_id,
+                "child_chain": cc,
+            }
+            meta_a = {
+                "inside": [ix,iy,ip],
+                "outside": [ox,oy,op],
+                "open_action": open_action,
+                "real_id_open": real_open,
+                "real_id_closed": real_closed,
+                "direction": direction,
+                "location_open_x": lox,
+                "location_open_y": loy,
+                "location_open_plane": lop,
+                "location_closed_x": lcx,
+                "location_closed_y": lcy,
+                "location_closed_plane": lcp,
+                "child_chain": cc,
+                "db_row": db_row,
+            }
             add_offmesh("door","door_nodes",node_id,req_id,cost,ip,op,a_id,b_id if b_id is not None else None, meta_a)
         if b_id is not None:
             cc = _build_child_chain(in_conn, next_node_type, next_node_id)
-            meta_b = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action, "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
+            db_row = {
+                "id": node_id,
+                "direction": direction,
+                "real_id_open": real_open,
+                "real_id_closed": real_closed,
+                "location_open_x": lox,
+                "location_open_y": loy,
+                "location_open_plane": lop,
+                "location_closed_x": lcx,
+                "location_closed_y": lcy,
+                "location_closed_plane": lcp,
+                "tile_inside_x": ix,
+                "tile_inside_y": iy,
+                "tile_inside_plane": ip,
+                "tile_outside_x": ox,
+                "tile_outside_y": oy,
+                "tile_outside_plane": op,
+                "open_action": open_action,
+                "cost": cost,
+                "next_node_type": next_node_type,
+                "next_node_id": next_node_id,
+                "requirement_id": req_id,
+                "child_chain": cc,
+            }
+            meta_b = {
+                "inside": [ix,iy,ip],
+                "outside": [ox,oy,op],
+                "open_action": open_action,
+                "real_id_open": real_open,
+                "real_id_closed": real_closed,
+                "direction": direction,
+                "location_open_x": lox,
+                "location_open_y": loy,
+                "location_open_plane": lop,
+                "location_closed_x": lcx,
+                "location_closed_y": lcy,
+                "location_closed_plane": lcp,
+                "child_chain": cc,
+                "db_row": db_row,
+            }
             add_offmesh("door","door_nodes",node_id,req_id,cost,op,ip,b_id,a_id if a_id is not None else None, meta_b)
 
         # Same-plane: add both directions when both endpoints are in this plane
         if ip == op == plane and a_id is not None and b_id is not None:
             cc = _build_child_chain(in_conn, next_node_type, next_node_id)
-            meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action, "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
+            db_row = {
+                "id": node_id,
+                "direction": direction,
+                "real_id_open": real_open,
+                "real_id_closed": real_closed,
+                "location_open_x": lox,
+                "location_open_y": loy,
+                "location_open_plane": lop,
+                "location_closed_x": lcx,
+                "location_closed_y": lcy,
+                "location_closed_plane": lcp,
+                "tile_inside_x": ix,
+                "tile_inside_y": iy,
+                "tile_inside_plane": ip,
+                "tile_outside_x": ox,
+                "tile_outside_y": oy,
+                "tile_outside_plane": op,
+                "open_action": open_action,
+                "cost": cost,
+                "next_node_type": next_node_type,
+                "next_node_id": next_node_id,
+                "requirement_id": req_id,
+                "child_chain": cc,
+            }
+            meta = {
+                "inside": [ix,iy,ip],
+                "outside": [ox,oy,op],
+                "open_action": open_action,
+                "real_id_open": real_open,
+                "real_id_closed": real_closed,
+                "direction": direction,
+                "location_open_x": lox,
+                "location_open_y": loy,
+                "location_open_plane": lop,
+                "location_closed_x": lcx,
+                "location_closed_y": lcy,
+                "location_closed_plane": lcp,
+                "child_chain": cc,
+                "db_row": db_row,
+            }
             add_offmesh("door","door_nodes",node_id,req_id,cost,plane,plane,a_id,b_id,meta)
             add_offmesh("door","door_nodes",node_id,req_id,cost,plane,plane,b_id,a_id,meta)
         else:
             # Cross-plane: only add the inbound link that LANDS in this plane (dst known)
             cc = _build_child_chain(in_conn, next_node_type, next_node_id)
-            meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action, "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
+            db_row = {
+                "id": node_id,
+                "direction": direction,
+                "real_id_open": real_open,
+                "real_id_closed": real_closed,
+                "location_open_x": lox,
+                "location_open_y": loy,
+                "location_open_plane": lop,
+                "location_closed_x": lcx,
+                "location_closed_y": lcy,
+                "location_closed_plane": lcp,
+                "tile_inside_x": ix,
+                "tile_inside_y": iy,
+                "tile_inside_plane": ip,
+                "tile_outside_x": ox,
+                "tile_outside_y": oy,
+                "tile_outside_plane": op,
+                "open_action": open_action,
+                "cost": cost,
+                "next_node_type": next_node_type,
+                "next_node_id": next_node_id,
+                "requirement_id": req_id,
+                "child_chain": cc,
+            }
+            meta = {
+                "inside": [ix,iy,ip],
+                "outside": [ox,oy,op],
+                "open_action": open_action,
+                "real_id_open": real_open,
+                "real_id_closed": real_closed,
+                "direction": direction,
+                "child_chain": cc,
+                "db_row": db_row,
+            }
             if op == plane and b_id is not None:
                 # From ip -> op(this plane), src unknown in this run
                 add_offmesh("door","door_nodes",node_id,req_id,cost,ip,op,None,b_id,meta)
@@ -1069,8 +1220,33 @@ def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection
         a_id = cell_id_for_tile(out_conn, ip, ix, iy)
         b_id = cell_id_for_tile(out_conn, op, ox, oy)
         cc = _build_child_chain(in_conn, next_node_type, next_node_id)
+        db_row = {
+            "id": node_id,
+            "direction": direction,
+            "real_id_open": real_open,
+            "real_id_closed": real_closed,
+            "location_open_x": lox,
+            "location_open_y": loy,
+            "location_open_plane": lop,
+            "location_closed_x": lcx,
+            "location_closed_y": lcy,
+            "location_closed_plane": lcp,
+            "tile_inside_x": ix,
+            "tile_inside_y": iy,
+            "tile_inside_plane": ip,
+            "tile_outside_x": ox,
+            "tile_outside_y": oy,
+            "tile_outside_plane": op,
+            "open_action": open_action,
+            "cost": cost,
+            "next_node_type": next_node_type,
+            "next_node_id": next_node_id,
+            "requirement_id": req_id,
+            "child_chain": cc,
+        }
         meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action,
-                "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
+                "real_id_open": real_open, "real_id_closed": real_closed, "direction": direction,
+                "child_chain": cc, "db_row": db_row}
         # Add both directions if endpoints exist
         if a_id is not None and b_id is not None:
             ensure_offmesh(out_conn, "door", "door_nodes", node_id, req_id, cost, ip, op, a_id, b_id, meta)
