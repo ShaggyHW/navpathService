@@ -111,12 +111,7 @@ async fn find_path(State(state): State<AppState>, Query(params): Query<FindPathQ
             let goal_xy = [goal[0] as f64 + 0.5, goal[1] as f64 + 0.5];
             let s_cell = match provider.map_point_to_tile(start_xy[0], start_xy[1], start[2]) {
                 Ok(Some(t)) => t,
-                _ => {
-                    return (StatusCode::BAD_REQUEST, Json(json!({
-                        "error": "ERR_START_NOT_ON_NAVMESH",
-                        "message": "Start tile center does not map to any navmesh cell"
-                    }))).into_response();
-                }
+                _ => [-1, 0, start[2]],
             };
             let g_cell = match provider.map_point_to_tile(goal_xy[0], goal_xy[1], goal[2]) {
                 Ok(Some(t)) => t,
