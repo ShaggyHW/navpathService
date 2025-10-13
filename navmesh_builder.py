@@ -170,7 +170,7 @@ NODE_TABLES = {
 
 DIR_TOKENS = {"N","NE","E","SE","S","SW","W","NW","NORTH","EAST","SOUTH","WEST","NORTHEAST","NORTHWEST","SOUTHEAST","SOUTHWEST"}
 
-MAX_POLY_EXTENT = 16
+MAX_POLY_EXTENT = 32
 
 def is_tile_walkable(allowed: Optional[str], blocked: Optional[str]) -> bool:
     """
@@ -574,9 +574,40 @@ def rect_to_poly(ixmin: int, ixmax: int, iymin: int, iymax: int) -> Polygon:
     return box(ixmin, iymin, ixmax + 1, iymax + 1)
 
 
+def _gather_non_heads(conn: sqlite3.Connection) -> Dict[str, set]:
+    idx: Dict[str, set] = {}
+    for key, table in (
+        ("door", "door_nodes"),
+        ("lodestone", "lodestone_nodes"),
+        ("object", "object_nodes"),
+        ("ifslot", "ifslot_nodes"),
+        ("npc", "npc_nodes"),
+        ("item", "item_nodes"),
+    ):
+        try:
+            for t, i in conn.execute(
+                f"SELECT next_node_type, next_node_id FROM {table} WHERE next_node_type IS NOT NULL AND next_node_id IS NOT NULL"
+            ):
+                if t is None or i is None:
+                    continue
+                tt = str(t).strip().lower()
+                try:
+                    ii = int(i)
+                except Exception:
+                    continue
+                s = idx.setdefault(tt, set())
+                s.add(ii)
+        except Exception:
+            continue
+    return idx
+
+
 def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection, plane: int):
     cur = out_conn.cursor()
     req_ids: set = set()
+    non_heads = _gather_non_heads(in_conn)
+    def is_non_head(kind: str, node_id: int) -> bool:
+        return node_id in non_heads.get(kind, set())
 
     # Helper: insert offmesh row
     def add_offmesh(link_type: str, node_table: str, node_id: int, req_id: Optional[int],
@@ -597,6 +628,8 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
     # Lodestones (point destination)
     rows = in_conn.execute(NODE_TABLES["lodestone_nodes"]["sql"])
     for node_id, lodename, dx, dy, dplane, cost, next_node_type, next_node_id, req_id in rows:
+        if is_non_head("lodestone", int(node_id)):
+            continue
         if dplane != plane:
             continue
         pt = Point(float(dx)+0.5, float(dy)+0.5)
@@ -619,6 +652,8 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
     for (node_id, direction, real_open, real_closed,
          lox, loy, lop, lcx, lcy, lcp,
          ix, iy, ip, ox, oy, op, open_action, cost, _, _, req_id) in rows:
+        if is_non_head("door", int(node_id)):
+            continue
         # Map tiles to cells on their respective planes
         a_id = None
         b_id = None
@@ -673,6 +708,9 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
                  dminx, dmaxx, dminy, dmaxy, dplane,
                  cost, next_node_type, next_node_id, req_id) = row
                 ominx=omaxx=ominy=omaxy=oplane=None
+
+            if is_non_head(specs["key"], int(node_id)):
+                continue
 
             if dplane != plane:
                 continue
@@ -835,12 +873,17 @@ def ensure_offmesh(out_conn: sqlite3.Connection, link_type: str, node_table: str
 def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection):
     print("[resolve] Resolving cross-plane doors and origin→dest links ...")
     req_ids: set = set()
+    non_heads = _gather_non_heads(in_conn)
+    def is_non_head(kind: str, node_id: int) -> bool:
+        return node_id in non_heads.get(kind, set())
 
     # Doors: ensure both directions with concrete src/dst ids
     rows = in_conn.execute(NODE_TABLES["door_nodes"]["sql"])
     for (node_id, direction, real_open, real_closed,
          lox, loy, lop, lcx, lcy, lcp,
          ix, iy, ip, ox, oy, op, open_action, cost, _, _, req_id) in rows:
+        if is_non_head("door", int(node_id)):
+            continue
         if req_id is not None:
             req_ids.add(int(req_id))
         a_id = cell_id_for_tile(out_conn, ip, ix, iy)
@@ -866,6 +909,9 @@ def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection
                  dminx, dmaxx, dminy, dmaxy, dplane,
                  search_radius, cost, ominx, omaxx, ominy, omaxy, oplane,
                  _, _, req_id) = row
+            key = NODE_TABLES[table_name]["key"]
+            if is_non_head(key, int(node_id)):
+                continue
             if req_id is not None:
                 req_ids.add(int(req_id))
             # Need both planes known
