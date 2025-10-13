@@ -266,9 +266,9 @@ impl SqliteGraphProvider {
                 continue;
             }
             let (dest, computed_dir) = if r.tile_inside == tile {
-                (r.tile_outside, Some("OUT".to_string()))
+                (r.tile_outside, Some("out".to_string()))
             } else if r.tile_outside == tile {
-                (r.tile_inside, Some("IN".to_string()))
+                (r.tile_inside, Some("in".to_string()))
             } else {
                 continue;
             };
@@ -276,13 +276,19 @@ impl SqliteGraphProvider {
                 continue;
             }
             let cost = self.cost_model.door_cost(r.cost);
+            let mut db_row = serde_json::to_value(&r).unwrap_or_else(|_| json!({}));
+            if let Some(dir) = &computed_dir {
+                db_row["direction"] = Value::from(dir.clone());
+            } else if let Some(dir) = r.direction.clone() {
+                db_row["direction"] = Value::from(dir);
+            }
             let meta = json!({
-                "door_direction": computed_dir.unwrap_or_else(|| r.direction.clone().unwrap_or_default()),
+                "door_direction": computed_dir.clone().unwrap_or_else(|| db_row.get("direction").and_then(Value::as_str).unwrap_or_default().to_string()),
                 "db_door_direction": r.direction,
                 "real_id_open": r.real_id_open,
                 "real_id_closed": r.real_id_closed,
                 "action": r.open_action,
-                "db_row": &r,
+                "db_row": db_row,
             });
             edges.push(Edge {
                 type_: "door".into(),

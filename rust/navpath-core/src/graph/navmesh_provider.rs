@@ -179,7 +179,34 @@ impl NavmeshGraphProvider {
                             if let Some(v) = m.get("location_closed_x").cloned() { db_row["location_closed_x"] = v; }
                             if let Some(v) = m.get("location_closed_y").cloned() { db_row["location_closed_y"] = v; }
                             if let Some(v) = m.get("location_closed_plane").cloned() { db_row["location_closed_plane"] = v; }
+                            // Compute door direction at runtime using current cell and inside/outside cells
+                            let mut computed_dir: Option<String> = None;
+                            if let (Some(ix), Some(iy), Some(ip), Some(ox), Some(oy), Some(op)) = (
+                                db_row.get("tile_inside_x").and_then(Value::as_i64).map(|v| v as i32),
+                                db_row.get("tile_inside_y").and_then(Value::as_i64).map(|v| v as i32),
+                                db_row.get("tile_inside_plane").and_then(Value::as_i64).map(|v| v as i32),
+                                db_row.get("tile_outside_x").and_then(Value::as_i64).map(|v| v as i32),
+                                db_row.get("tile_outside_y").and_then(Value::as_i64).map(|v| v as i32),
+                                db_row.get("tile_outside_plane").and_then(Value::as_i64).map(|v| v as i32),
+                            ) {
+                                // Map tile centers to navmesh cell IDs
+                                if let (Ok(ic_opt), Ok(oc_opt)) = (
+                                    self.map_point_to_cell_id(ix as f64 + 0.5, iy as f64 + 0.5, ip),
+                                    self.map_point_to_cell_id(ox as f64 + 0.5, oy as f64 + 0.5, op),
+                                ) {
+                                    if let (Some(ic), Some(oc)) = (ic_opt, oc_opt) {
+                                        if ic == cell_id {
+                                            computed_dir = Some("out".to_string());
+                                        } else if oc == cell_id {
+                                            computed_dir = Some("in".to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(cd) = computed_dir.clone() { db_row["direction"] = Value::from(cd); }
                             if let Some(cc) = m.get("child_chain").cloned() { meta["child_chain"] = cc.clone(); db_row["child_chain"] = cc; }
+                            // Prefer computed door direction for top-level meta as well
+                            if let Some(cd) = computed_dir { meta["door_direction"] = Value::from(cd); }
                             meta["db_row"] = db_row;
                         }
                         "object" => {

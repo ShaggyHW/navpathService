@@ -146,17 +146,17 @@ async fn find_path(State(state): State<AppState>, Query(params): Query<FindPathQ
                             }
                         }
                     }
-                    let waypoints = string_pull(start_xy, &portals, goal_xy, 1e-9);
-                    // Append synthetic action step carrying waypoints so clients can render a world path without schema change
-                    let synth = ActionStep {
-                        type_: "waypoints".into(),
-                        from_rect: Rect { min: start, max: start },
-                        to_rect: Rect { min: goal, max: goal },
-                        cost_ms: 0,
-                        node: None,
-                        metadata: Some(json!({ "waypoints": waypoints })),
-                    };
-                    res.actions.push(synth);
+                    // let waypoints = string_pull(start_xy, &portals, goal_xy, 1e-9);
+                    // // Append synthetic action step carrying waypoints so clients can render a world path without schema change
+                    // let synth = ActionStep {
+                    //     type_: "waypoints".into(),
+                    //     from_rect: Rect { min: start, max: start },
+                    //     to_rect: Rect { min: goal, max: goal },
+                    //     cost_ms: 0,
+                    //     node: None,
+                    //     metadata: Some(json!({ "waypoints": waypoints })),
+                    // };
+                    // res.actions.push(synth);
                     Ok(res)
                 }
                 Err(e) => Err(e),
