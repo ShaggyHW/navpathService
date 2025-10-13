@@ -276,9 +276,64 @@ def bbox_of_geom(g) -> Tuple[float,float,float,float]:
     return (float(minx), float(miny), float(maxx), float(maxy))
 
 
-# -------------------------
-# RTree wrapper (optional)
-# -------------------------
+def _door_barrier_segments_for_plane(conn: sqlite3.Connection, plane: int) -> List[LineString]:
+    segs: List[LineString] = []
+    try:
+        rows = conn.execute(NODE_TABLES["door_nodes"]["sql"])
+    except Exception:
+        return segs
+    for (
+        _node_id, _direction, _real_open, _real_closed,
+        _lox, _loy, _lop, _lcx, _lcy, _lcp,
+        ix, iy, ip, ox, oy, op, _open_action, _cost, _next_t, _next_i, _req_id
+    ) in rows:
+        try:
+            ix = int(ix); iy = int(iy); ip = int(ip)
+            ox = int(ox); oy = int(oy); op = int(op)
+        except Exception:
+            continue
+        if ip != plane or op != plane:
+            continue
+        dx = ox - ix
+        dy = oy - iy
+        if dx == 1 and dy == 0:
+            segs.append(LineString([(ix + 1, iy), (ix + 1, iy + 1)]))
+        elif dx == -1 and dy == 0:
+            segs.append(LineString([(ix, iy), (ix, iy + 1)]))
+        elif dy == 1 and dx == 0:
+            segs.append(LineString([(ix, iy + 1), (ix + 1, iy + 1)]))
+        elif dy == -1 and dx == 0:
+            segs.append(LineString([(ix, iy), (ix + 1, iy)]))
+        else:
+            continue
+    return segs
+
+
+def _apply_barriers_to_polys(polys: Iterable[Polygon], barrier_segs: List[LineString], eps: float = 1e-3) -> List[Polygon]:
+    polys = list(polys)
+    if not polys or not barrier_segs:
+        return polys
+    barrier_geom = unary_union(barrier_segs)
+    try:
+        slit = barrier_geom.buffer(eps, cap_style=2)
+    except Exception:
+        return polys
+    out: List[Polygon] = []
+    for poly in polys:
+        try:
+            clipped = poly.difference(slit)
+        except Exception:
+            out.append(poly)
+            continue
+        if isinstance(clipped, Polygon):
+            if clipped.area > 1e-6:
+                out.append(clipped)
+        else:
+            for g in getattr(clipped, "geoms", []):
+                if isinstance(g, Polygon) and not g.is_empty and g.area > 1e-6:
+                    out.append(g)
+    return out
+
 
 class SimpleRTree:
     def __init__(self):
@@ -532,6 +587,15 @@ def build_navmesh_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conne
         polys = tiles_to_polygons(tiles)
         polys = enforce_polygon_extent(polys, MAX_POLY_EXTENT)
 
+    # Prevent cells merging across door edges; split polys along door barriers
+    door_segs = _door_barrier_segments_for_plane(in_conn, plane)
+    if door_segs:
+        before = len(polys)
+        polys = _apply_barriers_to_polys(polys, door_segs)
+        after = len(polys)
+        if after != before:
+            print(f"[plane {plane}] Door barriers applied: {before} -> {after} cells before triangulation")
+
     cur = out_conn.cursor()
 
     cell_geoms: Dict[int, Polygon] = {}  # id -> geometry
@@ -602,6 +666,110 @@ def _gather_non_heads(conn: sqlite3.Connection) -> Dict[str, set]:
     return idx
 
 
+def _fetch_next(conn: sqlite3.Connection, kind: Optional[str], node_id: Optional[int]) -> Tuple[Optional[str], Optional[int]]:
+    if not kind or node_id is None:
+        return None, None
+    t = str(kind).strip().lower()
+    table = None
+    if t == "door":
+        table = "door_nodes"
+    elif t == "lodestone":
+        table = "lodestone_nodes"
+    elif t == "object":
+        table = "object_nodes"
+    elif t == "ifslot":
+        table = "ifslot_nodes"
+    elif t == "npc":
+        table = "npc_nodes"
+    elif t == "item":
+        table = "item_nodes"
+    if not table:
+        return None, None
+    try:
+        row = conn.execute(f"SELECT next_node_type, next_node_id FROM {table} WHERE id = ?", (int(node_id),)).fetchone()
+    except Exception:
+        row = None
+    if not row:
+        return None, None
+    nxt_t, nxt_i = row
+    if nxt_t is None or nxt_i is None:
+        return None, None
+    try:
+        return str(nxt_t).strip().lower(), int(nxt_i)
+    except Exception:
+        return None, None
+
+
+def _fetch_node_meta(conn: sqlite3.Connection, kind: str, node_id: int) -> Dict:
+    t = str(kind).strip().lower()
+    if t == "lodestone":
+        row = conn.execute("SELECT id,lodestone,dest_x,dest_y,dest_plane,cost,next_node_type,next_node_id,requirement_id FROM lodestone_nodes WHERE id=?", (node_id,)).fetchone()
+        if not row:
+            return {}
+        _, lodename, dx, dy, dplane, cost, next_node_type, next_node_id, _ = row
+        return {"lodestone": lodename, "dest_point": [dx,dy,dplane], "next_node_type": next_node_type, "next_node_id": next_node_id}
+    if t == "door":
+        row = conn.execute("SELECT id,direction,real_id_open,real_id_closed,location_open_x,location_open_y,location_open_plane,location_closed_x,location_closed_y,location_closed_plane,tile_inside_x,tile_inside_y,tile_inside_plane,tile_outside_x,tile_outside_y,tile_outside_plane,open_action,cost,next_node_type,next_node_id,requirement_id FROM door_nodes WHERE id=?", (node_id,)).fetchone()
+        if not row:
+            return {}
+        (_, direction, real_open, real_closed, lox, loy, lop, lcx, lcy, lcp, ix, iy, ip, ox, oy, op, open_action, cost, next_node_type, next_node_id, _) = row
+        meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action, "real_id_open": real_open, "real_id_closed": real_closed, "direction": direction}
+        return meta
+    if t == "object":
+        row = conn.execute("SELECT id,match_type,object_id,object_name,action,dest_min_x,dest_max_x,dest_min_y,dest_max_y,dest_plane,orig_min_x,orig_max_x,orig_min_y,orig_max_y,orig_plane,search_radius,cost,next_node_type,next_node_id,requirement_id FROM object_nodes WHERE id=?", (node_id,)).fetchone()
+        if not row:
+            return {}
+        ( _id, match_type, object_id, object_name, action, dminx, dmaxx, dminy, dmaxy, dplane, ominx, omaxx, ominy, omaxy, oplane, _sr, _cost, next_node_type, next_node_id, _req) = row
+        meta = {"action": action, "object_id": object_id, "object_name": object_name, "match_type": match_type, "dest_rect": [dminx,dmaxx,dminy,dmaxy,dplane], "next_node_type": next_node_type, "next_node_id": next_node_id}
+        if oplane is not None and ominx is not None:
+            meta["orig_rect"] = [ominx,omaxx,ominy,omaxy,oplane]
+        return meta
+    if t == "npc":
+        row = conn.execute("SELECT id,match_type,npc_id,npc_name,action,dest_min_x,dest_max_x,dest_min_y,dest_max_y,dest_plane,search_radius,cost,orig_min_x,orig_max_x,orig_min_y,orig_max_y,orig_plane,next_node_type,next_node_id,requirement_id FROM npc_nodes WHERE id=?", (node_id,)).fetchone()
+        if not row:
+            return {}
+        (_id, match_type, npc_id, npc_name, action, dminx, dmaxx, dminy, dmaxy, dplane, _sr, _cost, ominx, omaxx, ominy, omaxy, oplane, next_node_type, next_node_id, _req) = row
+        meta = {"action": action, "npc_id": npc_id, "npc_name": npc_name, "match_type": match_type, "dest_rect": [dminx,dmaxx,dminy,dmaxy,dplane], "next_node_type": next_node_type, "next_node_id": next_node_id}
+        if oplane is not None and ominx is not None:
+            meta["orig_rect"] = [ominx,omaxx,ominy,omaxy,oplane]
+        return meta
+    if t == "ifslot":
+        row = conn.execute("SELECT id,interface_id,component_id,slot_id,click_id,dest_min_x,dest_max_x,dest_min_y,dest_max_y,dest_plane,cost,next_node_type,next_node_id,requirement_id FROM ifslot_nodes WHERE id=?", (node_id,)).fetchone()
+        if not row:
+            return {}
+        (_id, interface_id, component_id, slot_id, click_id, dminx, dmaxx, dminy, dmaxy, dplane, _cost, next_node_type, next_node_id, _req) = row
+        return {"interface_id": interface_id, "component_id": component_id, "slot_id": slot_id, "click_id": click_id, "dest_rect": [dminx,dmaxx,dminy,dmaxy,dplane], "next_node_type": next_node_type, "next_node_id": next_node_id}
+    if t == "item":
+        row = conn.execute("SELECT id,item_id,action,dest_min_x,dest_max_x,dest_min_y,dest_max_y,dest_plane,cost,next_node_type,next_node_id,requirement_id FROM item_nodes WHERE id=?", (node_id,)).fetchone()
+        if not row:
+            return {}
+        (_id, item_id, action, dminx, dmaxx, dminy, dmaxy, dplane, _cost, next_node_type, next_node_id, _req) = row
+        return {"item_id": item_id, "action": action, "dest_rect": [dminx,dmaxx,dminy,dmaxy,dplane], "next_node_type": next_node_type, "next_node_id": next_node_id}
+    return {}
+
+
+def _build_child_chain(conn: sqlite3.Connection, start_kind: Optional[str], start_id: Optional[int], max_depth: int = 32) -> List[Dict[str, int]]:
+    out: List[Dict[str, int]] = []
+    seen: set = set()
+    kind = start_kind.strip().lower() if isinstance(start_kind, str) else None
+    try:
+        cur_id = int(start_id) if start_id is not None else None
+    except Exception:
+        cur_id = None
+    depth = 0
+    while kind and cur_id is not None and depth < max_depth:
+        key = (kind, cur_id)
+        if key in seen:
+            break
+        seen.add(key)
+        meta = _fetch_node_meta(conn, kind, cur_id)
+        out.append({"type": kind, "id": cur_id, "meta": meta})
+        nxt_kind, nxt_id = _fetch_next(conn, kind, cur_id)
+        kind, cur_id = nxt_kind, nxt_id
+        depth += 1
+    return out
+
+
 def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection, plane: int):
     cur = out_conn.cursor()
     req_ids: set = set()
@@ -636,14 +804,16 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
         dst_id = find_cell_containing_point(cur, plane, pt)
         if dst_id is None:
             continue
-        # Origin is the start tile only ⇒ src_cell_id NULL
+        cc = _build_child_chain(in_conn, next_node_type, next_node_id)
         add_offmesh(
             "lodestone","lodestone_nodes",node_id,req_id,cost,None,plane,None,dst_id,
             {
+                "target_lodestone": lodename,
                 "lodestone": lodename,
-                "dest_point":[dx,dy,dplane],
+                "dest_point": [dx,dy,dplane],
                 "next_node_type": next_node_type,
                 "next_node_id": next_node_id,
+                "child_chain": cc,
             }
         )
 
@@ -651,7 +821,7 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
     rows = in_conn.execute(NODE_TABLES["door_nodes"]["sql"])
     for (node_id, direction, real_open, real_closed,
          lox, loy, lop, lcx, lcy, lcp,
-         ix, iy, ip, ox, oy, op, open_action, cost, _, _, req_id) in rows:
+         ix, iy, ip, ox, oy, op, open_action, cost, next_node_type, next_node_id, req_id) in rows:
         if is_non_head("door", int(node_id)):
             continue
         # Map tiles to cells on their respective planes
@@ -664,18 +834,26 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
             b_pt = Point(float(ox)+0.5, float(oy)+0.5)
             b_id = find_cell_containing_point(cur, plane, b_pt)
 
-        meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action,
-                "real_id_open": real_open, "real_id_closed": real_closed,
-                "direction": direction,
-                "location_open_x": lox, "location_open_y": loy, "location_open_plane": lop,
-                "location_closed_x": lcx, "location_closed_y": lcy, "location_closed_plane": lcp}
+        # Two links: inside→outside on IP, outside→inside on OP
+        if a_id is not None:
+            cc = _build_child_chain(in_conn, next_node_type, next_node_id)
+            meta_a = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action, "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
+            add_offmesh("door","door_nodes",node_id,req_id,cost,ip,op,a_id,b_id if b_id is not None else None, meta_a)
+        if b_id is not None:
+            cc = _build_child_chain(in_conn, next_node_type, next_node_id)
+            meta_b = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action, "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
+            add_offmesh("door","door_nodes",node_id,req_id,cost,op,ip,b_id,a_id if a_id is not None else None, meta_b)
 
         # Same-plane: add both directions when both endpoints are in this plane
         if ip == op == plane and a_id is not None and b_id is not None:
+            cc = _build_child_chain(in_conn, next_node_type, next_node_id)
+            meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action, "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
             add_offmesh("door","door_nodes",node_id,req_id,cost,plane,plane,a_id,b_id,meta)
             add_offmesh("door","door_nodes",node_id,req_id,cost,plane,plane,b_id,a_id,meta)
         else:
             # Cross-plane: only add the inbound link that LANDS in this plane (dst known)
+            cc = _build_child_chain(in_conn, next_node_type, next_node_id)
+            meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action, "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
             if op == plane and b_id is not None:
                 # From ip -> op(this plane), src unknown in this run
                 add_offmesh("door","door_nodes",node_id,req_id,cost,ip,op,None,b_id,meta)
@@ -771,6 +949,8 @@ def build_overlays_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conn
                     "next_node_type": next_node_type,
                     "next_node_id": next_node_id,
                 })
+            cc = _build_child_chain(in_conn, next_node_type, next_node_id)
+            meta["child_chain"] = cc
 
             for dst_id in dst_ids:
                 for src_id in src_ids:
@@ -881,15 +1061,16 @@ def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection
     rows = in_conn.execute(NODE_TABLES["door_nodes"]["sql"])
     for (node_id, direction, real_open, real_closed,
          lox, loy, lop, lcx, lcy, lcp,
-         ix, iy, ip, ox, oy, op, open_action, cost, _, _, req_id) in rows:
+         ix, iy, ip, ox, oy, op, open_action, cost, next_node_type, next_node_id, req_id) in rows:
         if is_non_head("door", int(node_id)):
             continue
         if req_id is not None:
             req_ids.add(int(req_id))
         a_id = cell_id_for_tile(out_conn, ip, ix, iy)
         b_id = cell_id_for_tile(out_conn, op, ox, oy)
+        cc = _build_child_chain(in_conn, next_node_type, next_node_id)
         meta = {"inside":[ix,iy,ip], "outside":[ox,oy,op], "open_action": open_action,
-                "real_id_open": real_open, "real_id_closed": real_closed}
+                "real_id_open": real_open, "real_id_closed": real_closed, "child_chain": cc}
         # Add both directions if endpoints exist
         if a_id is not None and b_id is not None:
             ensure_offmesh(out_conn, "door", "door_nodes", node_id, req_id, cost, ip, op, a_id, b_id, meta)
@@ -903,12 +1084,12 @@ def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection
                 (node_id, match_type, object_id, object_name, action,
                  dminx, dmaxx, dminy, dmaxy, dplane,
                  ominx, omaxx, ominy, omaxy, oplane,
-                 search_radius, cost, _, _, req_id) = row
+                 search_radius, cost, next_node_type, next_node_id, req_id) = row
             else:
                 (node_id, match_type, npc_id, npc_name, action,
                  dminx, dmaxx, dminy, dmaxy, dplane,
                  search_radius, cost, ominx, omaxx, ominy, omaxy, oplane,
-                 _, _, req_id) = row
+                 next_node_type, next_node_id, req_id) = row
             key = NODE_TABLES[table_name]["key"]
             if is_non_head(key, int(node_id)):
                 continue
@@ -921,8 +1102,10 @@ def resolve_crossplane(in_conn: sqlite3.Connection, out_conn: sqlite3.Connection
             o_ids = cell_ids_for_rect(out_conn, oplane, int(ominx), int(omaxx), int(ominy), int(omaxy))
             if not d_ids or not o_ids:
                 continue
+            cc = _build_child_chain(in_conn, next_node_type, next_node_id)
             meta = {"dest_rect":[dminx,dmaxx,dminy,dmaxy,dplane],
-                    "orig_rect":[ominx,omaxx,ominy,omaxy,oplane]}
+                    "orig_rect":[ominx,omaxx,ominy,omaxy,oplane],
+                    "child_chain": cc}
             for src_id in o_ids:
                 for dst_id in d_ids:
                     ensure_offmesh(out_conn, NODE_TABLES[table_name]["key"], table_name, node_id,

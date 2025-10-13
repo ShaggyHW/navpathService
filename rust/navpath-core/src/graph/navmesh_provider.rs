@@ -127,6 +127,7 @@ impl NavmeshGraphProvider {
                                 "next_node_id": m.get("next_node_id").cloned().unwrap_or(Value::Null),
                                 "requirement_id": r.requirement_id,
                             });
+                            if let Some(cc) = m.get("child_chain").cloned() { meta["child_chain"] = cc.clone(); db_row["child_chain"] = cc; }
                             meta["db_row"] = db_row;
                         }
                         "door" => {
@@ -178,6 +179,7 @@ impl NavmeshGraphProvider {
                             if let Some(v) = m.get("location_closed_x").cloned() { db_row["location_closed_x"] = v; }
                             if let Some(v) = m.get("location_closed_y").cloned() { db_row["location_closed_y"] = v; }
                             if let Some(v) = m.get("location_closed_plane").cloned() { db_row["location_closed_plane"] = v; }
+                            if let Some(cc) = m.get("child_chain").cloned() { meta["child_chain"] = cc.clone(); db_row["child_chain"] = cc; }
                             meta["db_row"] = db_row;
                         }
                         "object" => {
@@ -220,6 +222,7 @@ impl NavmeshGraphProvider {
                                     db_row["orig_plane"] = orect[4].clone();
                                 }
                             }
+                            if let Some(cc) = m.get("child_chain").cloned() { meta["child_chain"] = cc.clone(); db_row["child_chain"] = cc; }
                             meta["db_row"] = db_row;
                         }
                         "npc" => {
@@ -267,9 +270,14 @@ impl NavmeshGraphProvider {
                                     db_row["orig_plane"] = orect[4].clone();
                                 }
                             }
+                            if let Some(cc) = m.get("child_chain").cloned() { meta["child_chain"] = cc.clone(); db_row["child_chain"] = cc; }
                             meta["db_row"] = db_row;
                         }
                         "ifslot" => {
+                            if let Some(v) = m.get("interface_id").cloned() { meta["interface_id"] = v; }
+                            if let Some(v) = m.get("component_id").cloned() { meta["component_id"] = v; }
+                            if let Some(v) = m.get("slot_id").cloned() { meta["slot_id"] = v; }
+                            if let Some(v) = m.get("click_id").cloned() { meta["click_id"] = v; }
                             let mut db_row = json!({
                                 "id": r.node_id,
                                 "interface_id": m.get("interface_id").cloned().unwrap_or(Value::Null),
@@ -295,6 +303,7 @@ impl NavmeshGraphProvider {
                                     db_row["dest_plane"] = rect[4].clone();
                                 }
                             }
+                            if let Some(cc) = m.get("child_chain").cloned() { meta["child_chain"] = cc.clone(); db_row["child_chain"] = cc; }
                             meta["db_row"] = db_row;
                         }
                         "item" => {
@@ -323,6 +332,7 @@ impl NavmeshGraphProvider {
                                     db_row["dest_plane"] = rect[4].clone();
                                 }
                             }
+                            if let Some(cc) = m.get("child_chain").cloned() { meta["child_chain"] = cc.clone(); db_row["child_chain"] = cc; }
                             meta["db_row"] = db_row;
                         }
                         _ => {}

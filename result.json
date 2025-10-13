@@ -1,51 +1,291 @@
 [
     {
-        "type": "ifslot",
+        "type": "move",
         "from": {
             "min": [
-                2208,
+                848,
                 0,
                 0
             ],
             "max": [
-                2208,
+                848,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                2953,
-                3146,
+                884,
+                0,
                 0
             ],
             "max": [
-                2960,
-                3163,
+                884,
+                0,
+                0
+            ]
+        },
+        "cost_ms": 1,
+        "metadata": {
+            "a_id": 848,
+            "b_id": 884,
+            "length": 1.0,
+            "plane": 0,
+            "portal_id": 4561,
+            "x1": 2917.0,
+            "x2": 2917.0,
+            "y1": 3536.0,
+            "y2": 3535.0
+        }
+    },
+    {
+        "type": "move",
+        "from": {
+            "min": [
+                884,
+                0,
+                0
+            ],
+            "max": [
+                884,
+                0,
+                0
+            ]
+        },
+        "to": {
+            "min": [
+                879,
+                0,
+                0
+            ],
+            "max": [
+                879,
+                0,
+                0
+            ]
+        },
+        "cost_ms": 1,
+        "metadata": {
+            "a_id": 879,
+            "b_id": 884,
+            "length": 1.0,
+            "plane": 0,
+            "portal_id": 4725,
+            "x1": 2917.0,
+            "x2": 2918.0,
+            "y1": 3506.0,
+            "y2": 3506.0
+        }
+    },
+    {
+        "type": "move",
+        "from": {
+            "min": [
+                879,
+                0,
+                0
+            ],
+            "max": [
+                879,
+                0,
+                0
+            ]
+        },
+        "to": {
+            "min": [
+                877,
+                0,
+                0
+            ],
+            "max": [
+                877,
+                0,
+                0
+            ]
+        },
+        "cost_ms": 2,
+        "metadata": {
+            "a_id": 877,
+            "b_id": 879,
+            "length": 2.0,
+            "plane": 0,
+            "portal_id": 4717,
+            "x1": 2940.0,
+            "x2": 2942.0,
+            "y1": 3474.0,
+            "y2": 3474.0
+        }
+    },
+    {
+        "type": "move",
+        "from": {
+            "min": [
+                877,
+                0,
+                0
+            ],
+            "max": [
+                877,
+                0,
+                0
+            ]
+        },
+        "to": {
+            "min": [
+                845,
+                0,
+                0
+            ],
+            "max": [
+                845,
+                0,
+                0
+            ]
+        },
+        "cost_ms": 2,
+        "metadata": {
+            "a_id": 845,
+            "b_id": 877,
+            "length": 2.0,
+            "plane": 0,
+            "portal_id": 4539,
+            "x1": 2917.0,
+            "x2": 2917.0,
+            "y1": 3445.0,
+            "y2": 3443.0
+        }
+    },
+    {
+        "type": "move",
+        "from": {
+            "min": [
+                845,
+                0,
+                0
+            ],
+            "max": [
+                845,
+                0,
+                0
+            ]
+        },
+        "to": {
+            "min": [
+                841,
+                0,
+                0
+            ],
+            "max": [
+                841,
+                0,
+                0
+            ]
+        },
+        "cost_ms": 4,
+        "metadata": {
+            "a_id": 841,
+            "b_id": 845,
+            "length": 4.0,
+            "plane": 0,
+            "portal_id": 4519,
+            "x1": 2909.0,
+            "x2": 2913.0,
+            "y1": 3442.0,
+            "y2": 3442.0
+        }
+    },
+    {
+        "type": "move",
+        "from": {
+            "min": [
+                841,
+                0,
+                0
+            ],
+            "max": [
+                841,
+                0,
+                0
+            ]
+        },
+        "to": {
+            "min": [
+                875,
+                0,
+                0
+            ],
+            "max": [
+                875,
+                0,
+                0
+            ]
+        },
+        "cost_ms": 1,
+        "metadata": {
+            "a_id": 841,
+            "b_id": 875,
+            "length": 1.0,
+            "plane": 0,
+            "portal_id": 4521,
+            "x1": 2917.0,
+            "x2": 2917.0,
+            "y1": 3434.0,
+            "y2": 3433.0
+        }
+    },
+    {
+        "type": "door",
+        "from": {
+            "min": [
+                875,
+                0,
+                0
+            ],
+            "max": [
+                875,
+                0,
+                0
+            ]
+        },
+        "to": {
+            "min": [
+                876,
+                0,
+                0
+            ],
+            "max": [
+                876,
+                0,
                 0
             ]
         },
         "cost_ms": 1,
         "node": {
-            "type": "ifslot",
-            "id": 3
+            "type": "door",
+            "id": 1
         },
         "metadata": {
             "db_row": {
-                "click_id": 0,
-                "component_id": 15,
+                "child_chain": [],
                 "cost": 1,
-                "dest_max_x": 2960,
-                "dest_max_y": 3163,
-                "dest_min_x": 2953,
-                "dest_min_y": 3146,
-                "dest_plane": 0,
-                "id": 3,
-                "interface_id": 1191,
+                "direction": null,
+                "id": 1,
+                "location_closed_plane": null,
+                "location_closed_x": null,
+                "location_closed_y": null,
+                "location_open_plane": null,
+                "location_open_x": null,
+                "location_open_y": null,
                 "next_node_id": null,
                 "next_node_type": null,
+                "open_action": "Open",
                 "requirement_id": null,
-                "slot_id": -1
+                "tile_inside_plane": 0,
+                "tile_inside_x": 2942,
+                "tile_inside_y": 3440,
+                "tile_outside_plane": 0,
+                "tile_outside_x": 2943,
+                "tile_outside_y": 3440
             }
         }
     },
@@ -53,142 +293,64 @@
         "type": "move",
         "from": {
             "min": [
-                2123,
+                876,
                 0,
                 0
             ],
             "max": [
-                2123,
+                876,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                2119,
+                905,
                 0,
                 0
             ],
             "max": [
-                2119,
+                905,
                 0,
                 0
             ]
         },
-        "cost_ms": 1,
+        "cost_ms": 3,
         "metadata": {
-            "a_id": 2119,
-            "b_id": 2123,
-            "length": 1.0,
+            "a_id": 876,
+            "b_id": 905,
+            "length": 3.0,
             "plane": 0,
-            "portal_id": 9721,
-            "x1": 2944.0,
-            "x2": 2944.0,
-            "y1": 3148.0,
-            "y2": 3147.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                2119,
-                0,
-                0
-            ],
-            "max": [
-                2119,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                2114,
-                0,
-                0
-            ],
-            "max": [
-                2114,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 1,
-        "metadata": {
-            "a_id": 2114,
-            "b_id": 2119,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 9699,
-            "x1": 2928.0,
-            "x2": 2928.0,
-            "y1": 3155.0,
-            "y2": 3154.0
-        }
-    },
-    {
-        "type": "move",
-        "from": {
-            "min": [
-                2114,
-                0,
-                0
-            ],
-            "max": [
-                2114,
-                0,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                2115,
-                0,
-                0
-            ],
-            "max": [
-                2115,
-                0,
-                0
-            ]
-        },
-        "cost_ms": 1,
-        "metadata": {
-            "a_id": 2114,
-            "b_id": 2115,
-            "length": 1.0,
-            "plane": 0,
-            "portal_id": 9687,
-            "x1": 2917.0,
-            "x2": 2918.0,
-            "y1": 3163.0,
-            "y2": 3163.0
+            "portal_id": 4707,
+            "x1": 2949.0,
+            "x2": 2949.0,
+            "y1": 3421.0,
+            "y2": 3418.0
         }
     },
     {
         "type": "waypoints",
         "from": {
             "min": [
-                2899,
-                3540,
+                2900,
+                3536,
                 0
             ],
             "max": [
-                2899,
-                3540,
+                2900,
+                3536,
                 0
             ]
         },
         "to": {
             "min": [
-                2926,
-                3173,
+                2963,
+                3411,
                 0
             ],
             "max": [
-                2926,
-                3173,
+                2963,
+                3411,
                 0
             ]
         },
@@ -196,20 +358,20 @@
         "metadata": {
             "waypoints": [
                 [
-                    2899.5,
-                    3540.5
+                    2900.5,
+                    3536.5
                 ],
                 [
-                    2944.0,
-                    3148.0
+                    2917.0,
+                    3536.0
                 ],
                 [
-                    2944.0,
-                    3148.0
+                    2917.0,
+                    3536.0
                 ],
                 [
-                    2926.5,
-                    3173.5
+                    2963.5,
+                    3411.5
                 ]
             ]
         }
