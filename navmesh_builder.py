@@ -171,7 +171,7 @@ NODE_TABLES = {
 DIR_TOKENS = {"N","NE","E","SE","S","SW","W","NW","NORTH","EAST","SOUTH","WEST","NORTHEAST","NORTHWEST","SOUTHEAST","SOUTHWEST"}
 
 MAX_POLY_EXTENT = 64
-HOLE_SPLIT_MIN_RADIUS = 15
+HOLE_SPLIT_MIN_RADIUS = 5
 
 def is_tile_walkable(allowed: Optional[str], blocked: Optional[str]) -> bool:
     """

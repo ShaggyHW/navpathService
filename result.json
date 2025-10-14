@@ -1,204 +1,119 @@
 [
     {
-        "type": "lodestone",
+        "type": "move",
         "from": {
             "min": [
-                737,
+                969,
                 0,
                 0
             ],
             "max": [
-                737,
+                969,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                598,
+                1056,
                 0,
                 0
             ],
             "max": [
-                598,
+                1056,
                 0,
                 0
             ]
         },
         "cost_ms": 1,
-        "node": {
-            "type": "lodestone",
-            "id": 25
-        },
         "metadata": {
-            "db_row": {
-                "child_chain": [],
-                "cost": 1,
-                "dest": [
-                    2878,
-                    3442,
-                    0
-                ],
-                "id": 25,
-                "lodestone": "TAVERLEY",
-                "next_node_id": null,
-                "next_node_type": null,
-                "requirement_id": 5
-            }
+            "a_id": 969,
+            "b_id": 1056,
+            "length": 1.0,
+            "plane": 0,
+            "portal_id": 26565,
+            "x1": 3072.0,
+            "x2": 3073.0,
+            "y1": 3520.0,
+            "y2": 3520.0
         }
     },
     {
         "type": "move",
         "from": {
             "min": [
-                598,
+                1056,
                 0,
                 0
             ],
             "max": [
-                598,
+                1056,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                599,
+                1068,
                 0,
                 0
             ],
             "max": [
-                599,
+                1068,
                 0,
                 0
             ]
         },
-        "cost_ms": 5,
+        "cost_ms": 1,
         "metadata": {
-            "a_id": 598,
-            "b_id": 599,
-            "length": 5.0,
+            "a_id": 1056,
+            "b_id": 1068,
+            "length": 1.0,
             "plane": 0,
-            "portal_id": 2391,
-            "x1": 2880.0,
-            "x2": 2880.0,
-            "y1": 3446.0,
-            "y2": 3441.0
+            "portal_id": 29117,
+            "x1": 3136.0,
+            "x2": 3136.0,
+            "y1": 3583.0,
+            "y2": 3582.0
         }
     },
     {
         "type": "move",
         "from": {
             "min": [
-                599,
+                1068,
                 0,
                 0
             ],
             "max": [
-                599,
+                1068,
                 0,
                 0
             ]
         },
         "to": {
             "min": [
-                593,
+                1122,
                 0,
                 0
             ],
             "max": [
-                593,
+                1122,
                 0,
-                0
-            ]
-        },
-        "cost_ms": 6,
-        "metadata": {
-            "a_id": 593,
-            "b_id": 599,
-            "length": 6.0,
-            "plane": 0,
-            "portal_id": 2375,
-            "x1": 2880.0,
-            "x2": 2880.0,
-            "y1": 3415.0,
-            "y2": 3409.0
-        }
-    },
-    {
-        "type": "object",
-        "from": {
-            "min": [
-                2871,
-                3402,
-                0
-            ],
-            "max": [
-                2876,
-                3409,
-                0
-            ]
-        },
-        "to": {
-            "min": [
-                3234,
-                3212,
-                0
-            ],
-            "max": [
-                3241,
-                3218,
                 0
             ]
         },
         "cost_ms": 1,
-        "node": {
-            "type": "object",
-            "id": 8
-        },
         "metadata": {
-            "db_row": {
-                "action": "Board",
-                "child_chain": [
-                    {
-                        "id": 4,
-                        "meta": {
-                            "click_id": 0,
-                            "component_id": 22,
-                            "dest_rect": [
-                                null,
-                                null,
-                                null,
-                                null,
-                                null
-                            ],
-                            "interface_id": 847,
-                            "next_node_id": null,
-                            "next_node_type": null,
-                            "slot_id": -1
-                        },
-                        "type": "ifslot"
-                    }
-                ],
-                "cost": 1,
-                "dest_max_x": 3241,
-                "dest_max_y": 3218,
-                "dest_min_x": 3234,
-                "dest_min_y": 3212,
-                "dest_plane": 0,
-                "id": 8,
-                "match_type": "id",
-                "next_node_id": 4,
-                "next_node_type": "ifslot",
-                "object_id": 114172,
-                "object_name": null,
-                "orig_max_x": 2876,
-                "orig_max_y": 3409,
-                "orig_min_x": 2871,
-                "orig_min_y": 3402,
-                "orig_plane": 0,
-                "requirement_id": null
-            }
+            "a_id": 1068,
+            "b_id": 1122,
+            "length": 1.0,
+            "plane": 0,
+            "portal_id": 29469,
+            "x1": 3136.0,
+            "x2": 3137.0,
+            "y1": 3584.0,
+            "y2": 3584.0
         }
     }
 ]
