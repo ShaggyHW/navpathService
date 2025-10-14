@@ -39,7 +39,7 @@ from typing import Iterable, List, Tuple, Dict, Optional
 
 try:
     from shapely.geometry import box, Polygon, Point, MultiPolygon, LineString
-    from shapely.ops import unary_union, triangulate
+    from shapely.ops import unary_union, triangulate, split, nearest_points
     from shapely import wkb
 except Exception as e:
     print("Error: shapely is required. Install with: pip install shapely", file=sys.stderr)
@@ -171,6 +171,7 @@ NODE_TABLES = {
 DIR_TOKENS = {"N","NE","E","SE","S","SW","W","NW","NORTH","EAST","SOUTH","WEST","NORTHEAST","NORTHWEST","SOUTHEAST","SOUTHWEST"}
 
 MAX_POLY_EXTENT = 64
+HOLE_SPLIT_MIN_RADIUS = 15
 
 def is_tile_walkable(allowed: Optional[str], blocked: Optional[str]) -> bool:
     """
@@ -181,6 +182,79 @@ def is_tile_walkable(allowed: Optional[str], blocked: Optional[str]) -> bool:
         return False
     tokens = {t.strip().upper() for t in allowed.split(",") if t.strip()}
     return len(tokens & DIR_TOKENS) > 0
+
+
+def _parse_dir_set(s: Optional[str]) -> set:
+    if not s:
+        return set()
+    return {t.strip().upper() for t in s.split(",") if t.strip()}
+
+
+def _tile_allows_dir(allowed_set: set, blocked_set: set, base: str) -> bool:
+    b = base.upper()
+    if b == "N":
+        syn = {"N", "NORTH"}
+    elif b == "E":
+        syn = {"E", "EAST"}
+    elif b == "S":
+        syn = {"S", "SOUTH"}
+    elif b == "W":
+        syn = {"W", "WEST"}
+    else:
+        syn = {b}
+    if len(syn & allowed_set) == 0:
+        return False
+    if len(syn & blocked_set) > 0:
+        return False
+    return True
+
+
+def _fetch_tile_dirs(conn: sqlite3.Connection, plane: int, bbox: Optional[Dict[str,int]]) -> Dict[Tuple[int,int], Tuple[set, set]]:
+    params = {"plane": plane}
+    if bbox:
+        params.update({
+            "xmin": int(bbox.get("xmin", -1<<30)),
+            "xmax": int(bbox.get("xmax",  1<<30)),
+            "ymin": int(bbox.get("ymin", -1<<30)),
+            "ymax": int(bbox.get("ymax",  1<<30)),
+        })
+        sql = TILES_SELECT_BBOX
+    else:
+        sql = TILES_SELECT_PLANE
+    out: Dict[Tuple[int,int], Tuple[set, set]] = {}
+    for x, y, plane_v, allow, block in conn.execute(sql, params):
+        try:
+            xx = int(x); yy = int(y)
+        except Exception:
+            continue
+        a = _parse_dir_set(allow)
+        b = _parse_dir_set(block)
+        if len(a) == 0:
+            continue
+        out[(xx,yy)] = (a, b)
+    return out
+
+
+def _build_passable_edge_union(conn: sqlite3.Connection, plane: int, bbox: Optional[Dict[str,int]]):
+    tile_dirs = _fetch_tile_dirs(conn, plane, bbox)
+    segs: List[LineString] = []
+    for (x, y), (a_set, b_set) in tile_dirs.items():
+        nx = (x + 1, y)
+        if nx in tile_dirs:
+            a2, b2 = tile_dirs[nx]
+            if _tile_allows_dir(a_set, b_set, "E") and _tile_allows_dir(a2, b2, "W"):
+                segs.append(LineString([(x + 1, y), (x + 1, y + 1)]))
+        ny = (x, y + 1)
+        if ny in tile_dirs:
+            a2, b2 = tile_dirs[ny]
+            if _tile_allows_dir(a_set, b_set, "N") and _tile_allows_dir(a2, b2, "S"):
+                segs.append(LineString([(x, y + 1), (x + 1, y + 1)]))
+    if not segs:
+        return None
+    try:
+        return unary_union(segs)
+    except Exception:
+        return None
 
 
 def tiles_to_polygons(tiles: Iterable[Tuple[int,int]]) -> List[Polygon]:
@@ -199,19 +273,65 @@ def tiles_to_polygons(tiles: Iterable[Tuple[int,int]]) -> List[Polygon]:
     return [g for g in getattr(merged, "geoms", []) if isinstance(g, Polygon)]
 
 
+def split_polygon_holes(poly: Polygon, min_radius: float) -> List[Polygon]:
+    interiors = list(getattr(poly, "interiors", []) or [])
+    if not interiors:
+        return [poly]
+    lines = []
+    ext = poly.exterior
+    for ring in interiors:
+        try:
+            hole_area = Polygon(ring).area
+            if hole_area <= 0:
+                continue
+            radius = math.sqrt(hole_area / math.pi)
+            if radius <= min_radius:
+                continue
+            p_ext, p_hole = nearest_points(ext, ring)
+            line = LineString([p_ext, p_hole])
+            lines.append(line)
+        except Exception:
+            continue
+    if not lines:
+        return [poly]
+    splitter = unary_union(lines) if len(lines) > 1 else lines[0]
+    try:
+        res = split(poly, splitter)
+        geoms = list(getattr(res, "geoms", [res]))
+    except Exception:
+        try:
+            slit = splitter.buffer(1e-6, cap_style=2)
+            diffed = poly.difference(slit)
+            geoms = [g for g in getattr(diffed, "geoms", [diffed])]
+        except Exception:
+            geoms = [poly]
+    out: List[Polygon] = []
+    for g in geoms:
+        if isinstance(g, Polygon) and not g.is_empty and g.area > 1e-6:
+            out.append(g)
+    return out or [poly]
+
+
+def split_holes_in_polys(polys: Iterable[Polygon], min_radius: float) -> List[Polygon]:
+    out: List[Polygon] = []
+    for p in polys:
+        out.extend(split_polygon_holes(p, min_radius))
+    return out
+
+
 def split_polygon_by_extent(poly: Polygon, max_extent: int) -> List[Polygon]:
     minx, miny, maxx, maxy = poly.bounds
     if (maxx - minx) <= max_extent and (maxy - miny) <= max_extent:
         return [poly]
-    xmin = math.floor(minx)
-    ymin = math.floor(miny)
-    xmax = math.ceil(maxx)
-    ymax = math.ceil(maxy)
+    gx_min = math.floor(minx / max_extent) * max_extent
+    gy_min = math.floor(miny / max_extent) * max_extent
+    gx_max = math.ceil(maxx / max_extent) * max_extent
+    gy_max = math.ceil(maxy / max_extent) * max_extent
     pieces: List[Polygon] = []
-    for x0 in range(xmin, xmax, max_extent):
-        x1 = min(x0 + max_extent, xmax)
-        for y0 in range(ymin, ymax, max_extent):
-            y1 = min(y0 + max_extent, ymax)
+    for x0 in range(gx_min, gx_max, max_extent):
+        x1 = min(x0 + max_extent, gx_max)
+        for y0 in range(gy_min, gy_max, max_extent):
+            y1 = min(y0 + max_extent, gy_max)
             cell = box(x0, y0, x1, y1)
             clipped = poly.intersection(cell)
             if clipped.is_empty:
@@ -231,6 +351,13 @@ def enforce_polygon_extent(polys: Iterable[Polygon], max_extent: int) -> List[Po
     for poly in polys:
         out.extend(split_polygon_by_extent(poly, max_extent))
     return out
+
+
+def _grid_sort_key(geom: Polygon, extent: int) -> Tuple[int, int, float, float]:
+    minx, miny, _, _ = geom.bounds
+    gx = math.floor(minx / extent)
+    gy = math.floor(miny / extent)
+    return (gy, gx, float(miny), float(minx))
 
 
 def tiles_to_rectangles(tiles: Iterable[Tuple[int,int]], max_w: int, max_h: int) -> List[Polygon]:
@@ -492,12 +619,13 @@ def insert_portal(cur: sqlite3.Cursor, plane: int, a_id: int, b_id: int,
     )
 
 
-def build_adjacency(cells: Dict[int, Polygon], plane: int, cur: sqlite3.Cursor):
+def build_adjacency(cells: Dict[int, Polygon], plane: int, cur: sqlite3.Cursor, passable_union=None):
     # Spatial index over cell bboxes
     sidx = SimpleRTree()
     for cid, geom in cells.items():
         sidx.insert(cid, bbox_of_geom(geom))
-
+    EPS = 0.0000001
+    
     # For each cell, find neighbors with boundary overlap (LineString segment)
     # To avoid O(n^2) duplicates, only connect cid < nid
     for cid, geom in cells.items():
@@ -507,23 +635,47 @@ def build_adjacency(cells: Dict[int, Polygon], plane: int, cur: sqlite3.Cursor):
             if nid <= cid:
                 continue
             ng = cells[nid]
-            inter = geom.boundary.intersection(ng.boundary)
+            if geom.distance(ng) > EPS:
+                continue
+            inter = geom.intersection(ng)
             if inter.is_empty:
                 continue
             # intersection could be MultiLineString or LineString
+            lines = []
             if isinstance(inter, LineString):
-                if inter.length > 1e-6:
-                    x1, y1 = inter.coords[0]
-                    x2, y2 = inter.coords[-1]
-                    insert_portal(cur, plane, cid, nid, x1, y1, x2, y2)
-                    insert_portal(cur, plane, nid, cid, x1, y1, x2, y2)
+                if inter.length > EPS:
+                    lines.append(inter)
             else:
                 for g in getattr(inter, "geoms", []):
-                    if isinstance(g, LineString) and g.length > 1e-6:
-                        x1, y1 = g.coords[0]
-                        x2, y2 = g.coords[-1]
-                        insert_portal(cur, plane, cid, nid, x1, y1, x2, y2)
-                        insert_portal(cur, plane, nid, cid, x1, y1, x2, y2)
+                    if isinstance(g, LineString) and g.length > EPS:
+                        lines.append(g)
+            for g in lines:
+                p = g.interpolate(0.5, normalized=True)
+                mx, my = p.coords[0]
+                on_a = abs(geom.boundary.distance(Point(mx, my))) < EPS
+                on_b = abs(ng.boundary.distance(Point(mx, my))) < EPS
+                if not (on_a and on_b):
+                    continue
+                g_use = g
+                if passable_union is not None:
+                    try:
+                        g_clip = g.intersection(passable_union)
+                    except Exception:
+                        g_clip = g
+                    g_use = g_clip
+                pieces = []
+                if isinstance(g_use, LineString):
+                    if g_use.length > EPS:
+                        pieces.append(g_use)
+                else:
+                    for gg in getattr(g_use, "geoms", []):
+                        if isinstance(gg, LineString) and gg.length > EPS:
+                            pieces.append(gg)
+                for seg in pieces:
+                    x1, y1 = seg.coords[0]
+                    x2, y2 = seg.coords[-1]
+                    insert_portal(cur, plane, cid, nid, x1, y1, x2, y2)
+                    insert_portal(cur, plane, nid, cid, x1, y1, x2, y2)
 
 
 def find_cell_containing_point(cur: sqlite3.Cursor, plane: int, pt: Point) -> Optional[int]:
@@ -583,9 +735,28 @@ def build_navmesh_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conne
     if cell_shape == "rects" and not triangulate_flag:
         print(f"[plane {plane}] Packing tiles into rectangles (max {rect_max_w}x{rect_max_h}) ...")
         polys = tiles_to_rectangles(tiles, rect_max_w, rect_max_h)
+        polys = split_holes_in_polys(polys, HOLE_SPLIT_MIN_RADIUS)
+        polys = enforce_polygon_extent(polys, MAX_POLY_EXTENT)
     else:
         print(f"[plane {plane}] Merging tiles into polygons ...")
         polys = tiles_to_polygons(tiles)
+        for _ in range(3):
+            has_big_hole = False
+            for p in polys:
+                if isinstance(p, Polygon) and getattr(p, "interiors", None):
+                    for ring in p.interiors:
+                        try:
+                            a = Polygon(ring).area
+                            if a > 0 and math.sqrt(a / math.pi) > HOLE_SPLIT_MIN_RADIUS:
+                                has_big_hole = True
+                                break
+                        except Exception:
+                            continue
+                if has_big_hole:
+                    break
+            if not has_big_hole:
+                break
+            polys = split_holes_in_polys(polys, HOLE_SPLIT_MIN_RADIUS)
         polys = enforce_polygon_extent(polys, MAX_POLY_EXTENT)
 
     # Prevent cells merging across door edges; split polys along door barriers
@@ -600,23 +771,26 @@ def build_navmesh_for_plane(in_conn: sqlite3.Connection, out_conn: sqlite3.Conne
     cur = out_conn.cursor()
 
     cell_geoms: Dict[int, Polygon] = {}  # id -> geometry
+    passable_union = _build_passable_edge_union(in_conn, plane, bbox)
 
     if mode == "polys" and not triangulate_flag:
+        polys = sorted(polys, key=lambda g: _grid_sort_key(g, MAX_POLY_EXTENT))
         for poly in polys:
             cid = insert_cell(cur, plane, "polygon", poly)
             cell_geoms[cid] = poly
         print(f"[plane {plane}] Building polygon adjacency (portals) ...")
-        build_adjacency(cell_geoms, plane, cur)
+        build_adjacency(cell_geoms, plane, cur, passable_union=passable_union)
     else:
         # Triangulate each polygon; keep triangles within polygon only.
         print(f"[plane {plane}] Triangulating polygons into triangles ...")
-        for poly in polys:
+        for poly in sorted(polys, key=lambda g: _grid_sort_key(g, MAX_POLY_EXTENT)):
             tris = triangles_from_polygon(poly)
+            tris = sorted(tris, key=lambda g: _grid_sort_key(g, MAX_POLY_EXTENT))
             for t in tris:
                 cid = insert_cell(cur, plane, "triangle", t)
                 cell_geoms[cid] = t
         print(f"[plane {plane}] Building triangle adjacency (portals) ...")
-        build_adjacency(cell_geoms, plane, cur)
+        build_adjacency(cell_geoms, plane, cur, passable_union=None)
 
     out_conn.commit()
     print(f"[plane {plane}] Cells stored: {len(cell_geoms)}")
