@@ -38,3 +38,4 @@ Desktop.ini
 /rust/out/
 /rust/node_modules/
 /.spec-workflow
+/rust/target/
