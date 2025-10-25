@@ -1,176 +1,90 @@
-# navpath-service (Axum HTTP Service)
+# navpath-service
 
-`navpath-service` exposes Navpath functionality over HTTP using Axum. It reuses a long-lived `SqliteGraphProvider` per database path to leverage warm caches for stable, low-latency responses.
+Axum-based HTTP service that serves pathfinding over a grid with optional HPA*/micro-A* planning against a read-only SQLite database.
 
-No Python is required to run this service.
+- Health: GET /healthz → {"status":"ok"}
+- Readiness: GET /readyz → {"ready":true|false} (opens DB and performs a minimal query)
+- Version: GET /version → {"version":"x.y.z"}
+- Pathfinding: POST /find_path → { path, actions } or only actions
 
 ## Quickstart
 
+1) Prerequisites
+- Rust (stable)
+- SQLite DB file (absolute path). Example DB provided at repo root: `worldReachableTiles.db`.
+
+2) Environment
+- The service reads process environment variables. It does NOT auto-load a .env file.
+- Either export values, or `source` a file before running.
+
+Example (bash):
 ```bash
-# From the workspace root `rust/`
-# 1) Build
-cargo build -p navpath-service
-
-# 2) Configure (required): path to your SQLite DB
-export NAVPATH_DB=/absolute/path/to/worldReachableTiles.db
-
-# Optional environment
-export NAVPATH_HOST=0.0.0.0
+export NAVPATH_DB="$PWD/worldReachableTiles.db"
+export NAVPATH_HOST=127.0.0.1
 export NAVPATH_PORT=8080
-export RUST_LOG=info
+export NAVPATH_MOVE_COST_MS=200
+export RUST_LOG=info,navpath_service=debug,axum=info
+```
 
-# Optional SQLite read-only PRAGMA tuning (applied if supported)
-export NAVPATH_SQLITE_QUERY_ONLY=1
-export NAVPATH_SQLITE_CACHE_SIZE_KB=200000
-export NAVPATH_SQLITE_MMAP_SIZE=268435456
-export NAVPATH_SQLITE_TEMP_STORE=MEMORY   # or FILE
-
-# 3) Run
+3) Run the server
+```bash
 cargo run -p navpath-service
 ```
 
-The service binds to `${NAVPATH_HOST}:${NAVPATH_PORT}` (default `0.0.0.0:8080`).
-
-## Endpoints
-
-- `GET /healthz` — liveness
-- `GET /version` — service and core crate versions
-- `GET /readyz` — warms and reports readiness for the default DB (`NAVPATH_DB`)
-- `POST /find_path` — run pathfinding
-
-### Warmed-ready flow
-To maximize performance, warm the default provider caches before traffic:
-1) Start with `NAVPATH_DB` set.
-2) Call `GET /readyz` once.
-
+4) Probe
 ```bash
-curl -s http://127.0.0.1:8080/readyz | jq
+curl -s http://127.0.0.1:8080/healthz
+curl -s http://127.0.0.1:8080/readyz
+curl -s http://127.0.0.1:8080/version
 ```
 
-If `NAVPATH_DB` is not set, `/readyz` returns 503 with an error message.
+## API
 
-### Request/Response: /find_path
-Request shape matches `FindPathRequest` in `rust/navpath-service/src/routes.rs`:
-```jsonc
+### POST /find_path
+Request body (JSON):
+```json
 {
-  "start": [x, y, plane],
-  "goal": [x, y, plane],
-  "options": { /* optional: mirrors SearchOptions in navpath-core */ },
-  "db_path": "/optional/override.db"
+  "start": {"x": 3200, "y": 3200, "plane": 0},
+  "end":   {"x": 3203, "y": 3202, "plane": 0},
+  "requirements": [
+    {"key": "quest.points", "value": 20},
+    {"key": "has_item.gloves", "value": "true"}
+  ]
 }
 ```
 
-- `options` fields correspond to `SearchOptions` in `rust/navpath-core/src/options.rs`.
-- If `db_path` is omitted, the default `NAVPATH_DB` is used.
-- The service injects `options.extras["start_tile"] = [start_x, start_y, start_plane]` automatically for provider gating.
-- Actions-only variant is supported when either body or query indicates it:
-  - Body: `options.extras["only_actions"]` or `options.extras["actions_only"]` is truthy
-  - Query: `?only_actions=true` (alias: `?actions_only=true`)
+Query parameters:
+- `only_actions=true` to return just the `actions` array.
 
-Examples:
-```bash
-# Minimal
-curl -s -X POST http://127.0.0.1:8080/find_path \
-  -H 'Content-Type: application/json' \
-  -d '{"start":[3200,3200,0],"goal":[3210,3211,0]}' | jq
-
-# With options and per-request db override
-curl -s -X POST http://127.0.0.1:8080/find_path \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "start": [3200, 3200, 0],
-    "goal": [3210, 3211, 0],
-    "db_path": "/absolute/other.db",
-    "options": {
-      "use_doors": true,
-      "use_lodestones": true,
-      "use_objects": true,
-      "use_ifslots": true,
-      "use_npcs": true,
-      "use_items": true,
-      "max_expansions": 1000000,
-      "timeout_ms": 5000,
-      "max_chain_depth": 5000,
-      "door_cost_override": 600,
-      "lodestone_cost_override": 17000,
-      "object_cost_override": 2000,
-      "ifslot_cost_override": 1000,
-      "npc_cost_override": 1000,
-      "item_cost_override": 3000,
-      "extras": {}
-    }
-  }' | jq
+Response (full):
+```json
+{
+  "path": [[3200,3200,0],[3201,3200,0],[3202,3201,0],[3203,3202,0]],
+  "actions": [
+    {"type":"move","from":{"min":[3200,3200,0],"max":[3200,3200,0]},"to":{"min":[3201,3200,0],"max":[3201,3200,0]},"cost_ms":200}
+  ]
+}
 ```
 
-### Actions-only responses
-
-If you only need the `actions` array, request the actions-only variant via query or body extras.
-
+Response (only actions):
 ```bash
-# Query flag (preferred)
-curl -s -X POST 'http://127.0.0.1:8080/find_path?only_actions=true' \
-  -H 'Content-Type: application/json' \
-  -d '{"start":[3200,3200,0],"goal":[3210,3211,0]}' | jq
-
-# Query alias
-curl -s -X POST 'http://127.0.0.1:8080/find_path?actions_only=true' \
-  -H 'Content-Type: application/json' \
-  -d '{"start":[3200,3200,0],"goal":[3210,3211,0]}' | jq
-
-# Body extras (boolean)
-curl -s -X POST http://127.0.0.1:8080/find_path \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "start": [3200, 3200, 0],
-    "goal": [3210, 3211, 0],
-    "options": { "extras": { "only_actions": true } }
-  }' | jq
-
-# Body extras alias and coercion ("1" is accepted)
-curl -s -X POST http://127.0.0.1:8080/find_path \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "start": [3200, 3200, 0],
-    "goal": [3210, 3211, 0],
-    "options": { "extras": { "actions_only": "1" } }
-  }' | jq
+curl -s "http://127.0.0.1:8080/find_path?only_actions=true" \
+  -H 'content-type: application/json' \
+  -d '{"start":{"x":3200,"y":3200,"plane":0},"end":{"x":3203,"y":3202,"plane":0},"requirements":[]}'
 ```
 
-## Configuration
+Notes:
+- `requirements` is an array of `{key, value}` pairs. Numeric comparisons are supported when both sides are numeric; otherwise string eq/neq apply.
+- Walkability and allowed tiles are constrained by the DB if `NAVPATH_DB` is set; otherwise unconstrained.
 
-- Binding
-  - `NAVPATH_HOST` (default `0.0.0.0`)
-  - `NAVPATH_PORT` (default `8080`)
-- Default DB
-  - `NAVPATH_DB=/absolute/path/to/worldReachableTiles.db`
-- Logging
-  - `RUST_LOG=info` (e.g., `debug` for verbose tracing JSON logs)
-- SQLite read-only PRAGMAs (applied if supported):
-  - `NAVPATH_SQLITE_QUERY_ONLY=1|0`
-  - `NAVPATH_SQLITE_CACHE_SIZE_KB=<KB>`
-  - `NAVPATH_SQLITE_MMAP_SIZE=<bytes>`
-  - `NAVPATH_SQLITE_TEMP_STORE=MEMORY|FILE`
+## Environment variables
+- `NAVPATH_DB` (optional, absolute path): SQLite DB file. Required for readiness to be true and for DB-backed constraints.
+- `NAVPATH_HOST` (default: 127.0.0.1)
+- `NAVPATH_PORT` (default: 8080)
+- `NAVPATH_MOVE_COST_MS` (default: 200) per-tile move cost used when emitting actions.
+- `RUST_LOG` (example: `info,navpath_service=debug,axum=info`)
 
-These map to `DbOpenConfig` in `navpath-core` and are applied by `Database::open_read_only()` used in `ProviderManager`.
-
-## Benchmark tips
-
-- Warm with `/readyz` before measuring.
-- Use a single DB for consistent cache behavior.
-- Suggested tools:
-  - [`hey`](https://github.com/rakyll/hey) for quick load tests
-  - [`wrk`](https://github.com/wg/wrk) for sustained benchmarks
-- Tune for your host:
-  - `NAVPATH_SQLITE_CACHE_SIZE_KB=200000`
-  - `NAVPATH_SQLITE_MMAP_SIZE=268435456`
-- Monitor logs via `RUST_LOG`. Avoid debug logging in hot loops in production.
-
-## Development
-
-- Run all tests for the workspace:
-  ```bash
-  cargo test
-  ```
-- Typical changes live in:
-  - Service: `rust/navpath-service/src/`
-  - Core crate: `rust/navpath-core/src/`
+## Logging & Performance
+- Structured logs via `tracing`/`tracing-subscriber`.
+- `/find_path` logs include algorithm time and total handler time fields: `algo_ms`, `total_ms`.
+- `/readyz` logs probe latency and returns `ready=false` if DB cannot be opened or minimally queried.

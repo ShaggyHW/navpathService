@@ -1,0 +1,3 @@
+fn(axum::extract::State<AppState>) -> impl Future<Output = Json<Readyz>> {readyz}
+fn(axum::extract::State<AppState>) -> impl Future<Output = Json<Readyz>> {readyz}: Handler<_, _>
+axum::handler::Layered<L, H, T, S>

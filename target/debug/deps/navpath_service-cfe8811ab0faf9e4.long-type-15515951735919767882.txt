@@ -1,0 +1,3 @@
+fn(axum::extract::State<AppState>, Query<FindPathQuery>, Json<FindPathRequest>) -> impl Future<Output = Result<Json<serde_json::Value>, AppError>> {find_path}
+fn(axum::extract::State<AppState>, Query<FindPathQuery>, Json<FindPathRequest>) -> impl Future<Output = Result<Json<serde_json::Value>, AppError>> {find_path}: Handler<_, _>
+axum::handler::Layered<L, H, T, S>
