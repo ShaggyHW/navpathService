@@ -88,6 +88,22 @@ impl Db {
         Ok(out)
     }
 
+    pub fn list_cluster_entrances_by_plane(&self, plane: i32) -> Result<Vec<ClusterEntrance>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT entrance_id, cluster_id, x, y, plane, neighbor_dir, teleport_edge_id
+                 FROM cluster_entrances WHERE plane = ?1 ORDER BY entrance_id",
+            )
+            .context("prepare list_cluster_entrances_by_plane")?;
+        let rows = stmt
+            .query_map(params![plane], |r| Ok(ClusterEntrance::from_row(r)))
+            .context("exec list_cluster_entrances_by_plane")?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
     pub fn get_intraconnection(&self, from: i64, to: i64) -> Result<Option<ClusterIntraConnection>> {
         let mut stmt = self
             .conn
@@ -103,6 +119,26 @@ impl Db {
         Ok(row)
     }
 
+    pub fn list_cluster_intraconnections_by_plane(&self, plane: i32) -> Result<Vec<ClusterIntraConnection>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT c.entrance_from, c.entrance_to, c.cost, c.path_blob
+                 FROM cluster_intraconnections c
+                 JOIN cluster_entrances e1 ON e1.entrance_id = c.entrance_from
+                 JOIN cluster_entrances e2 ON e2.entrance_id = c.entrance_to
+                 WHERE e1.plane = ?1 AND e2.plane = ?1
+                 ORDER BY c.entrance_from, c.entrance_to",
+            )
+            .context("prepare list_cluster_intraconnections_by_plane")?;
+        let rows = stmt
+            .query_map(params![plane], |r| Ok(ClusterIntraConnection::from_row(r)))
+            .context("exec list_cluster_intraconnections_by_plane")?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
     pub fn get_interconnection(&self, from: i64, to: i64) -> Result<Option<ClusterInterConnection>> {
         let mut stmt = self
             .conn
@@ -116,6 +152,26 @@ impl Db {
             .optional()
             .context("exec get_interconnection")?;
         Ok(row)
+    }
+
+    pub fn list_cluster_interconnections_by_plane(&self, plane: i32) -> Result<Vec<ClusterInterConnection>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT c.entrance_from, c.entrance_to, c.cost
+                 FROM cluster_interconnections c
+                 JOIN cluster_entrances e1 ON e1.entrance_id = c.entrance_from
+                 JOIN cluster_entrances e2 ON e2.entrance_id = c.entrance_to
+                 WHERE e1.plane = ?1 AND e2.plane = ?1
+                 ORDER BY c.entrance_from, c.entrance_to",
+            )
+            .context("prepare list_cluster_interconnections_by_plane")?;
+        let rows = stmt
+            .query_map(params![plane], |r| Ok(ClusterInterConnection::from_row(r)))
+            .context("exec list_cluster_interconnections_by_plane")?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
     }
 
     pub fn get_tile(&self, x: i32, y: i32, plane: i32) -> Result<Option<TileRow>> {
@@ -148,6 +204,63 @@ impl Db {
         for r in rows {
             out.push(r?);
         }
+        Ok(out)
+    }
+
+    pub fn list_abstract_teleport_edges_for_plane(&self, plane: i32) -> Result<Vec<AbstractTeleportEdge>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT t.edge_id, t.kind, t.node_id, t.src_x, t.src_y, t.src_plane,
+                        t.dst_x, t.dst_y, t.dst_plane, t.cost, t.requirement_id, t.src_entrance, t.dst_entrance
+                 FROM abstract_teleport_edges t
+                 JOIN cluster_entrances s ON s.entrance_id = t.src_entrance
+                 JOIN cluster_entrances d ON d.entrance_id = t.dst_entrance
+                 WHERE s.plane = ?1 AND d.plane = ?1
+                 ORDER BY t.src_entrance, t.dst_entrance, t.edge_id",
+            )
+            .context("prepare list_abstract_teleport_edges_for_plane")?;
+        let rows = stmt
+            .query_map(params![plane], |r| Ok(AbstractTeleportEdge::from_row(r)))
+            .context("exec list_abstract_teleport_edges_for_plane")?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn list_abstract_teleport_edges_for_planes(&self, plane_a: i32, plane_b: i32) -> Result<Vec<AbstractTeleportEdge>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT t.edge_id, t.kind, t.node_id, t.src_x, t.src_y, t.src_plane,
+                        t.dst_x, t.dst_y, t.dst_plane, t.cost, t.requirement_id, t.src_entrance, t.dst_entrance
+                 FROM abstract_teleport_edges t
+                 JOIN cluster_entrances s ON s.entrance_id = t.src_entrance
+                 JOIN cluster_entrances d ON d.entrance_id = t.dst_entrance
+                 WHERE (s.plane IN (?1, ?2)) AND (d.plane IN (?1, ?2))
+                 ORDER BY t.src_entrance, t.dst_entrance, t.edge_id",
+            )
+            .context("prepare list_abstract_teleport_edges_for_planes")?;
+        let rows = stmt
+            .query_map(params![plane_a, plane_b], |r| Ok(AbstractTeleportEdge::from_row(r)))
+            .context("exec list_abstract_teleport_edges_for_planes")?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn list_teleport_requirements(&self) -> Result<Vec<TeleportRequirement>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT id, metaInfo, key, value, comparison FROM teleports_requirements ORDER BY id",
+            )
+            .context("prepare list_teleport_requirements")?;
+        let rows = stmt
+            .query_map([], |r| Ok(TeleportRequirement::from_row(r)))
+            .context("exec list_teleport_requirements")?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
         Ok(out)
     }
 

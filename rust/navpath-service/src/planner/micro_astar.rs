@@ -66,7 +66,7 @@ where
     in_open.insert(start_pos);
 
     // Fixed neighbor order for determinism: N, E, S, W
-    let neighbors = [(0, -1), (1, 0), (0, 1), (-1, 0)];
+    let neighbors = [(0, 1), (1, 0), (0, -1), (-1, 0)];
 
     while let Some(current) = open.pop() {
         let cur_pos = (current.x, current.y);

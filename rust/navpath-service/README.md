@@ -1,6 +1,6 @@
 # navpath-service
 
-Axum-based HTTP service that serves pathfinding over a grid with optional HPA*/micro-A* planning against a read-only SQLite database.
+Axum-based HTTP service that serves pathfinding over a grid using a database-backed HPA* planner (micro A* is used internally for intra-cluster refinement). A read-only SQLite database is required.
 
 - Health: GET /healthz → {"status":"ok"}
 - Readiness: GET /readyz → {"ready":true|false} (opens DB and performs a minimal query)
@@ -75,14 +75,15 @@ curl -s "http://127.0.0.1:8080/find_path?only_actions=true" \
 
 Notes:
 - `requirements` is an array of `{key, value}` pairs. Numeric comparisons are supported when both sides are numeric; otherwise string eq/neq apply.
-- Walkability and allowed tiles are constrained by the DB if `NAVPATH_DB` is set; otherwise unconstrained.
+- Walkability and allowed tiles are constrained by the DB; `NAVPATH_DB` is required.
 
 ## Environment variables
-- `NAVPATH_DB` (optional, absolute path): SQLite DB file. Required for readiness to be true and for DB-backed constraints.
+- `NAVPATH_DB` (required, absolute path): SQLite DB file. The service will refuse to start if this is not set or cannot be opened.
 - `NAVPATH_HOST` (default: 127.0.0.1)
 - `NAVPATH_PORT` (default: 8080)
 - `NAVPATH_MOVE_COST_MS` (default: 200) per-tile move cost used when emitting actions.
 - `RUST_LOG` (example: `info,navpath_service=debug,axum=info`)
+- `NAVPATH_DEBUG_RESULT_PATH` (optional): absolute path where the service writes the last `/find_path` JSON response for debugging.
 
 ## Logging & Performance
 - Structured logs via `tracing`/`tracing-subscriber`.

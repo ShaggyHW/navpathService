@@ -1,1 +1,0 @@
-Arc<{type error}, {type error}>

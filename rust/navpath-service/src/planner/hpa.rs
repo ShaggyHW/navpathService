@@ -48,28 +48,29 @@ pub fn plan(inputs: &HpaInputs<'_>, evaluator: &RequirementEvaluator, opts: &Hpa
     for (idx, node) in graph.nodes.iter().enumerate() {
         match &node.kind {
             NodeKind::Entrance { entrance_id: _, cluster_id, x, y, plane } => {
-                if *plane != opts.start.plane || *plane != opts.end.plane {
-                    continue;
+                // Connect start -> entrance only on the start plane
+                if *plane == opts.start.plane {
+                    if let Some(cost) = micro_cost_within_cluster(
+                        opts.start,
+                        Tile { x: *x, y: *y, plane: *plane },
+                        *cluster_id,
+                        &inputs.cluster_tiles,
+                        &inputs.is_walkable,
+                    ) {
+                        extra_edges_from_start.push((idx, cost));
+                    }
                 }
-                // Connect start -> entrance if micro A* exists within cluster tiles
-                if let Some(cost) = micro_cost_within_cluster(
-                    opts.start,
-                    Tile { x: *x, y: *y, plane: *plane },
-                    *cluster_id,
-                    &inputs.cluster_tiles,
-                    &inputs.is_walkable,
-                ) {
-                    extra_edges_from_start.push((idx, cost));
-                }
-                // Connect entrance -> end
-                if let Some(cost) = micro_cost_within_cluster(
-                    Tile { x: *x, y: *y, plane: *plane },
-                    opts.end,
-                    *cluster_id,
-                    &inputs.cluster_tiles,
-                    &inputs.is_walkable,
-                ) {
-                    extra_edges_to_end.push((idx, cost));
+                // Connect entrance -> end only on the end plane
+                if *plane == opts.end.plane {
+                    if let Some(cost) = micro_cost_within_cluster(
+                        Tile { x: *x, y: *y, plane: *plane },
+                        opts.end,
+                        *cluster_id,
+                        &inputs.cluster_tiles,
+                        &inputs.is_walkable,
+                    ) {
+                        extra_edges_to_end.push((idx, cost));
+                    }
                 }
             }
             _ => {}

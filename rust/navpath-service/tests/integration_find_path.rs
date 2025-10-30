@@ -30,7 +30,6 @@ fn build_test_db() -> (TempDir, std::path::PathBuf) {
         )
         .unwrap();
     }
-
     (dir, path)
 }
 
@@ -40,6 +39,18 @@ fn build_router_with_db(db_path: std::path::PathBuf) -> Router {
         port: 0,
         db_path: Some(db_path),
         move_cost_ms: Some(200),
+        debug_result_path: None,
+    };
+    build_router(Arc::new(cfg))
+}
+
+fn build_router_without_db() -> Router {
+    let cfg = Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        db_path: None,
+        move_cost_ms: Some(200),
+        debug_result_path: None,
     };
     build_router(Arc::new(cfg))
 }
@@ -184,4 +195,27 @@ async fn find_path_unreachable_returns_400() {
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["error"]["code"], json!("bad_request"));
+}
+
+#[tokio::test]
+async fn find_path_missing_db_returns_500() {
+    let app = build_router_without_db();
+
+    let req_body = json!({
+        "start": {"x":0, "y":0, "plane":0},
+        "end": {"x":1, "y":0, "plane":0}
+    });
+
+    let req: Request<Body> = Request::builder()
+        .method("POST")
+        .uri("/find_path")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["code"], json!("internal"));
 }

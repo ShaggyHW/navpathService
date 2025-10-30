@@ -1,2 +1,0 @@
-fn(axum::extract::State<AppState>, Query<FindPathQuery>, axum::Json<FindPathRequest>) -> impl Future<Output = Result<axum::Json<serde_json::Value>, AppError>> {find_path}
-fn(axum::extract::State<AppState>, Query<FindPathQuery>, axum::Json<FindPathRequest>) -> impl Future<Output = Result<axum::Json<serde_json::Value>, AppError>> {find_path}: Handler<_, _>

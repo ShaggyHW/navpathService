@@ -1,1 +1,0 @@
-fn(axum::extract::State<AppState>) -> impl Future<Output = axum::Json<Readyz>> {readyz}: Handler<_, _>
