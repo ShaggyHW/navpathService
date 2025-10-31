@@ -129,8 +129,17 @@ pub fn build_graph(inputs: &GraphInputs<'_>, evaluator: &RequirementEvaluator, o
     }
 
     for t in teleports.into_iter() {
-        let (Some(src_eid), Some(dst_eid)) = (t.src_entrance, t.dst_entrance) else { continue };
-        let (Some(&from), Some(&to)) = (entrance_index.get(&src_eid), entrance_index.get(&dst_eid)) else { continue };
+        let Some(dst_eid) = t.dst_entrance else { continue };
+        let Some(&to) = entrance_index.get(&dst_eid) else { continue };
+        let from = match t.src_entrance.and_then(|eid| entrance_index.get(&eid).copied()) {
+            Some(id) => id,
+            None => {
+                match (t.src_x, t.src_y, t.src_plane) {
+                    (Some(x), Some(y), Some(p)) if options.start == Tile { x: x as i32, y: y as i32, plane: p as i32 } => start_id,
+                    _ => continue,
+                }
+            }
+        };
         let allowed = match t.requirement_id.and_then(|id| req_index.get(&id)) {
             None => true,
             Some(req) => evaluator.satisfies_all(std::slice::from_ref(req)),

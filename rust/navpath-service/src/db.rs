@@ -214,9 +214,9 @@ impl Db {
                 "SELECT t.edge_id, t.kind, t.node_id, t.src_x, t.src_y, t.src_plane,
                         t.dst_x, t.dst_y, t.dst_plane, t.cost, t.requirement_id, t.src_entrance, t.dst_entrance
                  FROM abstract_teleport_edges t
-                 JOIN cluster_entrances s ON s.entrance_id = t.src_entrance
+                 LEFT JOIN cluster_entrances s ON s.entrance_id = t.src_entrance
                  JOIN cluster_entrances d ON d.entrance_id = t.dst_entrance
-                 WHERE s.plane = ?1 AND d.plane = ?1
+                 WHERE (t.src_entrance IS NULL OR s.plane = ?1) AND d.plane = ?1
                  ORDER BY t.src_entrance, t.dst_entrance, t.edge_id",
             )
             .context("prepare list_abstract_teleport_edges_for_plane")?;
@@ -235,9 +235,9 @@ impl Db {
                 "SELECT t.edge_id, t.kind, t.node_id, t.src_x, t.src_y, t.src_plane,
                         t.dst_x, t.dst_y, t.dst_plane, t.cost, t.requirement_id, t.src_entrance, t.dst_entrance
                  FROM abstract_teleport_edges t
-                 JOIN cluster_entrances s ON s.entrance_id = t.src_entrance
+                 LEFT JOIN cluster_entrances s ON s.entrance_id = t.src_entrance
                  JOIN cluster_entrances d ON d.entrance_id = t.dst_entrance
-                 WHERE (s.plane IN (?1, ?2)) AND (d.plane IN (?1, ?2))
+                 WHERE (t.src_entrance IS NULL OR s.plane IN (?1, ?2)) AND d.plane IN (?1, ?2)
                  ORDER BY t.src_entrance, t.dst_entrance, t.edge_id",
             )
             .context("prepare list_abstract_teleport_edges_for_planes")?;
