@@ -19,13 +19,12 @@ impl Bounds {
 pub struct MoveAction {
     #[serde(rename = "type")]
     pub kind: &'static str,
-    pub from: Bounds,
     pub to: Bounds,
     pub cost_ms: i64,
 }
 
-pub fn move_action(from: Tile, to: Tile, cost_ms: i64) -> serde_json::Value {
-    let act = MoveAction { kind: "move", from: Bounds::from_tile(from), to: Bounds::from_tile(to), cost_ms };
+pub fn move_action(_from: Tile, to: Tile, cost_ms: i64) -> serde_json::Value {
+    let act = MoveAction { kind: "move", to: Bounds::from_tile(to), cost_ms };
     serde_json::to_value(act).expect("serialize move action")
 }
 
