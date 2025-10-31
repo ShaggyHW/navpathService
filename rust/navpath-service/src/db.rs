@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use std::path::Path;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 pub struct Db {
     conn: Connection,
+    // Cache for tile->cluster_id resolution. None means tile not in any cluster.
+    cluster_cache: Mutex<HashMap<(i32, i32, i32), Option<i64>>>,
 }
 
 impl Db {
@@ -14,7 +18,7 @@ impl Db {
         )
         .with_context(|| "failed to open SQLite database read-only")?;
         Self::apply_pragmas(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, cluster_cache: Mutex::new(HashMap::new()) })
     }
 
     fn apply_pragmas(conn: &Connection) -> Result<()> {
@@ -24,6 +28,32 @@ impl Db {
         let _ = conn.pragma_update(None, "synchronous", &"OFF");
         let _ = conn.pragma_update(None, "journal_mode", &"OFF");
         Ok(())
+    }
+
+    /// Resolve the containing cluster_id for a tile, if any, with a small in-memory cache.
+    /// Thread-safe and read-only. Returns Ok(None) if the tile does not belong to any cluster.
+    pub fn get_cluster_id_for_tile(&self, x: i32, y: i32, plane: i32) -> Result<Option<i64>> {
+        let key = (x, y, plane);
+        // Fast path: cache hit
+        if let Some(val) = self.cluster_cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
+            return Ok(val);
+        }
+        // Miss: query DB
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT cluster_id FROM cluster_tiles WHERE x = ?1 AND y = ?2 AND plane = ?3 LIMIT 1",
+            )
+            .context("prepare get_cluster_id_for_tile")?;
+        let cid: Option<i64> = stmt
+            .query_row(params![x, y, plane], |r| r.get::<_, i64>(0))
+            .optional()
+            .context("exec get_cluster_id_for_tile")?;
+        // Store in cache
+        if let Ok(mut m) = self.cluster_cache.lock() {
+            m.insert(key, cid);
+        }
+        Ok(cid)
     }
 
     pub fn list_clusters(&self, limit: usize) -> Result<Vec<Cluster>> {

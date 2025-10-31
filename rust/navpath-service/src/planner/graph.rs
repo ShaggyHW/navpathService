@@ -22,7 +22,7 @@ pub struct Node {
 pub enum EdgeKind {
     Intra { path_blob: Option<Vec<u8>> },
     Inter,
-    Teleport { edge_id: i64, requirement_id: Option<i64> },
+    Teleport { edge_id: i64, requirement_id: Option<i64>, kind: String, node_id: i64 },
 }
 
 #[derive(Debug, Clone)]
@@ -131,21 +131,29 @@ pub fn build_graph(inputs: &GraphInputs<'_>, evaluator: &RequirementEvaluator, o
     for t in teleports.into_iter() {
         let Some(dst_eid) = t.dst_entrance else { continue };
         let Some(&to) = entrance_index.get(&dst_eid) else { continue };
+        // Determine source node for teleport:
+        // - If src_entrance is provided and present in this graph, use that entrance node.
+        // - Else if explicit src coordinates provided, require caller start to match those coords.
+        // - Else (no explicit source), allow from virtual start to support global teleports (e.g., lodestones).
         let from = match t.src_entrance.and_then(|eid| entrance_index.get(&eid).copied()) {
             Some(id) => id,
-            None => {
-                match (t.src_x, t.src_y, t.src_plane) {
-                    (Some(x), Some(y), Some(p)) if options.start == Tile { x: x as i32, y: y as i32, plane: p as i32 } => start_id,
-                    _ => continue,
+            None => match (t.src_x, t.src_y, t.src_plane) {
+                (Some(x), Some(y), Some(p)) => {
+                    if options.start.x == x as i32 && options.start.y == y as i32 && options.start.plane == p as i32 {
+                        start_id
+                    } else {
+                        continue
+                    }
                 }
-            }
+                _ => start_id,
+            },
         };
         let allowed = match t.requirement_id.and_then(|id| req_index.get(&id)) {
             None => true,
             Some(req) => evaluator.satisfies_all(std::slice::from_ref(req)),
         };
         if !allowed { continue; }
-        edges.push(Edge { from, to, cost: t.cost, kind: EdgeKind::Teleport { edge_id: t.edge_id, requirement_id: t.requirement_id } });
+        edges.push(Edge { from, to, cost: t.cost, kind: EdgeKind::Teleport { edge_id: t.edge_id, requirement_id: t.requirement_id, kind: t.kind.clone(), node_id: t.node_id } });
     }
 
     Graph { nodes, edges }

@@ -3,6 +3,8 @@ use crate::errors::AppError;
 use crate::models::{FindPathRequest, Tile};
 use crate::planner::graph::GraphInputs;
 use crate::planner::hpa::{plan as hpa_plan, HpaInputs, HpaOptions};
+use crate::planner::cluster::{plan_same_cluster, plan_cluster_aware};
+use crate::planner::micro_astar::find_path_4dir;
 use crate::requirements::RequirementEvaluator;
 use crate::serialization::{move_action, serialize_path};
 use crate::db::Db;
@@ -110,7 +112,7 @@ async fn find_path(
 
     // Build requirement evaluator (ignore extra fields by design)
     let evaluator = RequirementEvaluator::new(body.requirements.as_slice());
-    let _ = evaluator; // reserved for future teleport gating in full HPA*
+    let _ = &evaluator; // reserved for future teleport gating in full HPA*
 
     // If DB is configured, open per-request read-only connection to check walkability
     let db_opt: Option<std::sync::Arc<Db>> = match &state.db_path {
@@ -149,46 +151,65 @@ async fn find_path(
         None => return Err(AppError::Internal(anyhow::anyhow!("missing database configuration (NAVPATH_DB)"))),
     };
     let (path_tiles, hpa_extra_actions): (Vec<Tile>, Vec<serde_json::Value>) = {
+        // Prefer cluster-aware planner which assembles micro-bridges for entrance hops
+        match plan_cluster_aware(db.as_ref(), &evaluator, body.start, body.end, &is_walkable) {
+            Ok(Some(res)) => (res.path, res.actions),
+            Ok(None) | Err(_) => {
+                // Preserve previous behavior: try same-cluster micro, then general micro, then legacy HPA
+                if let Ok(Some(path)) = plan_same_cluster(db.as_ref(), body.start, body.end, &is_walkable) {
+                    (path, Vec::new())
+                } else if let Some(path) = find_path_4dir(body.start, body.end, &allowed, |x, y| is_walkable(x, y, plane)) {
+                    (path, Vec::new())
+                } else {
+                    // Fallback to legacy HPA
         // Gather inputs for both planes when start and end differ
         let plane_s = body.start.plane;
         let plane_e = body.end.plane;
-        // Entrances
-        let mut entrances = db
-            .list_cluster_entrances_by_plane(plane_s)
-            .map_err(|e| AppError::Internal(e.into()))?;
+        // Entrances (if unavailable, treat as no path rather than internal error)
+        let mut entrances = match db.list_cluster_entrances_by_plane(plane_s) {
+            Ok(v) => v,
+            Err(_) => return Err(AppError::BadRequest("no path found".to_string())),
+        };
         if plane_e != plane_s {
-            let mut more = db
-                .list_cluster_entrances_by_plane(plane_e)
-                .map_err(|e| AppError::Internal(e.into()))?;
+            let mut more = match db.list_cluster_entrances_by_plane(plane_e) {
+                Ok(v) => v,
+                Err(_) => return Err(AppError::BadRequest("no path found".to_string())),
+            };
             entrances.append(&mut more);
         }
         // Intra connections
-        let mut intra = db
-            .list_cluster_intraconnections_by_plane(plane_s)
-            .map_err(|e| AppError::Internal(e.into()))?;
+        let mut intra = match db.list_cluster_intraconnections_by_plane(plane_s) {
+            Ok(v) => v,
+            Err(_) => return Err(AppError::BadRequest("no path found".to_string())),
+        };
         if plane_e != plane_s {
-            let mut more = db
-                .list_cluster_intraconnections_by_plane(plane_e)
-                .map_err(|e| AppError::Internal(e.into()))?;
+            let mut more = match db.list_cluster_intraconnections_by_plane(plane_e) {
+                Ok(v) => v,
+                Err(_) => return Err(AppError::BadRequest("no path found".to_string())),
+            };
             intra.append(&mut more);
         }
         // Inter connections
-        let mut inter = db
-            .list_cluster_interconnections_by_plane(plane_s)
-            .map_err(|e| AppError::Internal(e.into()))?;
+        let mut inter = match db.list_cluster_interconnections_by_plane(plane_s) {
+            Ok(v) => v,
+            Err(_) => return Err(AppError::BadRequest("no path found".to_string())),
+        };
         if plane_e != plane_s {
-            let mut more = db
-                .list_cluster_interconnections_by_plane(plane_e)
-                .map_err(|e| AppError::Internal(e.into()))?;
+            let mut more = match db.list_cluster_interconnections_by_plane(plane_e) {
+                Ok(v) => v,
+                Err(_) => return Err(AppError::BadRequest("no path found".to_string())),
+            };
             inter.append(&mut more);
         }
         // Teleports (edges allowed to connect across the two planes)
-        let teleports = db
-            .list_abstract_teleport_edges_for_planes(plane_s, plane_e)
-            .map_err(|e| AppError::Internal(e.into()))?;
-        let teleport_requirements = db
-            .list_teleport_requirements()
-            .map_err(|e| AppError::Internal(e.into()))?;
+        let teleports = match db.list_abstract_teleport_edges_for_planes(plane_s, plane_e) {
+            Ok(v) => v,
+            Err(_) => return Err(AppError::BadRequest("no path found".to_string())),
+        };
+        let teleport_requirements = match db.list_teleport_requirements() {
+            Ok(v) => v,
+            Err(_) => return Err(AppError::BadRequest("no path found".to_string())),
+        };
 
         // Build cluster tiles map for all clusters referenced by entrances
         let mut cluster_tiles: std::collections::HashMap<i64, std::collections::HashSet<(i32, i32, i32)>> =
@@ -224,20 +245,225 @@ async fn find_path(
             Some(res) => (res.path, res.actions),
             None => return Err(AppError::BadRequest("no path found".to_string())),
         }
+                }
+            }
+        }
     };
     let algo_ms = t_algo.elapsed().as_millis();
 
     // Serialize response
     let only_actions = parse_only_actions(&q.only_actions);
     let move_cost = state.config.move_cost_ms.unwrap_or(200) as i64;
+    // Interleave move actions with non-move actions (e.g., teleports) in order.
     let mut actions = Vec::new();
+    let mut extra_iter = hpa_extra_actions.into_iter();
     for w in path_tiles.windows(2) {
         let a = w[0];
         let b = w[1];
-        actions.push(move_action(a, b, move_cost));
+        if a.plane != b.plane {
+            if let Some(act) = extra_iter.next() { actions.push(act); }
+            // Skip move across plane change; teleport covers this hop
+        } else {
+            actions.push(move_action(a, b, move_cost));
+        }
     }
-    // Include any non-move actions produced by HPA (e.g., teleports)
-    actions.extend(hpa_extra_actions);
+    // Append any remaining non-move actions (should be none in well-formed plans)
+    actions.extend(extra_iter);
+
+    // Enrich non-move actions with metadata, using DB lookups
+    // This preserves existing fields and adds a `metadata` object similar to legacy outputs
+    let mut enriched = Vec::with_capacity(actions.len());
+    for mut act in actions.into_iter() {
+        let kind_opt = act.get("type").and_then(|v| v.as_str()).map(|s| s.to_string());
+        if let Some(kind) = kind_opt {
+            if kind == "move" { enriched.push(act); continue; }
+            // Extract node_id if present
+            let node_id_opt = act.get("node").and_then(|n| n.get("id")).and_then(|v| v.as_i64());
+            match (kind.as_str(), node_id_opt) {
+                ("lodestone", Some(node_id)) => {
+                    if let Ok(Some(row)) = db.get_lodestone_node(node_id) {
+                        let lodestone_name = row.lodestone.clone().unwrap_or_default();
+                        // Build db_row subset similar to legacy
+                        let dest = [
+                            row.dest_x.unwrap_or_default() as i32,
+                            row.dest_y.unwrap_or_default() as i32,
+                            row.dest_plane.unwrap_or_default() as i32,
+                        ];
+                        let cost_ms = act.get("cost_ms").and_then(|v| v.as_i64()).unwrap_or(row.cost.unwrap_or_default());
+                        let metadata = serde_json::json!({
+                            "lodestone": lodestone_name,
+                            "target_lodestone": lodestone_name,
+                            "db_row": {
+                                "id": node_id,
+                                "lodestone": row.lodestone.unwrap_or_default(),
+                                "dest": dest,
+                                "cost": cost_ms,
+                                "next_node_type": row.next_node_type,
+                                "next_node_id": row.next_node_id,
+                                "requirement_id": row.requirement_id,
+                            }
+                        });
+                        act.as_object_mut().unwrap().insert("metadata".into(), metadata);
+                    }
+                    enriched.push(act);
+                }
+                ("object", Some(node_id)) => {
+                    if let Ok(Some(row)) = db.get_object_node(node_id) {
+                        let action = row.action.clone().unwrap_or_default();
+                        let match_type = row.match_type.clone().unwrap_or_default();
+                        let metadata = serde_json::json!({
+                            "action": action.clone(),
+                            "object_id": row.object_id.unwrap_or_default(),
+                            "match_type": match_type.clone(),
+                            "db_row": {
+                                "id": node_id,
+                                "match_type": match_type,
+                                "object_id": row.object_id.unwrap_or_default(),
+                                "object_name": row.object_name,
+                                "action": action,
+                                "dest_min_x": row.dest_min_x.unwrap_or_default(),
+                                "dest_max_x": row.dest_max_x.unwrap_or_default(),
+                                "dest_min_y": row.dest_min_y.unwrap_or_default(),
+                                "dest_max_y": row.dest_max_y.unwrap_or_default(),
+                                "dest_plane": row.dest_plane.unwrap_or_default(),
+                                "orig_min_x": row.orig_min_x.unwrap_or_default(),
+                                "orig_max_x": row.orig_max_x.unwrap_or_default(),
+                                "orig_min_y": row.orig_min_y.unwrap_or_default(),
+                                "orig_max_y": row.orig_max_y.unwrap_or_default(),
+                                "orig_plane": row.orig_plane.unwrap_or_default(),
+                                "search_radius": row.search_radius.unwrap_or_default(),
+                                "cost": row.cost.unwrap_or_default(),
+                                "next_node_type": row.next_node_type,
+                                "next_node_id": row.next_node_id,
+                                "requirement_id": row.requirement_id,
+                            }
+                        });
+                        act.as_object_mut().unwrap().insert("metadata".into(), metadata);
+                    }
+                    enriched.push(act);
+                }
+                ("npc", Some(node_id)) => {
+                    if let Ok(Some(row)) = db.get_npc_node(node_id) {
+                        let action = row.action.clone().unwrap_or_default();
+                        let match_type = row.match_type.clone().unwrap_or_default();
+                        let metadata = serde_json::json!({
+                            "action": action.clone(),
+                            "npc_id": row.npc_id.unwrap_or_default(),
+                            "match_type": match_type.clone(),
+                            "db_row": {
+                                "id": node_id,
+                                "match_type": match_type,
+                                "npc_id": row.npc_id.unwrap_or_default(),
+                                "npc_name": row.npc_name,
+                                "action": action,
+                                "dest_min_x": row.dest_min_x.unwrap_or_default(),
+                                "dest_max_x": row.dest_max_x.unwrap_or_default(),
+                                "dest_min_y": row.dest_min_y.unwrap_or_default(),
+                                "dest_max_y": row.dest_max_y.unwrap_or_default(),
+                                "dest_plane": row.dest_plane.unwrap_or_default(),
+                                "orig_min_x": row.orig_min_x.unwrap_or_default(),
+                                "orig_max_x": row.orig_max_x.unwrap_or_default(),
+                                "orig_min_y": row.orig_min_y.unwrap_or_default(),
+                                "orig_max_y": row.orig_max_y.unwrap_or_default(),
+                                "orig_plane": row.orig_plane.unwrap_or_default(),
+                                "search_radius": row.search_radius.unwrap_or_default(),
+                                "cost": row.cost.unwrap_or_default(),
+                                "next_node_type": row.next_node_type,
+                                "next_node_id": row.next_node_id,
+                                "requirement_id": row.requirement_id,
+                            }
+                        });
+                        act.as_object_mut().unwrap().insert("metadata".into(), metadata);
+                    }
+                    enriched.push(act);
+                }
+                ("item", Some(node_id)) => {
+                    if let Ok(Some(row)) = db.get_item_node(node_id) {
+                        let action = row.action.clone().unwrap_or_default();
+                        let metadata = serde_json::json!({
+                            "action": action.clone(),
+                            "item_id": row.item_id.unwrap_or_default(),
+                            "db_row": {
+                                "id": node_id,
+                                "item_id": row.item_id.unwrap_or_default(),
+                                "action": action,
+                                "dest_min_x": row.dest_min_x.unwrap_or_default(),
+                                "dest_max_x": row.dest_max_x.unwrap_or_default(),
+                                "dest_min_y": row.dest_min_y.unwrap_or_default(),
+                                "dest_max_y": row.dest_max_y.unwrap_or_default(),
+                                "dest_plane": row.dest_plane.unwrap_or_default(),
+                                "next_node_type": row.next_node_type,
+                                "next_node_id": row.next_node_id,
+                                "cost": row.cost.unwrap_or_default(),
+                                "requirement_id": row.requirement_id,
+                            }
+                        });
+                        act.as_object_mut().unwrap().insert("metadata".into(), metadata);
+                    }
+                    enriched.push(act);
+                }
+                ("ifslot", Some(node_id)) => {
+                    if let Ok(Some(row)) = db.get_ifslot_node(node_id) {
+                        let metadata = serde_json::json!({
+                            "db_row": {
+                                "id": node_id,
+                                "interface_id": row.interface_id.unwrap_or_default(),
+                                "component_id": row.component_id.unwrap_or_default(),
+                                "slot_id": row.slot_id.unwrap_or_default(),
+                                "click_id": row.click_id.unwrap_or_default(),
+                                "dest_min_x": row.dest_min_x.unwrap_or_default(),
+                                "dest_max_x": row.dest_max_x.unwrap_or_default(),
+                                "dest_min_y": row.dest_min_y.unwrap_or_default(),
+                                "dest_max_y": row.dest_max_y.unwrap_or_default(),
+                                "dest_plane": row.dest_plane.unwrap_or_default(),
+                                "cost": row.cost.unwrap_or_default(),
+                                "next_node_type": row.next_node_type,
+                                "next_node_id": row.next_node_id,
+                                "requirement_id": row.requirement_id,
+                            }
+                        });
+                        act.as_object_mut().unwrap().insert("metadata".into(), metadata);
+                    }
+                    enriched.push(act);
+                }
+                ("door", Some(node_id)) => {
+                    if let Ok(Some(row)) = db.get_door_node(node_id) {
+                        let metadata = serde_json::json!({
+                            "db_row": {
+                                "id": node_id,
+                                "direction": row.direction,
+                                "real_id_open": row.real_id_open,
+                                "real_id_closed": row.real_id_closed,
+                                "location_open_x": row.location_open_x,
+                                "location_open_y": row.location_open_y,
+                                "location_open_plane": row.location_open_plane,
+                                "location_closed_x": row.location_closed_x,
+                                "location_closed_y": row.location_closed_y,
+                                "location_closed_plane": row.location_closed_plane,
+                                "tile_inside_x": row.tile_inside_x,
+                                "tile_inside_y": row.tile_inside_y,
+                                "tile_inside_plane": row.tile_inside_plane,
+                                "tile_outside_x": row.tile_outside_x,
+                                "tile_outside_y": row.tile_outside_y,
+                                "tile_outside_plane": row.tile_outside_plane,
+                                "open_action": row.open_action,
+                                "cost": row.cost,
+                                "next_node_type": row.next_node_type,
+                                "next_node_id": row.next_node_id,
+                                "requirement_id": row.requirement_id,
+                            }
+                        });
+                        act.as_object_mut().unwrap().insert("metadata".into(), metadata);
+                    }
+                    enriched.push(act);
+                }
+                _ => { enriched.push(act); }
+            }
+        } else {
+            enriched.push(act);
+        }
+    }
+    let actions = enriched;
 
     let resp = if only_actions {
         serde_json::json!({ "actions": actions })

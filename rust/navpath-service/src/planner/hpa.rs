@@ -214,7 +214,7 @@ fn micro_cost_within_cluster(
     Some((path.len() as i64).saturating_sub(1))
 }
 
-fn reconstruct_tiles_and_actions(
+pub(crate) fn reconstruct_tiles_and_actions(
     graph: &Graph,
     hl_path: &[usize],
     opts: &HpaOptions,
@@ -270,14 +270,21 @@ fn reconstruct_tiles_and_actions(
                     // Minimal: step to the destination entrance tile
                     if let Some(t) = node_tile(b_idx) { append_path(&mut tiles, &mut vec![t]); }
                 }
-                EdgeKind::Teleport { edge_id, requirement_id } => {
-                    // Action annotation
-                    actions.push(serde_json::json!({
-                        "type": "teleport",
+                EdgeKind::Teleport { edge_id, requirement_id, kind, node_id } => {
+                    // Emit a rich non-move action with bounds, cost, and node info
+                    let from_t = node_tile(a_idx).unwrap();
+                    let to_t = node_tile(b_idx).unwrap();
+                    let act = serde_json::json!({
+                        "type": kind,
+                        "from": crate::serialization::Bounds::from_tile(from_t),
+                        "to": crate::serialization::Bounds::from_tile(to_t),
+                        "cost_ms": edge.cost,
+                        "node": { "type": kind, "id": node_id },
                         "edge_id": edge_id,
                         "requirement_id": requirement_id
-                    }));
-                    if let Some(t) = node_tile(b_idx) { append_path(&mut tiles, &mut vec![t]); }
+                    });
+                    actions.push(act);
+                    append_path(&mut tiles, &mut vec![to_t]);
                 }
             }
         } else {
