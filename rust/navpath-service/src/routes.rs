@@ -254,46 +254,21 @@ async fn find_path(
     // Serialize response
     let only_actions = parse_only_actions(&q.only_actions);
     let move_cost = state.config.move_cost_ms.unwrap_or(200) as i64;
-    // Interleave move actions with non-move actions (e.g., teleports including same-plane like doors)
-    // by aligning their (from,to) Bounds to consecutive tile pairs in path_tiles.
-    let mut actions: Vec<serde_json::Value> = Vec::new();
-    let mut action_map: std::collections::HashMap<(i32,i32,i32,i32,i32,i32), Vec<serde_json::Value>> = std::collections::HashMap::new();
-    // Index non-move actions by their (from_tile -> to_tile) pair
-    for act in hpa_extra_actions.into_iter() {
-        let (fx, fy, fp, tx, ty, tp) = match (
-            act.get("from").and_then(|v| v.get("min")).and_then(|a| a.as_array()),
-            act.get("to").and_then(|v| v.get("min")).and_then(|a| a.as_array()),
-        ) {
-            (Some(fa), Some(ta)) if fa.len() >= 3 && ta.len() >= 3 => {
-                let fx = fa[0].as_i64().unwrap_or_default() as i32;
-                let fy = fa[1].as_i64().unwrap_or_default() as i32;
-                let fp = fa[2].as_i64().unwrap_or_default() as i32;
-                let tx = ta[0].as_i64().unwrap_or_default() as i32;
-                let ty = ta[1].as_i64().unwrap_or_default() as i32;
-                let tp = ta[2].as_i64().unwrap_or_default() as i32;
-                (fx, fy, fp, tx, ty, tp)
-            }
-            _ => { actions.push(act); continue; }
-        };
-        action_map.entry((fx,fy,fp,tx,ty,tp)).or_default().push(act);
-    }
+    // Interleave move actions with non-move actions (e.g., teleports) in order.
+    let mut actions = Vec::new();
+    let mut extra_iter = hpa_extra_actions.into_iter();
     for w in path_tiles.windows(2) {
         let a = w[0];
         let b = w[1];
-        let key = (a.x, a.y, a.plane, b.x, b.y, b.plane);
-        if let Some(mut acts) = action_map.remove(&key) {
-            // Insert any associated non-move actions for this hop in order
-            actions.append(&mut acts);
-            // Do not add a move for this hop; the teleport action covers it
-        } else if a.plane != b.plane {
-            // Plane changed but no explicit action found: skip move to avoid fake cross-plane step
-            // This should not happen in well-formed plans
+        if a.plane != b.plane {
+            if let Some(act) = extra_iter.next() { actions.push(act); }
+            // Skip move across plane change; teleport covers this hop
         } else {
             actions.push(move_action(a, b, move_cost));
         }
     }
-    // Any remaining actions (unexpected) are appended at the end to avoid loss
-    for mut leftover in action_map.into_values() { actions.append(&mut leftover); }
+    // Append any remaining non-move actions (should be none in well-formed plans)
+    actions.extend(extra_iter);
 
     // Enrich non-move actions with metadata, using DB lookups
     // This preserves existing fields and adds a `metadata` object similar to legacy outputs

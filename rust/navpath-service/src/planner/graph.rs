@@ -122,14 +122,11 @@ pub fn build_graph(inputs: &GraphInputs<'_>, evaluator: &RequirementEvaluator, o
     let mut teleports: Vec<AbstractTeleportEdge> = inputs.teleports.to_vec();
     teleports.sort_by_key(|t| (t.src_entrance.unwrap_or(i64::MIN), t.dst_entrance.unwrap_or(i64::MIN), t.edge_id));
 
-    // Build index of requirement sets by id (multiple rows per id) to evaluate all conditions
-    let mut req_index: std::collections::HashMap<i64, Vec<TeleportRequirement>> = std::collections::HashMap::new();
-    for r in inputs.teleport_requirements.iter().cloned() {
-        req_index.entry(r.id).or_default().push(r);
+    // Build a small index of requirements by id to avoid searching the slice each time
+    let mut req_index = std::collections::HashMap::new();
+    for r in inputs.teleport_requirements.iter() {
+        req_index.insert(r.id, r.clone());
     }
-
-    // Track inserted teleport edges to avoid duplicates
-    let mut inserted: std::collections::HashSet<(usize, usize, i64)> = std::collections::HashSet::new();
 
     for t in teleports.into_iter() {
         let Some(dst_eid) = t.dst_entrance else { continue };
@@ -153,27 +150,10 @@ pub fn build_graph(inputs: &GraphInputs<'_>, evaluator: &RequirementEvaluator, o
         };
         let allowed = match t.requirement_id.and_then(|id| req_index.get(&id)) {
             None => true,
-            Some(reqs) => evaluator.satisfies_all(reqs.as_slice()),
+            Some(req) => evaluator.satisfies_all(std::slice::from_ref(req)),
         };
         if !allowed { continue; }
-        // Forward edge
-        let key_fwd = (from.0, to.0, t.edge_id);
-        if inserted.insert(key_fwd) {
-            edges.push(Edge { from, to, cost: t.cost, kind: EdgeKind::Teleport { edge_id: t.edge_id, requirement_id: t.requirement_id, kind: t.kind.clone(), node_id: t.node_id } });
-        }
-
-        // If door, also add reverse edge when both entrances are present
-        if t.kind == "door" {
-            if let Some(src_eid) = t.src_entrance {
-                if let Some(&from2) = entrance_index.get(&src_eid) {
-                    let to2 = to;
-                    let key_rev = (to2.0, from2.0, t.edge_id);
-                    if inserted.insert(key_rev) {
-                        edges.push(Edge { from: to2, to: from2, cost: t.cost, kind: EdgeKind::Teleport { edge_id: t.edge_id, requirement_id: t.requirement_id, kind: t.kind.clone(), node_id: t.node_id } });
-                    }
-                }
-            }
-        }
+        edges.push(Edge { from, to, cost: t.cost, kind: EdgeKind::Teleport { edge_id: t.edge_id, requirement_id: t.requirement_id, kind: t.kind.clone(), node_id: t.node_id } });
     }
 
     Graph { nodes, edges }
