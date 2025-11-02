@@ -6,7 +6,7 @@ use crate::planner::hpa::{plan as hpa_plan, HpaInputs, HpaOptions};
 use crate::planner::cluster::{plan_same_cluster, plan_cluster_aware};
 use crate::planner::micro_astar::find_path_4dir;
 use crate::requirements::RequirementEvaluator;
-use crate::serialization::{move_action, serialize_path};
+use crate::serialization::{move_action, serialize_path, Bounds};
 use crate::db::Db;
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
@@ -97,6 +97,255 @@ fn parse_only_actions(flag: &Option<String>) -> bool {
         Some("1") | Some("true") | Some("TRUE") | Some("True") => true,
         _ => false,
     }
+}
+
+fn expand_next_node_chain(db: &Db, evaluator: &RequirementEvaluator, first_action: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut successors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let max_steps = 32;
+    let mut steps = 0;
+
+    let mut curr_type_opt = first_action.get("metadata")
+        .and_then(|m| m.get("db_row"))
+        .and_then(|r| r.get("next_node_type"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let mut curr_id_opt = first_action.get("metadata")
+        .and_then(|m| m.get("db_row"))
+        .and_then(|r| r.get("next_node_id"))
+        .and_then(|v| v.as_i64());
+
+    let mut prev_to = first_action.get("to").cloned().unwrap_or(serde_json::Value::Null);
+
+    while let (Some(curr_type), Some(curr_id)) = (&curr_type_opt, curr_id_opt) {
+        if steps >= max_steps || seen.contains(&(curr_type.clone(), curr_id)) {
+            break;
+        }
+        seen.insert((curr_type.clone(), curr_id));
+        steps += 1;
+
+        // Fetch row based on type
+        let (row_opt, db_row_json) = match curr_type.as_str() {
+            "object" => {
+                if let Ok(Some(row)) = db.get_object_node(curr_id) {
+                    let db_row = serde_json::json!({
+                        "id": curr_id,
+                        "match_type": row.match_type,
+                        "object_id": row.object_id,
+                        "object_name": row.object_name,
+                        "action": row.action,
+                        "dest_min_x": row.dest_min_x,
+                        "dest_max_x": row.dest_max_x,
+                        "dest_min_y": row.dest_min_y,
+                        "dest_max_y": row.dest_max_y,
+                        "dest_plane": row.dest_plane,
+                        "orig_min_x": row.orig_min_x,
+                        "orig_max_x": row.orig_max_x,
+                        "orig_min_y": row.orig_min_y,
+                        "orig_max_y": row.orig_max_y,
+                        "orig_plane": row.orig_plane,
+                        "search_radius": row.search_radius,
+                        "cost": row.cost,
+                        "next_node_type": row.next_node_type,
+                        "next_node_id": row.next_node_id,
+                        "requirement_id": row.requirement_id,
+                    });
+                    (Some(()), db_row) // Using () as placeholder
+                } else {
+                    (None, serde_json::Value::Null)
+                }
+            }
+            "npc" => {
+                if let Ok(Some(row)) = db.get_npc_node(curr_id) {
+                    let db_row = serde_json::json!({
+                        "id": curr_id,
+                        "match_type": row.match_type,
+                        "npc_id": row.npc_id,
+                        "npc_name": row.npc_name,
+                        "action": row.action,
+                        "dest_min_x": row.dest_min_x,
+                        "dest_max_x": row.dest_max_x,
+                        "dest_min_y": row.dest_min_y,
+                        "dest_max_y": row.dest_max_y,
+                        "dest_plane": row.dest_plane,
+                        "orig_min_x": row.orig_min_x,
+                        "orig_max_x": row.orig_max_x,
+                        "orig_min_y": row.orig_min_y,
+                        "orig_max_y": row.orig_max_y,
+                        "orig_plane": row.orig_plane,
+                        "search_radius": row.search_radius,
+                        "cost": row.cost,
+                        "next_node_type": row.next_node_type,
+                        "next_node_id": row.next_node_id,
+                        "requirement_id": row.requirement_id,
+                    });
+                    (Some(()), db_row)
+                } else {
+                    (None, serde_json::Value::Null)
+                }
+            }
+            "item" => {
+                if let Ok(Some(row)) = db.get_item_node(curr_id) {
+                    let db_row = serde_json::json!({
+                        "id": curr_id,
+                        "item_id": row.item_id,
+                        "action": row.action,
+                        "dest_min_x": row.dest_min_x,
+                        "dest_max_x": row.dest_max_x,
+                        "dest_min_y": row.dest_min_y,
+                        "dest_max_y": row.dest_max_y,
+                        "dest_plane": row.dest_plane,
+                        "next_node_type": row.next_node_type,
+                        "next_node_id": row.next_node_id,
+                        "cost": row.cost,
+                        "requirement_id": row.requirement_id,
+                    });
+                    (Some(()), db_row)
+                } else {
+                    (None, serde_json::Value::Null)
+                }
+            }
+            "ifslot" => {
+                if let Ok(Some(row)) = db.get_ifslot_node(curr_id) {
+                    let db_row = serde_json::json!({
+                        "id": curr_id,
+                        "interface_id": row.interface_id,
+                        "component_id": row.component_id,
+                        "slot_id": row.slot_id,
+                        "click_id": row.click_id,
+                        "dest_min_x": row.dest_min_x,
+                        "dest_max_x": row.dest_max_x,
+                        "dest_min_y": row.dest_min_y,
+                        "dest_max_y": row.dest_max_y,
+                        "dest_plane": row.dest_plane,
+                        "cost": row.cost,
+                        "next_node_type": row.next_node_type,
+                        "next_node_id": row.next_node_id,
+                        "requirement_id": row.requirement_id,
+                    });
+                    (Some(()), db_row)
+                } else {
+                    (None, serde_json::Value::Null)
+                }
+            }
+            "door" => {
+                if let Ok(Some(row)) = db.get_door_node(curr_id) {
+                    let db_row = serde_json::json!({
+                        "id": curr_id,
+                        "direction": row.direction,
+                        "real_id_open": row.real_id_open,
+                        "real_id_closed": row.real_id_closed,
+                        "location_open_x": row.location_open_x,
+                        "location_open_y": row.location_open_y,
+                        "location_open_plane": row.location_open_plane,
+                        "location_closed_x": row.location_closed_x,
+                        "location_closed_y": row.location_closed_y,
+                        "location_closed_plane": row.location_closed_plane,
+                        "tile_inside_x": row.tile_inside_x,
+                        "tile_inside_y": row.tile_inside_y,
+                        "tile_inside_plane": row.tile_inside_plane,
+                        "tile_outside_x": row.tile_outside_x,
+                        "tile_outside_y": row.tile_outside_y,
+                        "tile_outside_plane": row.tile_outside_plane,
+                        "open_action": row.open_action,
+                        "cost": row.cost,
+                        "next_node_type": row.next_node_type,
+                        "next_node_id": row.next_node_id,
+                        "requirement_id": row.requirement_id,
+                    });
+                    (Some(()), db_row)
+                } else {
+                    (None, serde_json::Value::Null)
+                }
+            }
+            "lodestone" => {
+                if let Ok(Some(row)) = db.get_lodestone_node(curr_id) {
+                    let db_row = serde_json::json!({
+                        "id": curr_id,
+                        "lodestone": row.lodestone,
+                        "dest": [
+                            row.dest_x.unwrap_or_default(),
+                            row.dest_y.unwrap_or_default(),
+                            row.dest_plane.unwrap_or_default()
+                        ],
+                        "cost": row.cost,
+                        "next_node_type": row.next_node_type,
+                        "next_node_id": row.next_node_id,
+                        "requirement_id": row.requirement_id,
+                    });
+                    (Some(()), db_row)
+                } else {
+                    (None, serde_json::Value::Null)
+                }
+            }
+            _ => (None, serde_json::Value::Null),
+        };
+
+        if row_opt.is_none() {
+            break;
+        }
+
+        // Extract fields from db_row_json
+        let requirement_id = db_row_json.get("requirement_id").and_then(|v| v.as_i64());
+        let cost = db_row_json.get("cost").and_then(|v| v.as_i64()).unwrap_or_default();
+        let next_type = db_row_json.get("next_node_type").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let next_id = db_row_json.get("next_node_id").and_then(|v| v.as_i64());
+
+        // Check requirements
+        if let Some(req_id) = requirement_id {
+            if let Ok(Some(req)) = db.get_teleport_requirement(req_id) {
+                if !evaluator.satisfies_all(&[req]) {
+                    break;
+                }
+            }
+        }
+
+        // Build to_bounds: prefer dest_*, else orig_* for object/npc, or special for lodestone
+        let to_bounds_val = if curr_type == "lodestone" {
+            if let Some(dest) = db_row_json.get("dest").and_then(|d| d.as_array()) {
+                if dest.len() >= 3 {
+                    let x = dest[0].as_i64().unwrap_or_default() as i32;
+                    let y = dest[1].as_i64().unwrap_or_default() as i32;
+                    let p = dest[2].as_i64().unwrap_or_default() as i32;
+                    serde_json::to_value(crate::serialization::Bounds::from_tile(crate::models::Tile { x, y, plane: p })).unwrap()
+                } else {
+                    prev_to.clone()
+                }
+            } else {
+                prev_to.clone()
+            }
+        } else {
+            // For others, use dest_min/max or orig_min/max
+            let min_x = db_row_json.get("dest_min_x").and_then(|v| v.as_i64()).or_else(|| db_row_json.get("orig_min_x").and_then(|v| v.as_i64())).unwrap_or_default() as i32;
+            let max_x = db_row_json.get("dest_max_x").and_then(|v| v.as_i64()).or_else(|| db_row_json.get("orig_max_x").and_then(|v| v.as_i64())).unwrap_or_default() as i32;
+            let min_y = db_row_json.get("dest_min_y").and_then(|v| v.as_i64()).or_else(|| db_row_json.get("orig_min_y").and_then(|v| v.as_i64())).unwrap_or_default() as i32;
+            let max_y = db_row_json.get("dest_max_y").and_then(|v| v.as_i64()).or_else(|| db_row_json.get("orig_max_y").and_then(|v| v.as_i64())).unwrap_or_default() as i32;
+            let plane = db_row_json.get("dest_plane").and_then(|v| v.as_i64()).or_else(|| db_row_json.get("orig_plane").and_then(|v| v.as_i64())).unwrap_or_default() as i32;
+            serde_json::to_value(crate::serialization::Bounds::from_min_max_plane(min_x, max_x, min_y, max_y, plane)).unwrap()
+        };
+
+        // Construct successor action
+        let successor_action = serde_json::json!({
+            "type": curr_type,
+            "from": prev_to,
+            "to": to_bounds_val,
+            "cost_ms": cost,
+            "node": {"type": curr_type, "id": curr_id},
+            "edge_id": null,
+            "requirement_id": requirement_id,
+            "metadata": {
+                "db_row": db_row_json
+            }
+        });
+
+        successors.push(successor_action);
+
+        prev_to = to_bounds_val;
+        curr_type_opt = next_type;
+        curr_id_opt = next_id;
+    }
+
+    successors
 }
 
 async fn find_path(
@@ -330,7 +579,9 @@ async fn find_path(
                         });
                         act.as_object_mut().unwrap().insert("metadata".into(), metadata);
                     }
-                    enriched.push(act);
+                    enriched.push(act.clone());
+                    let successors = expand_next_node_chain(&db, &evaluator, &act);
+                    enriched.extend(successors);
                 }
                 ("object", Some(node_id)) => {
                     if let Ok(Some(row)) = db.get_object_node(node_id) {
@@ -365,7 +616,9 @@ async fn find_path(
                         });
                         act.as_object_mut().unwrap().insert("metadata".into(), metadata);
                     }
-                    enriched.push(act);
+                    enriched.push(act.clone());
+                    let successors = expand_next_node_chain(&db, &evaluator, &act);
+                    enriched.extend(successors);
                 }
                 ("npc", Some(node_id)) => {
                     if let Ok(Some(row)) = db.get_npc_node(node_id) {
@@ -400,7 +653,9 @@ async fn find_path(
                         });
                         act.as_object_mut().unwrap().insert("metadata".into(), metadata);
                     }
-                    enriched.push(act);
+                    enriched.push(act.clone());
+                    let successors = expand_next_node_chain(&db, &evaluator, &act);
+                    enriched.extend(successors);
                 }
                 ("item", Some(node_id)) => {
                     if let Ok(Some(row)) = db.get_item_node(node_id) {
@@ -425,7 +680,9 @@ async fn find_path(
                         });
                         act.as_object_mut().unwrap().insert("metadata".into(), metadata);
                     }
-                    enriched.push(act);
+                    enriched.push(act.clone());
+                    let successors = expand_next_node_chain(&db, &evaluator, &act);
+                    enriched.extend(successors);
                 }
                 ("ifslot", Some(node_id)) => {
                     if let Ok(Some(row)) = db.get_ifslot_node(node_id) {
@@ -449,7 +706,9 @@ async fn find_path(
                         });
                         act.as_object_mut().unwrap().insert("metadata".into(), metadata);
                     }
-                    enriched.push(act);
+                    enriched.push(act.clone());
+                    let successors = expand_next_node_chain(&db, &evaluator, &act);
+                    enriched.extend(successors);
                 }
                 ("door", Some(node_id)) => {
                     if let Ok(Some(row)) = db.get_door_node(node_id) {
@@ -480,7 +739,9 @@ async fn find_path(
                         });
                         act.as_object_mut().unwrap().insert("metadata".into(), metadata);
                     }
-                    enriched.push(act);
+                    enriched.push(act.clone());
+                    let successors = expand_next_node_chain(&db, &evaluator, &act);
+                    enriched.extend(successors);
                 }
                 _ => { enriched.push(act); }
             }

@@ -37,6 +37,7 @@ pub fn plan(inputs: &HpaInputs<'_>, evaluator: &RequirementEvaluator, opts: &Hpa
         &inputs.graph_inputs,
         evaluator,
         &GraphBuildOptions { start: opts.start, end: opts.end },
+        &inputs.cluster_tiles,
     );
 
     let (start_idx, end_idx) = find_virtual_indices(&graph)?;

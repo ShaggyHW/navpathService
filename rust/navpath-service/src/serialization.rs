@@ -13,18 +13,23 @@ pub struct Bounds {
 
 impl Bounds {
     pub fn from_tile(t: Tile) -> Self { Self { min: [t.x, t.y, t.plane], max: [t.x, t.y, t.plane] } }
+
+    pub fn from_min_max_plane(min_x: i32, max_x: i32, min_y: i32, max_y: i32, plane: i32) -> Self {
+        Self { min: [min_x, min_y, plane], max: [max_x, max_y, plane] }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MoveAction {
     #[serde(rename = "type")]
     pub kind: &'static str,
+    pub from: Bounds,
     pub to: Bounds,
     pub cost_ms: i64,
 }
 
 pub fn move_action(_from: Tile, to: Tile, cost_ms: i64) -> serde_json::Value {
-    let act = MoveAction { kind: "move", to: Bounds::from_tile(to), cost_ms };
+    let act = MoveAction { kind: "move", from: Bounds::from_tile(_from), to: Bounds::from_tile(to), cost_ms };
     serde_json::to_value(act).expect("serialize move action")
 }
 

@@ -352,5 +352,5 @@ async fn find_path_cross_cluster_via_teleport_includes_action() {
 
     // Actions contain move actions and a teleport action with correct ids
     let actions = v["actions"].as_array().unwrap();
-    assert!(actions.iter().any(|a| a["type"] == json!("teleport") && a["edge_id"] == json!(7) && a["requirement_id"] == json!(42)));
+    assert!(actions.iter().any(|a| a["type"] == json!("item") && a["edge_id"] == json!(7) && a["requirement_id"] == json!(42)));
 }

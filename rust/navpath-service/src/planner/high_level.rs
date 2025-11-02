@@ -22,7 +22,7 @@ pub fn plan_hl_indices(
     is_walkable: &Box<dyn Fn(i32, i32, i32) -> bool + '_>,
 ) -> Option<(Graph, Vec<usize>)> {
     let opts = GraphBuildOptions { start, end };
-    let graph = build_graph(inputs, evaluator, &opts);
+    let graph = build_graph(inputs, evaluator, &opts, cluster_tiles);
     // locate virtual start/end indices
     let start_idx = graph.nodes.iter().position(|n| matches!(n.kind, NodeKind::VirtualStart(_)))?;
     let end_idx = graph.nodes.iter().position(|n| matches!(n.kind, NodeKind::VirtualEnd(_)))?;
@@ -76,7 +76,7 @@ pub fn plan_hops(
     is_walkable: &Box<dyn Fn(i32, i32, i32) -> bool + '_>,
 ) -> Option<HopPlan> {
     let opts = GraphBuildOptions { start, end };
-    let graph = build_graph(inputs, evaluator, &opts);
+    let graph = build_graph(inputs, evaluator, &opts, cluster_tiles);
     // locate virtual start/end indices
     let start_idx = graph.nodes.iter().position(|n| matches!(n.kind, NodeKind::VirtualStart(_)))?;
     let end_idx = graph.nodes.iter().position(|n| matches!(n.kind, NodeKind::VirtualEnd(_)))?;
