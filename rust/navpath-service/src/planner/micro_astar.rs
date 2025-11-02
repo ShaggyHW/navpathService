@@ -70,6 +70,10 @@ where
 
     while let Some(current) = open.pop() {
         let cur_pos = (current.x, current.y);
+        // Skip if this is an outdated entry (duplicate with worse g-score)
+        if current.g > *g_score.get(&cur_pos).unwrap_or(&i32::MAX) {
+            continue;
+        }
         if cur_pos == goal_pos {
             // reconstruct path
             let mut path = Vec::new();

@@ -749,7 +749,23 @@ async fn find_path(
             enriched.push(act);
         }
     }
-    let actions = enriched;
+    let mut actions = enriched;
+
+    // Simplify move actions: remove 'from' and 'min' from 'to'
+    for action in &mut actions {
+        if let Some(serde_json::Value::String(ref typ)) = action.get("type") {
+            if typ == "move" {
+                if let Some(obj) = action.as_object_mut() {
+                    obj.remove("from");
+                    if let Some(to_val) = obj.get_mut("to") {
+                        if let Some(to_obj) = to_val.as_object_mut() {
+                            to_obj.remove("min");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let resp = if only_actions {
         serde_json::json!({ "actions": actions })
