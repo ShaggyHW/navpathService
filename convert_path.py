@@ -11,15 +11,45 @@ def load_json(path: str):
 
 def _extract_from_actions(obj: dict) -> List[Tuple[int,int,int]]:
     out: List[Tuple[int,int,int]] = []
-    for action in obj.get('actions', []):
+    actions = obj.get('actions', [])
+    if not isinstance(actions, list):
+        return out
+
+    for action in actions:
         if not isinstance(action, dict):
             continue
+
+        # Prefer explicit 'to' coordinate first
         to = action.get('to')
+        if isinstance(to, (list, tuple)) and len(to) >= 3:
+            out.append((int(to[0]), int(to[1]), int(to[2])))
+            continue
         if isinstance(to, dict):
+            # Newer macro actions provide bounding boxes; prefer max, fallback to min
             max_coords = to.get('max')
+            min_coords = to.get('min')
             if isinstance(max_coords, (list, tuple)) and len(max_coords) >= 3:
-                x, y, plane = int(max_coords[0]), int(max_coords[1]), int(max_coords[2])
-                out.append((x, y, plane))
+                out.append((int(max_coords[0]), int(max_coords[1]), int(max_coords[2])))
+                continue
+            if isinstance(min_coords, (list, tuple)) and len(min_coords) >= 3:
+                out.append((int(min_coords[0]), int(min_coords[1]), int(min_coords[2])))
+                continue
+
+        # Some actions may only have a 'from' location (rare); include as a last resort
+        frm = action.get('from')
+        if isinstance(frm, (list, tuple)) and len(frm) >= 3:
+            out.append((int(frm[0]), int(frm[1]), int(frm[2])))
+            continue
+        if isinstance(frm, dict):
+            max_coords = frm.get('max')
+            min_coords = frm.get('min')
+            if isinstance(max_coords, (list, tuple)) and len(max_coords) >= 3:
+                out.append((int(max_coords[0]), int(max_coords[1]), int(max_coords[2])))
+                continue
+            if isinstance(min_coords, (list, tuple)) and len(min_coords) >= 3:
+                out.append((int(min_coords[0]), int(min_coords[1]), int(min_coords[2])))
+                continue
+
     return out
 
 
