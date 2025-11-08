@@ -289,7 +289,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         }
     }
 
-    Ok(Json(RouteResponse {
+    let resp = RouteResponse {
         found: res.found,
         cost: res.cost,
         path: res.path.clone(),
@@ -297,7 +297,11 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         duration_ms,
         actions,
         geometry,
-    }))
+    };
+    if let Ok(bytes) = serde_json::to_vec_pretty(&resp) {
+        let _ = std::fs::write("/home/query/Dev/navpathService/result.json", bytes);
+    }
+    Ok(Json(resp))
 }
 
 #[derive(Debug, Serialize)]
