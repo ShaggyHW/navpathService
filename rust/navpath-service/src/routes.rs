@@ -64,6 +64,7 @@ pub struct Counts {
 pub struct RouteResponse {
     pub found: bool,
     pub cost: f32,
+    #[serde(skip_serializing)]
     pub path: Vec<u32>,
     pub length_tiles: usize,
     pub duration_ms: u128,
@@ -249,6 +250,10 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                                 }
                             }
                         }
+                    }
+                    // Remove duplicated top-level db_row; it exists inside per-step entries already
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.remove("db_row");
                     }
                     acts.push(serde_json::json!({
                         "type": kstr,
