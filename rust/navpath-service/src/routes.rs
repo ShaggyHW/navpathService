@@ -267,8 +267,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                     let cost_ms = wc.round();
                     acts.push(serde_json::json!({
                         "type": "move",
-                        "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
-                        "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                        "to":   [x2,y2,p2],
                         "cost_ms": cost_ms
                     }));
                 } else if let Some(gc) = global_cost.get(&v).cloned() {
