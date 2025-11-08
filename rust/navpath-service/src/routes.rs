@@ -272,8 +272,15 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                     }));
                 } else if let Some(gc) = global_cost.get(&v).cloned() {
                     let meta = global_meta.get(&v).cloned().unwrap_or(serde_json::json!({}));
+                    // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
+                    let kstr = meta
+                        .get("steps").and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|s| s.get("kind"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("global_teleport");
                     acts.push(serde_json::json!({
-                        "type": "global_teleport",
+                        "type": kstr,
                         "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
                         "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
                         "cost_ms": gc,
