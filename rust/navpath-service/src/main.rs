@@ -1,47 +1,51 @@
-mod config;
-mod errors;
-mod models;
-mod routes;
-mod db;
-mod planner;
-mod requirements;
-mod serialization;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
-use crate::config::Config;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use anyhow::Result;
+use arc_swap::ArcSwap;
+use tokio::net::TcpListener;
+use navpath_core::Snapshot;
 use tracing::{error, info};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::FmtSubscriber;
+
+use navpath_service::{
+    build_router,
+    AppState,
+    SnapshotState,
+    env_var,
+    read_tail_hash_hex,
+    now_unix,
+    build_coord_index,
+};
 
 #[tokio::main]
-async fn main() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info,navpath_service=debug,axum=info"))
-        .expect("failed to init EnvFilter");
-    fmt().with_env_filter(env_filter).init();
+async fn main() -> Result<()> {
+    let subscriber = FmtSubscriber::builder().with_ansi(false).finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
 
-    let config = match Config::from_env() {
-        Ok(cfg) => cfg,
+    let host = env_var("NAVPATH_HOST", "127.0.0.1");
+    let port: u16 = env_var("NAVPATH_PORT", "8080").parse().unwrap_or(8080);
+    let snapshot_path = PathBuf::from(env_var("SNAPSHOT_PATH", "./graph.snapshot"));
+
+    let snapshot = match Snapshot::open(&snapshot_path) {
+        Ok(s) => Some(Arc::new(s)),
         Err(e) => {
-            error!(error = %e, "failed to load configuration");
-            eprintln!("failed to load configuration: {e}");
-            std::process::exit(1);
+            error!(error=?e, path=?snapshot_path, "failed to open snapshot; service will still start but /route will 503");
+            None
         }
     };
-    let config = Arc::new(config);
 
-    let app = routes::build_router(Arc::clone(&config));
+    // Provide not-ready state if snapshot failed to load
+    let hash_hex = read_tail_hash_hex(&snapshot_path);
+    let coord_index = snapshot.as_ref().map(|s| Arc::new(build_coord_index(s)));
+    let init = SnapshotState { path: snapshot_path.clone(), snapshot, loaded_at_unix: now_unix(), snapshot_hash_hex: hash_hex, coord_index };
+    let state = AppState { current: Arc::new(ArcSwap::from_pointee(init)) };
 
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
-        .parse()
-        .expect("invalid host/port combination");
-    info!(%addr, version = env!("CARGO_PKG_VERSION"), "starting navpath-service");
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("failed to bind address");
-
-    if let Err(e) = axum::serve(listener, app.into_make_service()).await {
-        error!(error = %e, "server error");
-    }
+    let app = build_router(state.clone());
+    let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
+    info!(%addr, path=?snapshot_path, "starting navpath-service");
+    let listener = TcpListener::bind(addr).await?;
+    axum::serve(listener, app.into_make_service()).await?;
+    Ok(())
 }
+
+// no duplicate main

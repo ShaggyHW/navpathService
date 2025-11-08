@@ -40,3 +40,5 @@ Desktop.ini
 /.spec-workflow
 /rust/target/
 /target
+graph.snapshot
+tiles.bin

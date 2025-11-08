@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "rust/navpath-service",
+    "rust/navpath-core",
+    "rust/navpath-builder",
 ]
 resolver = "2"
 

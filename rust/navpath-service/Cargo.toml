@@ -13,8 +13,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "1"
 anyhow = "1"
 rusqlite = { version = "0.31" }
+navpath-core = { path = "../navpath-core" }
+arc-swap = "1"
+itertools = "0.12"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
 tempfile = "3"
 http-body-util = "0.1"
+navpath-core = { path = "../navpath-core", features = ["builder"] }

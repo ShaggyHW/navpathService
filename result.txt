@@ -1932,8 +1932,7 @@
         "id":4
       },
       "metadata":{
-        "door_direction":"OUT",
-        "db_door_direction":null,
+        "door_direction":"OUT",    
         "real_id_open":-1,
         "real_id_closed":65346,
         "action":"Slash",
