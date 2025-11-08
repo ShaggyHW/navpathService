@@ -1,139 +1,163 @@
 {
   "found": true,
-  "cost": 1800.0,
-  "length_tiles": 3,
-  "duration_ms": 73,
+  "cost": 8091.169,
+  "length_tiles": 12,
+  "duration_ms": 76,
   "actions": [
     {
-      "cost_ms": 600.0,
+      "cost_ms": 849.0,
       "to": [
-        3244,
-        3262,
+        2862,
+        3572,
         0
       ],
       "type": "move"
     },
     {
-      "cost_ms": 1200.0,
+      "cost_ms": 849.0,
+      "to": [
+        2861,
+        3573,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 849.0,
+      "to": [
+        2860,
+        3574,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 849.0,
+      "to": [
+        2859,
+        3575,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 849.0,
+      "to": [
+        2858,
+        3576,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 600.0,
       "from": {
         "max": [
-          3244,
-          3262,
+          2858,
+          3576,
           0
         ],
         "min": [
-          3244,
-          3262,
+          2858,
+          3576,
           0
         ]
       },
       "metadata": {
-        "door_direction": "IN",
-        "first_id": 6,
-        "kind": "door",
+        "first_id": 13,
+        "kind": "object",
         "requirements": [],
         "steps": [
           {
             "cost_ms": 600.0,
             "db_row": {
+              "action": "Enter",
               "cost": 600.0,
-              "direction": null,
-              "location_closed": [
-                3243,
-                3263,
-                0
-              ],
-              "location_open": [
-                3243,
-                3263,
-                0
-              ],
-              "next_db_row": {
-                "action": "Climb-down",
-                "cost": 600.0,
-                "dest_max_x": 3149,
-                "dest_max_y": 9652,
-                "dest_min_x": 3149,
-                "dest_min_y": 9652,
-                "dest_plane": 0,
-                "match_type": "id",
-                "next_node_id": null,
-                "next_node_type": null,
-                "object_id": 86431,
-                "object_name": null,
-                "orig_max_x": 3243,
-                "orig_max_y": 3262,
-                "orig_min_x": 3243,
-                "orig_min_y": 3262,
-                "orig_plane": 0,
-                "requirement_id": null,
-                "search_radius": 20
-              },
-              "next_node_id": 12,
-              "next_node_type": "object",
-              "open_action": "Pick-lock",
-              "real_id_closed": 86431,
-              "real_id_open": -1,
-              "requirement_id": null,
-              "tile_inside": [
-                3243,
-                3263,
-                0
-              ],
-              "tile_outside": [
-                3244,
-                3262,
-                0
-              ]
-            },
-            "id": 6,
-            "kind": "door"
-          },
-          {
-            "cost_ms": 600.0,
-            "db_row": {
-              "action": "Climb-down",
-              "cost": 600.0,
-              "dest_max_x": 3149,
-              "dest_max_y": 9652,
-              "dest_min_x": 3149,
-              "dest_min_y": 9652,
+              "dest_max_x": 2270,
+              "dest_max_y": 4753,
+              "dest_min_x": 2268,
+              "dest_min_y": 4752,
               "dest_plane": 0,
               "match_type": "id",
               "next_node_id": null,
               "next_node_type": null,
-              "object_id": 86431,
+              "object_id": 34395,
               "object_name": null,
-              "orig_max_x": 3243,
-              "orig_max_y": 3262,
-              "orig_min_x": 3243,
-              "orig_min_y": 3262,
+              "orig_max_x": 2859,
+              "orig_max_y": 3577,
+              "orig_min_x": 2858,
+              "orig_min_y": 3576,
               "orig_plane": 0,
               "requirement_id": null,
               "search_radius": 20
             },
-            "id": 12,
+            "id": 13,
             "kind": "object"
           }
         ]
       },
       "node": {
-        "id": 6,
-        "type": "door"
+        "id": 13,
+        "type": "object"
       },
       "to": {
         "max": [
-          3149,
-          9652,
+          2268,
+          4752,
           0
         ],
         "min": [
-          3149,
-          9652,
+          2268,
+          4752,
           0
         ]
       },
-      "type": "door"
+      "type": "object"
+    },
+    {
+      "cost_ms": 600.0,
+      "to": [
+        2268,
+        4753,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 600.0,
+      "to": [
+        2268,
+        4754,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 600.0,
+      "to": [
+        2268,
+        4755,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 600.0,
+      "to": [
+        2268,
+        4756,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 849.0,
+      "to": [
+        2269,
+        4757,
+        0
+      ],
+      "type": "move"
     }
   ]
 }
