@@ -1,7 +1,9 @@
 ```sh
 cargo run -p navpath-builder --release --   --sqlite ./worldReachableTiles.db   --out-snapshot ./graph.snapshot   --out-tiles ./tiles.bin  --landmarks 64
 
-export SNAPSHOT_PATH=/home/query/Dev/navpathService/graph.snapshot
+UPDATE THE PATH TO YOUR ONW
+
+export SNAPSHOT_PATH=/home/query/Dev/navpathService/graph.snapshot 
 export NAVPATH_HOST=127.0.0.1
 export NAVPATH_PORT=8080
 export RUST_LOG=info
