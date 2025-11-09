@@ -26,3 +26,7 @@ curl -s http://127.0.0.1:8080/route \
 ```
 
 You can check the rest of the keys in the worldReachableTiles.db TeleportRequirement Tables. if more keys are passed more connections will become available.
+
+
+IF YOU WANT TO BUILD YOUR OWN DATABASE, I GOT MINE BY USING THIS REPO:
+https://github.com/ShaggyHW/rs3cache_extractor
