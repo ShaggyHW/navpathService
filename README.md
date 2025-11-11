@@ -1,5 +1,20 @@
 ENJOY
 
+IF YOU NOTICE A COORDINATE NOT AVAILABLE OPEN AN ISSUE WITH THIS FORMAT
+
+```
+X: 3200
+Y: 3200
+Plane: 0
+
+Where it is:
+Near Lumbridge:
+
+Screenshot of map area:
+[Screenshot]
+
+```
+
 ```sh
 cargo run -p navpath-builder --release --   --sqlite ./worldReachableTiles.db   --out-snapshot ./graph.snapshot   --out-tiles ./tiles.bin  --landmarks 64
 
