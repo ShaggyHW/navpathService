@@ -97,7 +97,7 @@ pub fn compile_walk_edges(
 
                 src.push(sid);
                 dst.push(did);
-                w.push(cost * 600.0);
+                w.push(cost * 300.0);
             }
         }
     }
