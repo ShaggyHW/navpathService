@@ -1,82 +1,81 @@
 {
   "found": true,
-  "cost": 28336.746,
-  "length_tiles": 74,
-  "duration_ms": 74,
+  "cost": 66425.76,
+  "length_tiles": 139,
+  "duration_ms": 180,
   "actions": [
     {
-      "cost_ms": 1800.0,
+      "cost_ms": 17000.0,
       "from": {
         "max": [
-          2276,
-          3313,
-          1
+          3213,
+          3375,
+          0
         ],
         "min": [
-          2276,
-          3313,
-          1
+          3213,
+          3375,
+          0
         ]
       },
       "metadata": {
-        "cost_ms": 1800.0,
+        "cost_ms": 17000.0,
         "db_row": {
-          "action": "Teleport",
-          "cost": 1800.0,
-          "dest_max_x": 3336,
-          "dest_max_y": 3381,
-          "dest_min_x": 3336,
-          "dest_min_y": 3378,
-          "dest_plane": 0,
-          "item_id": 49429,
+          "cost": 17000.0,
+          "dest": [
+            2967,
+            3403,
+            0
+          ],
+          "lodestone": "FALADOR",
           "next_node_id": null,
           "next_node_type": null,
-          "requirement_id": 45
+          "requirement_id": 4
         },
-        "dst": 390123,
+        "dst": 419436,
         "requirements": [
-          45
+          4
         ],
         "steps": [
           {
-            "cost_ms": 1800.0,
+            "cost_ms": 17000.0,
             "db_row": {
-              "action": "Teleport",
-              "cost": 1800.0,
-              "dest_max_x": 3336,
-              "dest_max_y": 3381,
-              "dest_min_x": 3336,
-              "dest_min_y": 3378,
-              "dest_plane": 0,
-              "item_id": 49429,
+              "cost": 17000.0,
+              "dest": [
+                2967,
+                3403,
+                0
+              ],
+              "lodestone": "FALADOR",
               "next_node_id": null,
               "next_node_type": null,
-              "requirement_id": 45
+              "requirement_id": 4
             },
-            "id": 3,
-            "kind": "item"
+            "id": 12,
+            "kind": "lodestone",
+            "lodestone": "FALADOR"
           }
         ]
       },
       "to": {
         "max": [
-          3336,
-          3378,
+          2967,
+          3403,
           0
         ],
         "min": [
-          3336,
-          3378,
+          2967,
+          3403,
           0
         ]
       },
-      "type": "item"
+      "type": "lodestone"
     },
     {
       "cost_ms": 300.0,
       "to": [
-        3335,
-        3378,
+        2968,
+        3403,
         0
       ],
       "type": "move"
@@ -84,8 +83,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        3334,
-        3378,
+        2968,
+        3404,
         0
       ],
       "type": "move"
@@ -93,8 +92,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        3333,
-        3378,
+        2968,
+        3405,
         0
       ],
       "type": "move"
@@ -102,8 +101,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        3332,
-        3378,
+        2968,
+        3406,
         0
       ],
       "type": "move"
@@ -111,17 +110,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        3331,
-        3378,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        3330,
-        3378,
+        2968,
+        3407,
         0
       ],
       "type": "move"
@@ -129,391 +119,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        3329,
-        3377,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        3329,
-        3376,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        3329,
-        3375,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        3328,
-        3375,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        3327,
-        3375,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 1200.0,
-      "from": {
-        "max": [
-          3327,
-          3375,
-          0
-        ],
-        "min": [
-          3327,
-          3375,
-          0
-        ]
-      },
-      "metadata": {
-        "first_id": 146,
-        "kind": "object",
-        "requirements": [
-          53
-        ],
-        "steps": [
-          {
-            "cost_ms": 600.0,
-            "db_row": {
-              "action": "View",
-              "cost": 600.0,
-              "dest_max_x": 5457,
-              "dest_max_y": 2339,
-              "dest_min_x": 5457,
-              "dest_min_y": 2339,
-              "dest_plane": 0,
-              "match_type": "id",
-              "next_db_row": {
-                "click_id": 2,
-                "component_id": 11,
-                "cost": 600.0,
-                "dest_max_x": null,
-                "dest_max_y": null,
-                "dest_min_x": null,
-                "dest_min_y": null,
-                "dest_plane": null,
-                "interface_id": 667,
-                "next_node_id": null,
-                "next_node_type": null,
-                "requirement_id": null,
-                "slot_id": 5
-              },
-              "next_node_id": 22,
-              "next_node_type": "ifslot",
-              "object_id": 116436,
-              "object_name": null,
-              "orig_max_x": 3327,
-              "orig_max_y": 3375,
-              "orig_min_x": 3327,
-              "orig_min_y": 3375,
-              "orig_plane": 0,
-              "requirement_id": 53,
-              "search_radius": 20
-            },
-            "id": 146,
-            "kind": "object"
-          },
-          {
-            "cost_ms": 600.0,
-            "db_row": {
-              "click_id": 2,
-              "component_id": 11,
-              "cost": 600.0,
-              "dest_max_x": null,
-              "dest_max_y": null,
-              "dest_min_x": null,
-              "dest_min_y": null,
-              "dest_plane": null,
-              "interface_id": 667,
-              "next_node_id": null,
-              "next_node_type": null,
-              "requirement_id": null,
-              "slot_id": 5
-            },
-            "id": 22,
-            "kind": "ifslot"
-          }
-        ]
-      },
-      "node": {
-        "id": 146,
-        "type": "object"
-      },
-      "to": {
-        "max": [
-          5457,
-          2339,
-          0
-        ],
-        "min": [
-          5457,
-          2339,
-          0
-        ]
-      },
-      "type": "object"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5456,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5455,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5454,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5453,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5452,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5451,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5450,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5449,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5448,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5447,
-        2339,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 1800.0,
-      "from": {
-        "max": [
-          5447,
-          2339,
-          0
-        ],
-        "min": [
-          5447,
-          2339,
-          0
-        ]
-      },
-      "metadata": {
-        "first_id": 131,
-        "kind": "object",
-        "requirements": [
-          40
-        ],
-        "steps": [
-          {
-            "cost_ms": 600.0,
-            "db_row": {
-              "action": "Teleport",
-              "cost": 600.0,
-              "dest_max_x": 5655,
-              "dest_max_y": 2158,
-              "dest_min_x": 5655,
-              "dest_min_y": 2158,
-              "dest_plane": 0,
-              "match_type": "id",
-              "next_db_row": {
-                "click_id": 2,
-                "component_id": 9,
-                "cost": 600.0,
-                "dest_max_x": null,
-                "dest_max_y": null,
-                "dest_min_x": null,
-                "dest_min_y": null,
-                "dest_plane": null,
-                "interface_id": 71,
-                "next_node_id": 11,
-                "next_node_type": "ifslot",
-                "requirement_id": null,
-                "slot_id": 4
-              },
-              "next_node_id": 10,
-              "next_node_type": "ifslot",
-              "object_id": 119029,
-              "object_name": null,
-              "orig_max_x": 5447,
-              "orig_max_y": 2339,
-              "orig_min_x": 5447,
-              "orig_min_y": 2339,
-              "orig_plane": 0,
-              "requirement_id": 40,
-              "search_radius": 20
-            },
-            "id": 131,
-            "kind": "object"
-          },
-          {
-            "cost_ms": 600.0,
-            "db_row": {
-              "click_id": 2,
-              "component_id": 9,
-              "cost": 600.0,
-              "dest_max_x": null,
-              "dest_max_y": null,
-              "dest_min_x": null,
-              "dest_min_y": null,
-              "dest_plane": null,
-              "interface_id": 71,
-              "next_db_row": {
-                "click_id": 1,
-                "component_id": 28,
-                "cost": 600.0,
-                "dest_max_x": null,
-                "dest_max_y": null,
-                "dest_min_x": null,
-                "dest_min_y": null,
-                "dest_plane": null,
-                "interface_id": 71,
-                "next_node_id": null,
-                "next_node_type": null,
-                "requirement_id": null,
-                "slot_id": -1
-              },
-              "next_node_id": 11,
-              "next_node_type": "ifslot",
-              "requirement_id": null,
-              "slot_id": 4
-            },
-            "id": 10,
-            "kind": "ifslot"
-          },
-          {
-            "cost_ms": 600.0,
-            "db_row": {
-              "click_id": 1,
-              "component_id": 28,
-              "cost": 600.0,
-              "dest_max_x": null,
-              "dest_max_y": null,
-              "dest_min_x": null,
-              "dest_min_y": null,
-              "dest_plane": null,
-              "interface_id": 71,
-              "next_node_id": null,
-              "next_node_type": null,
-              "requirement_id": null,
-              "slot_id": -1
-            },
-            "id": 11,
-            "kind": "ifslot"
-          }
-        ]
-      },
-      "node": {
-        "id": 131,
-        "type": "object"
-      },
-      "to": {
-        "max": [
-          5655,
-          2158,
-          0
-        ],
-        "min": [
-          5655,
-          2158,
-          0
-        ]
-      },
-      "type": "object"
-    },
-    {
-      "cost_ms": 424.0,
-      "to": [
-        5656,
-        2159,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5656,
-        2160,
+        2969,
+        3408,
         0
       ],
       "type": "move"
@@ -521,8 +128,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        5657,
-        2161,
+        2970,
+        3409,
         0
       ],
       "type": "move"
@@ -530,8 +137,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        5658,
-        2161,
+        2971,
+        3409,
         0
       ],
       "type": "move"
@@ -539,17 +146,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        5659,
-        2161,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5660,
-        2161,
+        2972,
+        3409,
         0
       ],
       "type": "move"
@@ -557,89 +155,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        5661,
-        2162,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5662,
-        2162,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5663,
-        2162,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5664,
-        2162,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5665,
-        2162,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5666,
-        2162,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5667,
-        2162,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5668,
-        2162,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5669,
-        2162,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        5670,
-        2162,
+        2973,
+        3410,
         0
       ],
       "type": "move"
@@ -647,8 +164,26 @@
     {
       "cost_ms": 424.0,
       "to": [
-        5671,
-        2161,
+        2974,
+        3411,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        2974,
+        3412,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        2974,
+        3413,
         0
       ],
       "type": "move"
@@ -656,8 +191,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        5672,
-        2160,
+        2975,
+        3414,
         0
       ],
       "type": "move"
@@ -665,8 +200,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        5673,
-        2159,
+        2976,
+        3415,
         0
       ],
       "type": "move"
@@ -674,8 +209,17 @@
     {
       "cost_ms": 424.0,
       "to": [
-        5674,
-        2158,
+        2977,
+        3416,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        2978,
+        3416,
         0
       ],
       "type": "move"
@@ -683,93 +227,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        5675,
-        2157,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 600.0,
-      "from": {
-        "max": [
-          5675,
-          2157,
-          0
-        ],
-        "min": [
-          5675,
-          2157,
-          0
-        ]
-      },
-      "metadata": {
-        "first_id": 135,
-        "kind": "object",
-        "requirements": [
-          44
-        ],
-        "steps": [
-          {
-            "cost_ms": 600.0,
-            "db_row": {
-              "action": "Enter",
-              "cost": 600.0,
-              "dest_max_x": 1248,
-              "dest_max_y": 247,
-              "dest_min_x": 1248,
-              "dest_min_y": 247,
-              "dest_plane": 0,
-              "match_type": "id",
-              "next_node_id": null,
-              "next_node_type": null,
-              "object_id": 119066,
-              "object_name": null,
-              "orig_max_x": 5675,
-              "orig_max_y": 2157,
-              "orig_min_x": 5675,
-              "orig_min_y": 2157,
-              "orig_plane": 0,
-              "requirement_id": 44,
-              "search_radius": 20
-            },
-            "id": 135,
-            "kind": "object"
-          }
-        ]
-      },
-      "node": {
-        "id": 135,
-        "type": "object"
-      },
-      "to": {
-        "max": [
-          1248,
-          247,
-          0
-        ],
-        "min": [
-          1248,
-          247,
-          0
-        ]
-      },
-      "type": "object"
-    },
-    {
-      "cost_ms": 424.0,
-      "to": [
-        1247,
-        246,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        1246,
-        246,
+        2979,
+        3417,
         0
       ],
       "type": "move"
@@ -777,8 +236,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        1245,
-        245,
+        2980,
+        3418,
         0
       ],
       "type": "move"
@@ -786,8 +245,53 @@
     {
       "cost_ms": 424.0,
       "to": [
-        1244,
-        244,
+        2981,
+        3419,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        2982,
+        3419,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        2983,
+        3419,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        2984,
+        3419,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        2985,
+        3419,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        2986,
+        3419,
         0
       ],
       "type": "move"
@@ -795,8 +299,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        1243,
-        243,
+        2987,
+        3420,
         0
       ],
       "type": "move"
@@ -804,8 +308,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        1242,
-        242,
+        2988,
+        3421,
         0
       ],
       "type": "move"
@@ -813,8 +317,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1242,
-        241,
+        2988,
+        3422,
         0
       ],
       "type": "move"
@@ -822,8 +326,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1242,
-        240,
+        2988,
+        3423,
         0
       ],
       "type": "move"
@@ -831,8 +335,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1242,
-        239,
+        2988,
+        3424,
         0
       ],
       "type": "move"
@@ -840,8 +344,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1242,
-        238,
+        2988,
+        3425,
         0
       ],
       "type": "move"
@@ -849,17 +353,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1243,
-        238,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        1244,
-        238,
+        2988,
+        3426,
         0
       ],
       "type": "move"
@@ -867,17 +362,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        1245,
-        237,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        1246,
-        237,
+        2989,
+        3427,
         0
       ],
       "type": "move"
@@ -885,8 +371,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        1247,
-        236,
+        2990,
+        3428,
         0
       ],
       "type": "move"
@@ -894,8 +380,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1247,
-        235,
+        2991,
+        3428,
         0
       ],
       "type": "move"
@@ -903,8 +389,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1247,
-        234,
+        2992,
+        3428,
         0
       ],
       "type": "move"
@@ -912,44 +398,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1247,
-        233,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        1247,
-        232,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        1247,
-        231,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        1247,
-        230,
-        0
-      ],
-      "type": "move"
-    },
-    {
-      "cost_ms": 300.0,
-      "to": [
-        1247,
-        229,
+        2993,
+        3428,
         0
       ],
       "type": "move"
@@ -957,8 +407,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        1248,
-        228,
+        2994,
+        3429,
         0
       ],
       "type": "move"
@@ -966,8 +416,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1248,
-        227,
+        2995,
+        3429,
         0
       ],
       "type": "move"
@@ -975,8 +425,8 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1248,
-        226,
+        2996,
+        3429,
         0
       ],
       "type": "move"
@@ -984,8 +434,8 @@
     {
       "cost_ms": 424.0,
       "to": [
-        1249,
-        225,
+        2997,
+        3430,
         0
       ],
       "type": "move"
@@ -993,8 +443,863 @@
     {
       "cost_ms": 300.0,
       "to": [
-        1250,
-        225,
+        2998,
+        3430,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        2999,
+        3430,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3000,
+        3430,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3001,
+        3431,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3002,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3003,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3004,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3005,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3006,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3007,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3008,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3009,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3010,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3011,
+        3432,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3012,
+        3433,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3013,
+        3434,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3014,
+        3435,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3015,
+        3436,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3016,
+        3436,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3017,
+        3436,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3018,
+        3436,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3019,
+        3436,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3020,
+        3436,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3021,
+        3436,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3022,
+        3437,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3023,
+        3438,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3024,
+        3439,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3025,
+        3440,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3026,
+        3441,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3027,
+        3442,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3028,
+        3443,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3029,
+        3444,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3030,
+        3445,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3031,
+        3446,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3032,
+        3447,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3033,
+        3448,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3033,
+        3449,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3033,
+        3450,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3034,
+        3451,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3034,
+        3452,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3034,
+        3453,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3035,
+        3453,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3036,
+        3454,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3037,
+        3455,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3038,
+        3456,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3039,
+        3457,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3040,
+        3458,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3041,
+        3459,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3042,
+        3460,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3043,
+        3461,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3044,
+        3461,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3045,
+        3462,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3046,
+        3463,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3047,
+        3464,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3048,
+        3465,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3049,
+        3466,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3050,
+        3467,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3051,
+        3468,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3052,
+        3469,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3053,
+        3470,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3054,
+        3471,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3055,
+        3472,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3056,
+        3473,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3056,
+        3474,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3057,
+        3474,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3057,
+        3475,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3057,
+        3476,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3057,
+        3477,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3058,
+        3478,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3059,
+        3478,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3060,
+        3479,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3061,
+        3480,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3062,
+        3481,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3062,
+        3482,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3062,
+        3483,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3062,
+        3484,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3062,
+        3485,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3062,
+        3486,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3062,
+        3487,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3063,
+        3488,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3064,
+        3489,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3065,
+        3490,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3065,
+        3491,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3065,
+        3492,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3065,
+        3493,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3065,
+        3494,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3066,
+        3495,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3067,
+        3496,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3068,
+        3497,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3069,
+        3498,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3069,
+        3499,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3069,
+        3500,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3069,
+        3501,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 424.0,
+      "to": [
+        3070,
+        3502,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3070,
+        3503,
+        0
+      ],
+      "type": "move"
+    },
+    {
+      "cost_ms": 300.0,
+      "to": [
+        3070,
+        3504,
         0
       ],
       "type": "move"
