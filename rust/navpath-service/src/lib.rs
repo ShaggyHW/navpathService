@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::{SystemTime, UNI
 
 use arc_swap::ArcSwap;
 use axum::{routing::{get, post}, Router};
-use navpath_core::Snapshot;
+use navpath_core::{Snapshot, NeighborProvider};
 
 pub mod routes;
 pub mod engine_adapter;
@@ -11,6 +11,9 @@ pub mod engine_adapter;
 pub struct SnapshotState {
     pub path: PathBuf,
     pub snapshot: Option<Arc<Snapshot>>, // None when not loaded
+    pub neighbors: Option<Arc<NeighborProvider>>,
+    pub globals: Arc<Vec<(u32, f32, Vec<usize>)>>, // dst, cost, reqs (indices)
+    pub macro_lookup: Arc<HashMap<(u32, u32), u32>>,
     pub loaded_at_unix: u64,
     pub snapshot_hash_hex: Option<String>,
     pub coord_index: Option<Arc<HashMap<(i32,i32,i32), u32>>>,

@@ -64,7 +64,6 @@ pub struct Counts {
 pub struct RouteResponse {
     pub found: bool,
     pub cost: f32,
-    #[serde(skip_serializing)]
     pub path: Vec<u32>,
     pub length_tiles: usize,
     pub duration_ms: u128,
@@ -72,7 +71,7 @@ pub struct RouteResponse {
     #[serde(skip_serializing_if = "Option::is_none")] pub geometry: Option<Vec<serde_json::Value>>,
 }
 
-pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let cur = state.current.load();
     let counts = cur.snapshot.as_ref().map(|s| s.counts()).map(|c| Counts {
         nodes: c.nodes,
@@ -96,6 +95,10 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     let Some(snap) = cur.snapshot.as_ref() else {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "snapshot not loaded".into()));
     };
+    let Some(neighbors) = cur.neighbors.as_ref() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "neighbors not loaded".into()));
+    };
+    let globals = cur.globals.clone();
     let counts = snap.counts();
 
     // Resolve node ids
@@ -126,7 +129,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         .iter()
         .map(|kv| (kv.key.clone(), kv.value.clone()))
         .collect();
-    let res = engine_adapter::run_route_with_requirements(snap.clone(), sid, gid, &client_reqs);
+    let res = engine_adapter::run_route_with_requirements(snap.clone(), neighbors.clone(), globals, sid, gid, &client_reqs);
     let duration_ms = start.elapsed().as_millis();
 
     // Optionally build actions/geometry
@@ -134,34 +137,6 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     let mut geometry: Option<Vec<serde_json::Value>> = None;
 
     if res.found {
-        // Precompute maps to classify edges
-        let mut macro_pairs: HashSet<(u32,u32)> = HashSet::new();
-        let mut macro_cost: HashMap<(u32,u32), f32> = HashMap::new();
-        let mut macro_kind: HashMap<(u32,u32), u32> = HashMap::new();
-        let mut macro_id: HashMap<(u32,u32), u32> = HashMap::new();
-        let mut macro_meta: HashMap<(u32,u32), serde_json::Value> = HashMap::new();
-        // Build per-edge maps with index for metadata lookup
-        let msrc = snap.macro_src();
-        let mdst = snap.macro_dst();
-        let mw = snap.macro_w();
-        let mk = snap.macro_kind_first();
-        let mi = snap.macro_id_first();
-        for (idx, (s, d, w)) in izip!(msrc.iter(), mdst.iter(), mw.iter()).enumerate() {
-            macro_pairs.insert((s, d));
-            macro_cost.insert((s, d), w);
-            macro_kind.insert((s, d), mk.get(idx).unwrap_or(0));
-            macro_id.insert((s, d), mi.get(idx).unwrap_or(0));
-            if let Some(bytes) = snap.macro_meta_at(idx) {
-                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                    macro_meta.insert((s, d), val);
-                }
-            }
-        }
-        let mut walk_cost: HashMap<(u32,u32), f32> = HashMap::new();
-        for (s, d, w) in izip!(snap.walk_src().iter(), snap.walk_dst().iter(), snap.walk_w().iter()) {
-            walk_cost.insert((s, d), w);
-        }
-
         // Helper to fetch coords
         let xs = snap.nodes_x();
         let ys = snap.nodes_y();
@@ -183,24 +158,21 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         // Parse global teleports encoded under a synthetic 0->0 macro edge
         let mut global_cost: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
         let mut global_meta: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
-        for (idx, (s, d)) in izip!(msrc.iter(), mdst.iter()).enumerate() {
-            if s == 0 && d == 0 {
-                if let Some(bytes) = snap.macro_meta_at(idx) {
-                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                        if let Some(arr) = val.get("global").and_then(|v| v.as_array()) {
-                            for g in arr {
-                                if let Some(dst) = g.get("dst").and_then(|v| v.as_u64()) {
-                                    let dst = dst as u32;
-                                    let cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                                    global_cost.insert(dst, cost);
-                                    global_meta.insert(dst, g.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                break;
-            }
+        if let Some(&idx) = cur.macro_lookup.get(&(0, 0)) {
+             if let Some(bytes) = snap.macro_meta_at(idx as usize) {
+                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                     if let Some(arr) = val.get("global").and_then(|v| v.as_array()) {
+                         for g in arr {
+                             if let Some(dst) = g.get("dst").and_then(|v| v.as_u64()) {
+                                 let dst = dst as u32;
+                                 let cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                                 global_cost.insert(dst, cost);
+                                 global_meta.insert(dst, g.clone());
+                             }
+                         }
+                     }
+                 }
+             }
         }
 
         if req.options.only_actions || req.options.return_geometry {
@@ -209,10 +181,12 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                 let (u, v) = (w[0], w[1]);
                 let (x1,y1,p1) = coord(u);
                 let (x2,y2,p2) = coord(v);
-                if macro_pairs.contains(&(u, v)) {
-                    let cost_ms = macro_cost.get(&(u, v)).cloned().unwrap_or(0.0);
-                    let k = macro_kind.get(&(u, v)).cloned().unwrap_or(0);
-                    let kid = macro_id.get(&(u, v)).cloned().unwrap_or(0);
+                
+                if let Some(&idx) = cur.macro_lookup.get(&(u, v)) {
+                    let idx = idx as usize;
+                    let cost_ms = snap.macro_w().get(idx).unwrap_or(0.0);
+                    let k = snap.macro_kind_first().get(idx).unwrap_or(0);
+                    let kid = snap.macro_id_first().get(idx).unwrap_or(0);
                     let kstr = match k {
                         1 => "door",
                         2 => "lodestone",
@@ -222,7 +196,12 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                         6 => "ifslot",
                         _ => "teleport",
                     };
-                    let mut meta = macro_meta.get(&(u, v)).cloned().unwrap_or(serde_json::json!({}));
+                    let mut meta = if let Some(bytes) = snap.macro_meta_at(idx) {
+                        serde_json::from_slice(bytes).unwrap_or(serde_json::json!({}))
+                    } else {
+                        serde_json::json!({})
+                    };
+                    
                     // For doors, compute dynamic approach direction (IN/OUT) using db_row tile_inside/tile_outside
                     if kstr == "door" {
                         // helper to extract [x,y,p] to tuple
@@ -263,13 +242,6 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                         "node": {"type": kstr, "id": kid},
                         "metadata": meta
                     }));
-                } else if let Some(wc) = walk_cost.get(&(u, v)).cloned() {
-                    let cost_ms = wc.round();
-                    acts.push(serde_json::json!({
-                        "type": "move",
-                        "to":   [x2,y2,p2],
-                        "cost_ms": cost_ms
-                    }));
                 } else if let Some(gc) = global_cost.get(&v).cloned() {
                     let meta = global_meta.get(&v).cloned().unwrap_or(serde_json::json!({}));
                     // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
@@ -287,13 +259,35 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                         "metadata": meta
                     }));
                 } else {
-                    // Fallback: unknown edge kind; emit as generic teleport with zero cost
-                    acts.push(serde_json::json!({
-                        "type": "teleport",
-                        "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
-                        "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
-                        "cost_ms": 0
-                    }));
+                    // Walk edge or unknown
+                    // Check if it is a valid walk edge by querying neighbor provider
+                    let mut is_walk = false;
+                    let mut w_cost = 1.0; // Default
+                    // This is slightly inefficient to scan walk neighbors but degree is small
+                    let (wd, ww) = neighbors.walk.neighbors(u);
+                    for (i, &neighbor) in wd.iter().enumerate() {
+                        if neighbor == v {
+                            is_walk = true;
+                            w_cost = ww[i];
+                            break;
+                        }
+                    }
+                    
+                    if is_walk {
+                         acts.push(serde_json::json!({
+                            "type": "move",
+                            "to":   [x2,y2,p2],
+                            "cost_ms": w_cost.round()
+                        }));
+                    } else {
+                        // Fallback: unknown edge kind; emit as generic teleport with zero cost
+                        acts.push(serde_json::json!({
+                            "type": "teleport",
+                            "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
+                            "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                            "cost_ms": 0
+                        }));
+                    }
                 }
             }
             actions = Some(acts);
@@ -312,6 +306,13 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     if let Ok(bytes) = serde_json::to_vec_pretty(&resp) {
         let _ = std::fs::write("/home/query/Dev/navpathService/result.json", bytes);
     }
+    info!(
+        duration_ms = duration_ms,
+        found = res.found,
+        cost = res.cost,
+        length = res.path.len(),
+        "route request completed"
+    );
     Ok(Json(resp))
 }
 
@@ -327,9 +328,14 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<ReloadResponse
             let new_hash = crate::read_tail_hash_hex(&path);
             // Build coord index from newly loaded snapshot
             let idx = Arc::new(crate::build_coord_index(&new_snap));
+            // Pre-compute neighbors and globals
+            let (neighbors, globals, macro_lookup) = engine_adapter::build_neighbor_provider(&new_snap);
             let new_state = SnapshotState {
                 path: path.clone(),
                 snapshot: Some(Arc::new(new_snap)),
+                neighbors: Some(Arc::new(neighbors)),
+                globals: Arc::new(globals),
+                macro_lookup: Arc::new(macro_lookup),
                 loaded_at_unix: crate::now_unix(),
                 snapshot_hash_hex: new_hash.clone(),
                 coord_index: Some(idx),

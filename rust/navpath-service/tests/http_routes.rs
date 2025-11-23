@@ -64,11 +64,15 @@ async fn health_and_route_and_reload() {
     // Build initial snapshot
     let snap_path = make_snapshot_file(3);
     let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
+    let (neighbors, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
     let coord_index = Some(Arc::new(build_coord_index(&opened)));
     let snapshot = Some(Arc::new(opened));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
         snapshot,
+        neighbors: Some(Arc::new(neighbors)),
+        globals: Arc::new(globals),
+        macro_lookup: Arc::new(macro_lookup),
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
         coord_index,
