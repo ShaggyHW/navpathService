@@ -4,6 +4,6 @@ mod reader;
 mod writer;
 
 pub use manifest::{Manifest, SnapshotCounts};
-pub use reader::{LeSliceF32, LeSliceU32, Snapshot};
+pub use reader::{LeSliceF32, LeSliceU32, LeSliceI32, Snapshot};
 #[cfg(feature = "builder")]
 pub use writer::{write_snapshot, WriteResult, WriterError};

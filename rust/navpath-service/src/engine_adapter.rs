@@ -6,10 +6,28 @@ use navpath_core::{EngineView, SearchParams, SearchResult, Snapshot, NeighborPro
 use navpath_core::engine::search::SearchContext;
 use serde_json::Value as JsonValue;
 use navpath_core::eligibility::{build_mask_from_u32, ClientValue};
-use navpath_core::engine::heuristics::LandmarkHeuristic;
+use navpath_core::engine::heuristics::{LandmarkHeuristic, OctileCoords};
+use navpath_core::snapshot::LeSliceI32;
 
 thread_local! {
     static SEARCH_CONTEXT: RefCell<SearchContext> = RefCell::new(SearchContext::new(0));
+}
+
+struct SnapshotCoords<'a> {
+    x: LeSliceI32<'a>,
+    y: LeSliceI32<'a>,
+    p: LeSliceI32<'a>,
+}
+
+impl<'a> OctileCoords for SnapshotCoords<'a> {
+    fn coords(&self, node: u32) -> (i32, i32, i32) {
+        let i = node as usize;
+        (
+            self.x.get(i).unwrap_or(0),
+            self.y.get(i).unwrap_or(0),
+            self.p.get(i).unwrap_or(0)
+        )
+    }
 }
 
 pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<(u32, f32, Vec<usize>)>, HashMap<(u32, u32), u32>) {
@@ -170,14 +188,14 @@ pub fn run_route_with_requirements(
         view.extra = Some(Box::new(move |_u: u32| -> Vec<(u32, f32)> { eligible_globals.clone() }));
     }
 
+    let coords = SnapshotCoords {
+        x: snapshot.nodes_x(),
+        y: snapshot.nodes_y(),
+        p: snapshot.nodes_plane(),
+    };
+
     SEARCH_CONTEXT.with(|ctx_cell| {
         let mut ctx = ctx_cell.borrow_mut();
-        view.astar(SearchParams { start: start_id, goal: goal_id, coords: None::<&DummyCoords>, mask: Some(&mask) }, &mut ctx)
+        view.astar(SearchParams { start: start_id, goal: goal_id, coords: Some(&coords), mask: Some(&mask) }, &mut ctx)
     })
-}
-
-// Placeholder coords type (octile ignored when None)
-struct DummyCoords;
-impl navpath_core::OctileCoords for DummyCoords {
-    fn coords(&self, _node: u32) -> (i32, i32, i32) { (0, 0, 0) }
 }

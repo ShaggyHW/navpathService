@@ -129,7 +129,16 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         .iter()
         .map(|kv| (kv.key.clone(), kv.value.clone()))
         .collect();
-    let res = engine_adapter::run_route_with_requirements(snap.clone(), neighbors.clone(), globals, sid, gid, &client_reqs);
+    
+    // Offload search to blocking thread pool
+    let snap_arc = snap.clone();
+    let neighbors_arc = neighbors.clone();
+    let globals_arc = globals.clone();
+    
+    let res = tokio::task::spawn_blocking(move || {
+        engine_adapter::run_route_with_requirements(snap_arc, neighbors_arc, globals_arc, sid, gid, &client_reqs)
+    }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
     let duration_ms = start.elapsed().as_millis();
 
     // Optionally build actions/geometry
