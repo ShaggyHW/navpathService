@@ -1,12 +1,20 @@
 use std::sync::Arc;
-use std::collections::{HashMap, HashSet};
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-use itertools::izip;
 
 use crate::{engine_adapter, AppState, SnapshotState};
+use engine_adapter::MacroKind;
+
+// Bundle all Arc references needed for route computation to minimize cloning
+#[derive(Clone)]
+struct RouteContext {
+    snapshot: Arc<navpath_core::Snapshot>,
+    neighbors: Arc<navpath_core::NeighborProvider>,
+    globals: Arc<Vec<(u32, f32, Vec<usize>)>>,
+    req_words: Arc<Vec<u32>>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RequirementKV {
@@ -99,6 +107,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         return Err((StatusCode::SERVICE_UNAVAILABLE, "neighbors not loaded".into()));
     };
     let globals = cur.globals.clone();
+    let req_words = cur.req_words.clone();
     let counts = snap.counts();
 
     // Resolve node ids
@@ -130,15 +139,27 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         .map(|kv| (kv.key.clone(), kv.value.clone()))
         .collect();
     
+    // Bundle all Arc references into a single context to minimize cloning
+    let route_context = RouteContext {
+        snapshot: snap.clone(),
+        neighbors: neighbors.clone(),
+        globals,
+        req_words,
+    };
+    
     // Offload search to blocking thread pool
-    let snap_arc = snap.clone();
-    let neighbors_arc = neighbors.clone();
-    let globals_arc = globals.clone();
-    
+    let route_context = route_context.clone();
+    let search_start = std::time::Instant::now();
     let res = tokio::task::spawn_blocking(move || {
-        engine_adapter::run_route_with_requirements(snap_arc, neighbors_arc, globals_arc, sid, gid, &client_reqs)
+        engine_adapter::run_route_with_requirements(
+            route_context.snapshot,
+            route_context.neighbors,
+            route_context.globals,
+            route_context.req_words,
+            sid, gid, &client_reqs
+        )
     }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
+    let search_duration_ms = search_start.elapsed().as_millis();
     let duration_ms = start.elapsed().as_millis();
 
     // Optionally build actions/geometry
@@ -168,18 +189,10 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         let mut global_cost: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
         let mut global_meta: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
         if let Some(&idx) = cur.macro_lookup.get(&(0, 0)) {
-             if let Some(bytes) = snap.macro_meta_at(idx as usize) {
-                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                     if let Some(arr) = val.get("global").and_then(|v| v.as_array()) {
-                         for g in arr {
-                             if let Some(dst) = g.get("dst").and_then(|v| v.as_u64()) {
-                                 let dst = dst as u32;
-                                 let cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                                 global_cost.insert(dst, cost);
-                                 global_meta.insert(dst, g.clone());
-                             }
-                         }
-                     }
+             if let Some(Some(meta)) = cur.macro_meta.get(idx as usize) {
+                 for dest in &meta.global_dests {
+                     global_cost.insert(dest.dst, dest.cost);
+                     global_meta.insert(dest.dst, dest.raw_data.clone());
                  }
              }
         }
@@ -194,63 +207,78 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                 if let Some(&idx) = cur.macro_lookup.get(&(u, v)) {
                     let idx = idx as usize;
                     let cost_ms = snap.macro_w().get(idx).unwrap_or(0.0);
-                    let k = snap.macro_kind_first().get(idx).unwrap_or(0);
-                    let kid = snap.macro_id_first().get(idx).unwrap_or(0);
-                    let kstr = match k {
-                        1 => "door",
-                        2 => "lodestone",
-                        3 => "npc",
-                        4 => "object",
-                        5 => "item",
-                        6 => "ifslot",
-                        _ => "teleport",
-                    };
-                    let mut meta = if let Some(bytes) = snap.macro_meta_at(idx) {
-                        serde_json::from_slice(bytes).unwrap_or(serde_json::json!({}))
-                    } else {
-                        serde_json::json!({})
-                    };
                     
-                    // For doors, compute dynamic approach direction (IN/OUT) using db_row tile_inside/tile_outside
-                    if kstr == "door" {
-                        // helper to extract [x,y,p] to tuple
-                        fn arr_to_tuple(v: &serde_json::Value) -> Option<(i32,i32,i32)> {
-                            let a = v.as_array()?;
-                            if a.len() != 3 { return None; }
-                            let x = a[0].as_i64()? as i32;
-                            let y = a[1].as_i64()? as i32;
-                            let p = a[2].as_i64()? as i32;
-                            Some((x,y,p))
-                        }
-                        if let Some(db_row) = meta.get("db_row") {
-                            let tin = db_row.get("tile_inside").and_then(arr_to_tuple);
-                            let tout = db_row.get("tile_outside").and_then(arr_to_tuple);
-                            let from = (x1,y1,p1);
-                            let to = (x2,y2,p2);
-                            let dir = if tout.is_some() && Some(from) == tout { Some("IN") }
-                                      else if tin.is_some() && Some(from) == tin { Some("OUT") }
-                                      else if tin.is_some() && Some(to) == tin { Some("IN") }
-                                      else if tout.is_some() && Some(to) == tout { Some("OUT") }
-                                      else { None };
-                            if let Some(d) = dir {
-                                if let Some(obj) = meta.as_object_mut() {
-                                    obj.insert("door_direction".to_string(), serde_json::Value::String(d.to_string()));
+                    // Use pre-parsed metadata
+                    if let Some(Some(meta)) = cur.macro_meta.get(idx) {
+                        let kstr = match meta.kind {
+                            MacroKind::Door => "door",
+                            MacroKind::Lodestone => "lodestone",
+                            MacroKind::Npc => "npc",
+                            MacroKind::Object => "object",
+                            MacroKind::Item => "item",
+                            MacroKind::Ifslot => "ifslot",
+                            MacroKind::Teleport => "teleport",
+                        };
+                        
+                        let mut meta_json = meta.raw_data.clone();
+                        
+                        // For doors, compute dynamic approach direction (IN/OUT) using pre-parsed db_row data
+                        if meta.kind == MacroKind::Door {
+                            if let Some(db_row) = &meta.db_row {
+                                let from = (x1,y1,p1);
+                                let to = (x2,y2,p2);
+                                let dir = if let Some(tout) = db_row.tile_outside {
+                                    if from == tout { Some("IN") }
+                                    else if to == tout { Some("OUT") }
+                                    else { None }
+                                } else if let Some(tin) = db_row.tile_inside {
+                                    if from == tin { Some("OUT") }
+                                    else if to == tin { Some("IN") }
+                                    else { None }
+                                } else { None };
+                                
+                                if let Some(d) = dir {
+                                    if let Some(obj) = meta_json.as_object_mut() {
+                                        obj.insert("door_direction".to_string(), serde_json::Value::String(d.to_string()));
+                                    }
                                 }
                             }
                         }
+                        // Remove duplicated top-level db_row; it exists inside per-step entries already
+                        if let Some(obj) = meta_json.as_object_mut() {
+                            obj.remove("db_row");
+                        }
+                        
+                        acts.push(serde_json::json!({
+                            "type": kstr,
+                            "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
+                            "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                            "cost_ms": cost_ms,
+                            "node": {"type": kstr, "id": meta.node_id},
+                            "metadata": meta_json
+                        }));
+                    } else {
+                        // Fallback if no metadata - use basic macro kind
+                        let k = snap.macro_kind_first().get(idx).unwrap_or(0);
+                        let kid = snap.macro_id_first().get(idx).unwrap_or(0);
+                        let kstr = match k {
+                            1 => "door",
+                            2 => "lodestone",
+                            3 => "npc",
+                            4 => "object",
+                            5 => "item",
+                            6 => "ifslot",
+                            _ => "teleport",
+                        };
+                        acts.push(serde_json::json!({
+                            "type": kstr,
+                            "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
+                            "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                            "cost_ms": cost_ms,
+                            "node": {"type": kstr, "id": kid},
+                            "metadata": serde_json::json!({})
+                        }));
                     }
-                    // Remove duplicated top-level db_row; it exists inside per-step entries already
-                    if let Some(obj) = meta.as_object_mut() {
-                        obj.remove("db_row");
-                    }
-                    acts.push(serde_json::json!({
-                        "type": kstr,
-                        "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
-                        "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
-                        "cost_ms": cost_ms,
-                        "node": {"type": kstr, "id": kid},
-                        "metadata": meta
-                    }));
                 } else if let Some(gc) = global_cost.get(&v).cloned() {
                     let meta = global_meta.get(&v).cloned().unwrap_or(serde_json::json!({}));
                     // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
@@ -317,6 +345,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     }
     info!(
         duration_ms = duration_ms,
+        search_duration_ms = search_duration_ms,
         found = res.found,
         cost = res.cost,
         length = res.path.len(),
@@ -338,13 +367,15 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<ReloadResponse
             // Build coord index from newly loaded snapshot
             let idx = Arc::new(crate::build_coord_index(&new_snap));
             // Pre-compute neighbors and globals
-            let (neighbors, globals, macro_lookup) = engine_adapter::build_neighbor_provider(&new_snap);
+            let (neighbors, globals, macro_lookup, req_words, macro_meta) = engine_adapter::build_neighbor_provider(&new_snap);
             let new_state = SnapshotState {
                 path: path.clone(),
                 snapshot: Some(Arc::new(new_snap)),
                 neighbors: Some(Arc::new(neighbors)),
                 globals: Arc::new(globals),
                 macro_lookup: Arc::new(macro_lookup),
+                req_words: Arc::new(req_words),
+                macro_meta: Arc::new(macro_meta),
                 loaded_at_unix: crate::now_unix(),
                 snapshot_hash_hex: new_hash.clone(),
                 coord_index: Some(idx),

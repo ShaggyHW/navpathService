@@ -16,9 +16,13 @@ rusqlite = { version = "0.31" }
 navpath-core = { path = "../navpath-core" }
 arc-swap = "1"
 itertools = "0.12"
+bitvec = "1.0"
+aligned-vec = "0.5"
+rustc-hash = "1.1"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
 tempfile = "3"
 http-body-util = "0.1"
 navpath-core = { path = "../navpath-core", features = ["builder"] }
+criterion = "0.5"

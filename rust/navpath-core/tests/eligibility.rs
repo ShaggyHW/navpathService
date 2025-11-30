@@ -44,5 +44,8 @@ fn unsatisfied_mixed_types_and_ops() {
             ("skill", ClientValue::Str("20")),          // wrong type
         ],
     );
-    assert_eq!(mask.satisfied, vec![false, false, false]);
+    assert_eq!(mask.len(), 3);
+    assert!(!mask.satisfied[0]);
+    assert!(!mask.satisfied[1]);
+    assert!(!mask.satisfied[2]);
 }

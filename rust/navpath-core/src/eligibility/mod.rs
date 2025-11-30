@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use bitvec::prelude::*;
 
 /// Simple 32-bit FNV-1a hash for stable key/value ids
+#[inline(always)]
 pub fn fnv1a32(s: &str) -> u32 {
     const FNV_OFFSET: u32 = 0x811C9DC5;
     const FNV_PRIME: u32 = 16777619;
@@ -56,6 +58,7 @@ pub const OPBIT_NUMERIC: u32 = 1u32 << 31;
 pub const OPBIT_MASK: u32 = 0x000000FF;
 
 /// Encode op and numeric flag into a u32
+#[inline(always)]
 pub fn encode_opbits(op: Op, is_numeric: bool) -> u32 {
     let mut v = op.code() & OPBIT_MASK;
     if is_numeric { v |= OPBIT_NUMERIC; }
@@ -63,6 +66,7 @@ pub fn encode_opbits(op: Op, is_numeric: bool) -> u32 {
 }
 
 /// Decode opbits into (Op, is_numeric)
+#[inline(always)]
 pub fn decode_opbits(opbits: u32) -> Option<(Op, bool)> {
     let is_num = (opbits & OPBIT_NUMERIC) != 0;
     let code = opbits & OPBIT_MASK;
@@ -84,6 +88,7 @@ pub enum ClientValue<'a> { Str(&'a str), Num(i64) }
 pub type EncodedTag = [u32; 4];
 
 /// Evaluate a single encoded tag against the client's key-values
+#[inline(always)]
 pub fn eval_encoded_tag<'a>(tag: &EncodedTag, client_map: &ClientMap<'a>) -> bool {
     let _req_id = tag[0];
     let key_id = tag[1];
@@ -116,6 +121,7 @@ pub fn eval_encoded_tag<'a>(tag: &EncodedTag, client_map: &ClientMap<'a>) -> boo
     }
 }
 
+#[inline(always)]
 fn eval_num(op: Op, lhs: i64, rhs: i64) -> bool {
     match op {
         Op::Eq => lhs == rhs,
@@ -152,11 +158,11 @@ where I: IntoIterator<Item = (&'a str, ClientValue<'a>)>
 
 /// Per-tag satisfaction vector aligned with the encoded tags order
 #[derive(Debug, Clone)]
-pub struct EligibilityMask { pub satisfied: Vec<bool> }
+pub struct EligibilityMask { pub satisfied: BitVec<u64, Lsb0> }
 
 impl EligibilityMask {
     pub fn is_satisfied(&self, tag_index: usize) -> bool {
-        self.satisfied.get(tag_index).copied().unwrap_or(false)
+        self.satisfied.get(tag_index).as_deref().copied().unwrap_or(false)
     }
     pub fn len(&self) -> usize { self.satisfied.len() }
     pub fn is_empty(&self) -> bool { self.satisfied.is_empty() }
@@ -167,8 +173,10 @@ pub fn build_mask_from_u32<'a, I>(req_tags_words: &[u32], client_iter: I) -> Eli
 where I: IntoIterator<Item = (&'a str, ClientValue<'a>)>
 {
     let client_map = build_client_map(client_iter);
-    let mut satisfied = Vec::new();
+    let tag_count = req_tags_words.len() / 4;
+    let mut satisfied = bitvec![u64, Lsb0; 0; tag_count];
     let mut i = 0usize;
+    let mut bit_index = 0usize;
     while i + 3 < req_tags_words.len() {
         let tag: EncodedTag = [
             req_tags_words[i],
@@ -177,8 +185,9 @@ where I: IntoIterator<Item = (&'a str, ClientValue<'a>)>
             req_tags_words[i + 3],
         ];
         let ok = eval_encoded_tag(&tag, &client_map);
-        satisfied.push(ok);
+        satisfied.set(bit_index, ok);
         i += 4;
+        bit_index += 1;
     }
     EligibilityMask { satisfied }
 }
@@ -222,7 +231,11 @@ mod tests {
             ],
         );
         assert_eq!(mask.len(), 5);
-        assert_eq!(mask.satisfied, vec![true, true, true, true, true]);
+        assert!(mask.satisfied[0]);
+        assert!(mask.satisfied[1]);
+        assert!(mask.satisfied[2]);
+        assert!(mask.satisfied[3]);
+        assert!(mask.satisfied[4]);
     }
 
     #[test]
@@ -248,6 +261,10 @@ mod tests {
             ],
         );
         assert_eq!(mask.len(), 5);
-        assert_eq!(mask.satisfied, vec![false, false, false, false, false]);
+        assert!(!mask.satisfied[0]);
+        assert!(!mask.satisfied[1]);
+        assert!(!mask.satisfied[2]);
+        assert!(!mask.satisfied[3]);
+        assert!(!mask.satisfied[4]);
     }
 }
