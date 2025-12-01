@@ -10,7 +10,7 @@ use tempfile::NamedTempFile;
 use tower::ServiceExt; // for `oneshot`
 
 fn make_snapshot_file(nodes: usize) -> tempfile::TempPath {
-    let mut tmp = NamedTempFile::new().unwrap();
+    let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
     let nodes_ids: Vec<u32> = (0..nodes as u32).collect();
     let nodes_x: Vec<i32> = (0..nodes as i32).map(|i| 3200 + i).collect();

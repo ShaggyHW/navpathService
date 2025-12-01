@@ -1,12 +1,46 @@
 use std::sync::Arc;
-use std::collections::{HashMap, HashSet};
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-use itertools::izip;
 
 use crate::{engine_adapter, AppState, SnapshotState};
+
+// Helper function to find the nearest reachable tile to a given coordinate
+fn find_nearest_tile(_snap: &navpath_core::Snapshot, coord_index: &std::collections::HashMap<(i32, i32, i32), u32>, target_x: i32, target_y: i32, target_plane: i32) -> u32 {
+    
+    let mut nearest_id = 0;
+    let mut min_distance_sq = i32::MAX;
+    
+    // First, try to find tiles on the same plane
+    for (&(x, y, plane), &id) in coord_index.iter() {
+        if plane == target_plane {
+            let dx = x - target_x;
+            let dy = y - target_y;
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq < min_distance_sq {
+                min_distance_sq = dist_sq;
+                nearest_id = id;
+            }
+        }
+    }
+    
+    // If no tiles found on the same plane, find the closest tile on any plane
+    if min_distance_sq == i32::MAX {
+        for (&(x, y, plane), &id) in coord_index.iter() {
+            let dx = x - target_x;
+            let dy = y - target_y;
+            let plane_penalty = (plane - target_plane) * (plane - target_plane) * 10000; // Heavy penalty for plane changes
+            let dist_sq = dx * dx + dy * dy + plane_penalty;
+            if dist_sq < min_distance_sq {
+                min_distance_sq = dist_sq;
+                nearest_id = id;
+            }
+        }
+    }
+    
+    nearest_id
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RequirementKV {
@@ -102,17 +136,30 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     let counts = snap.counts();
 
     // Resolve node ids
-    let (sid, gid) = match (req.start_id, req.goal_id, req.start.as_ref(), req.goal.as_ref()) {
-        (Some(sid), Some(gid), _, _) => (sid, gid),
+    let (sid, gid, used_virtual_start) = match (req.start_id, req.goal_id, req.start.as_ref(), req.goal.as_ref()) {
+        (Some(sid), Some(gid), _, _) => (sid, gid, false),
         (_, _, Some(s), Some(g)) => {
             let Some(idx) = cur.coord_index.as_ref() else {
                 return Err((StatusCode::SERVICE_UNAVAILABLE, "snapshot missing coordinate index; reload a v3 snapshot".into()));
             };
             let key_s = (s.wx, s.wy, s.plane);
             let key_g = (g.wx, g.wy, g.plane);
-            let Some(&sid) = idx.get(&key_s) else { return Err((StatusCode::BAD_REQUEST, "start tile not found in snapshot".into())); };
             let Some(&gid) = idx.get(&key_g) else { return Err((StatusCode::BAD_REQUEST, "goal tile not found in snapshot".into())); };
-            (sid, gid)
+            
+            // Handle start coordinate that doesn't exist - find nearest reachable tile
+            let (sid, used_virtual_start) = if let Some(&sid) = idx.get(&key_s) {
+                (sid, false)
+            } else {
+                // Start coordinate doesn't exist, find nearest reachable tile
+                let nearest_id = find_nearest_tile(snap, idx, s.wx, s.wy, s.plane);
+                info!(
+                    start_x = s.wx, start_y = s.wy, start_plane = s.plane,
+                    nearest_id = nearest_id,
+                    "start coordinate not found, using nearest reachable tile"
+                );
+                (nearest_id, true)
+            };
+            (sid, gid, used_virtual_start)
         }
         _ => {
             return Err((StatusCode::BAD_REQUEST, "missing start/goal; provide start_id/goal_id or start/goal with {wx,wy,plane}".into()));
@@ -186,6 +233,21 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
 
         if req.options.only_actions || req.options.return_geometry {
             let mut acts: Vec<serde_json::Value> = Vec::with_capacity(res.path.len().saturating_sub(1));
+            
+            // If we used a virtual start (non-existent start coordinate), add global teleport as first step
+            if used_virtual_start {
+                if let Some(start_coord) = req.start.as_ref() {
+                    let (actual_x, actual_y, actual_p) = coord(sid);
+                    acts.push(serde_json::json!({
+                        "type": "global_teleport",
+                        "from": {"min": [start_coord.wx, start_coord.wy, start_coord.plane], "max": [start_coord.wx, start_coord.wy, start_coord.plane]},
+                        "to":   {"min": [actual_x, actual_y, actual_p], "max": [actual_x, actual_y, actual_p]},
+                        "cost_ms": 0,
+                        "metadata": {"reason": "start_coordinate_not_found"}
+                    }));
+                }
+            }
+            
             for w in res.path.windows(2) {
                 let (u, v) = (w[0], w[1]);
                 let (x1,y1,p1) = coord(u);
