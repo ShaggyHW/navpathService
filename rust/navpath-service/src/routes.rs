@@ -234,12 +234,13 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         if req.options.only_actions || req.options.return_geometry {
             let mut acts: Vec<serde_json::Value> = Vec::with_capacity(res.path.len().saturating_sub(1));
             
-            // If we used a virtual start (non-existent start coordinate), add global teleport as first step
+            // If we used a virtual start (non-existent start coordinate), we'll need to add the teleport action later
+            // after we determine the actual teleport type from the first real action
+            let mut virtual_start_action: Option<serde_json::Value> = None;
             if used_virtual_start {
                 if let Some(start_coord) = req.start.as_ref() {
                     let (actual_x, actual_y, actual_p) = coord(sid);
-                    acts.push(serde_json::json!({
-                        "type": "global_teleport",
+                    virtual_start_action = Some(serde_json::json!({
                         "from": {"min": [start_coord.wx, start_coord.wy, start_coord.plane], "max": [start_coord.wx, start_coord.wy, start_coord.plane]},
                         "to":   {"min": [actual_x, actual_y, actual_p], "max": [actual_x, actual_y, actual_p]},
                         "cost_ms": 0,
@@ -361,6 +362,32 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                     }
                 }
             }
+            
+            // If we had a virtual start, add the action with the correct type determined from the first real action
+            if let Some(mut virtual_action) = virtual_start_action {
+                if let Some(first_action) = acts.first() {
+                    // Copy the type and metadata from the first actual action (which should be the teleport)
+                    if let Some(action_type) = first_action.get("type").and_then(|v| v.as_str()) {
+                        virtual_action["type"] = serde_json::Value::String(action_type.to_string());
+                        // Also copy the metadata if it exists, but keep our reason
+                        if let Some(metadata) = first_action.get("metadata") {
+                            if let Some(obj) = virtual_action.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+                                // Merge the first action's metadata, but preserve our reason
+                                for (key, value) in metadata.as_object().unwrap_or(&serde_json::Map::new()) {
+                                    if key != "reason" {
+                                        obj.insert(key.to_string(), value.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Fallback: no actions found, use generic teleport
+                    virtual_action["type"] = serde_json::Value::String("teleport".to_string());
+                }
+                acts.insert(0, virtual_action);
+            }
+            
             actions = Some(acts);
         }
     }
