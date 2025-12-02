@@ -7,40 +7,40 @@ use tracing::{info, warn};
 use crate::{engine_adapter, AppState, SnapshotState};
 
 // Helper function to find the nearest reachable tile to a given coordinate
-fn find_nearest_tile(_snap: &navpath_core::Snapshot, coord_index: &std::collections::HashMap<(i32, i32, i32), u32>, target_x: i32, target_y: i32, target_plane: i32) -> u32 {
-    
-    let mut nearest_id = 0;
-    let mut min_distance_sq = i32::MAX;
-    
-    // First, try to find tiles on the same plane
-    for (&(x, y, plane), &id) in coord_index.iter() {
-        if plane == target_plane {
-            let dx = x - target_x;
-            let dy = y - target_y;
-            let dist_sq = dx * dx + dy * dy;
-            if dist_sq < min_distance_sq {
-                min_distance_sq = dist_sq;
-                nearest_id = id;
-            }
-        }
-    }
-    
-    // If no tiles found on the same plane, find the closest tile on any plane
-    if min_distance_sq == i32::MAX {
+    fn find_nearest_tile(_snap: &navpath_core::Snapshot, coord_index: &std::collections::HashMap<(i32, i32, i32), u32>, target_x: i32, target_y: i32, target_plane: i32) -> u32 {
+        let mut nearest_id = 0;
+        let mut min_distance_sq: i64 = i64::MAX;
+
+        // First, try to find tiles on the same plane
         for (&(x, y, plane), &id) in coord_index.iter() {
-            let dx = x - target_x;
-            let dy = y - target_y;
-            let plane_penalty = (plane - target_plane) * (plane - target_plane) * 10000; // Heavy penalty for plane changes
-            let dist_sq = dx * dx + dy * dy + plane_penalty;
-            if dist_sq < min_distance_sq {
-                min_distance_sq = dist_sq;
-                nearest_id = id;
+            if plane == target_plane {
+                let dx = (x - target_x) as i64;
+                let dy = (y - target_y) as i64;
+                let dist_sq = dx * dx + dy * dy;
+                if dist_sq < min_distance_sq {
+                    min_distance_sq = dist_sq;
+                    nearest_id = id;
+                }
             }
         }
+
+        // If no tiles found on the same plane, find the closest tile on any plane
+        if min_distance_sq == i64::MAX {
+            for (&(x, y, plane), &id) in coord_index.iter() {
+                let dx = (x - target_x) as i64;
+                let dy = (y - target_y) as i64;
+                let plane_diff = (plane - target_plane) as i64;
+                let plane_penalty = plane_diff * plane_diff * 10_000_i64; // Heavy penalty for plane changes
+                let dist_sq = dx * dx + dy * dy + plane_penalty;
+                if dist_sq < min_distance_sq {
+                    min_distance_sq = dist_sq;
+                    nearest_id = id;
+                }
+            }
+        }
+
+        nearest_id
     }
-    
-    nearest_id
-}
 
 #[derive(Debug, Deserialize)]
 pub struct RequirementKV {
