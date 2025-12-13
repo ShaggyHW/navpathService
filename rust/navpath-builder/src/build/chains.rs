@@ -5,6 +5,19 @@ use rusqlite::{params, Connection, Row, OptionalExtension};
 
 use super::load_sqlite::Tile;
 
+fn parse_requirements(reqs: Option<String>) -> Vec<i64> {
+    let Some(s) = reqs else { return Vec::new(); };
+    let s = s.trim();
+    if s.is_empty() { return Vec::new(); }
+    s.split(';')
+        .filter_map(|part| {
+            let p = part.trim();
+            if p.is_empty() { return None; }
+            p.parse::<i64>().ok()
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     Door,
@@ -44,7 +57,7 @@ pub struct ChainStepMeta {
     pub kind: &'static str,
     pub id: i64,
     pub cost: f32,
-    pub requirement_id: Option<i64>,
+    pub requirements: Vec<i64>,
     pub lodestone: Option<String>,
 }
 
@@ -62,7 +75,7 @@ struct StepRow {
     next_kind: Option<NodeKind>,
     next_id: Option<i64>,
     cost: f32,
-    requirement_id: Option<i64>,
+    requirements: Vec<i64>,
     lodestone: Option<String>,
 }
 
@@ -70,7 +83,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
     match kind {
         NodeKind::Door => {
             let mut st = conn.prepare(
-                "SELECT tile_inside_x, tile_inside_y, tile_inside_plane, next_node_type, next_node_id, cost, requirement_id FROM teleports_door_nodes WHERE id = ?1",
+                "SELECT tile_inside_x, tile_inside_y, tile_inside_plane, next_node_type, next_node_id, cost, requirements FROM teleports_door_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
                 let dx: Option<i64> = r.get(0)?;
@@ -79,7 +92,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                 let ntype: Option<String> = r.get(3)?;
                 let nid: Option<i64> = r.get(4)?;
                 let cost: f64 = r.get(5)?;
-                let req: Option<i64> = r.get(6)?;
+                let req: Option<String> = r.get(6)?;
                 Ok(StepRow {
                     dest: match (dx, dy, dp) {
                         (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
@@ -88,7 +101,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                     next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
                     next_id: nid,
                     cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirement_id: req,
+                    requirements: parse_requirements(req),
                     lodestone: None,
                 })
             }).optional()?;
@@ -96,7 +109,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
         }
         NodeKind::Lodestone => {
             let mut st = conn.prepare(
-                "SELECT dest_x, dest_y, dest_plane, next_node_type, next_node_id, cost, requirement_id FROM teleports_lodestone_nodes WHERE id = ?1",
+                "SELECT dest_x, dest_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_lodestone_nodes WHERE id = ?1",
             )?;
             let mut row = st.query_row(params![id], |r: &Row| {
                 let dx: Option<i64> = r.get(0)?;
@@ -105,7 +118,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                 let ntype: Option<String> = r.get(3)?;
                 let nid: Option<i64> = r.get(4)?;
                 let cost: f64 = r.get(5)?;
-                let req: Option<i64> = r.get(6)?;
+                let req: Option<String> = r.get(6)?;
                 Ok(StepRow {
                     dest: match (dx, dy, dp) {
                         (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
@@ -114,7 +127,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                     next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
                     next_id: nid,
                     cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirement_id: req,
+                    requirements: parse_requirements(req),
                     lodestone: None,
                 })
             }).optional()?;
@@ -129,7 +142,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
         }
         NodeKind::Npc => {
             let mut st = conn.prepare(
-                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirement_id FROM teleports_npc_nodes WHERE id = ?1",
+                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_npc_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
                 let dx: Option<i64> = r.get(0)?;
@@ -138,7 +151,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                 let ntype: Option<String> = r.get(3)?;
                 let nid: Option<i64> = r.get(4)?;
                 let cost: f64 = r.get(5)?;
-                let req: Option<i64> = r.get(6)?;
+                let req: Option<String> = r.get(6)?;
                 Ok(StepRow {
                     dest: match (dx, dy, dp) {
                         (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
@@ -147,7 +160,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                     next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
                     next_id: nid,
                     cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirement_id: req,
+                    requirements: parse_requirements(req),
                     lodestone: None,
                 })
             }).optional()?;
@@ -155,7 +168,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
         }
         NodeKind::Object => {
             let mut st = conn.prepare(
-                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirement_id FROM teleports_object_nodes WHERE id = ?1",
+                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_object_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
                 let dx: Option<i64> = r.get(0)?;
@@ -164,7 +177,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                 let ntype: Option<String> = r.get(3)?;
                 let nid: Option<i64> = r.get(4)?;
                 let cost: f64 = r.get(5)?;
-                let req: Option<i64> = r.get(6)?;
+                let req: Option<String> = r.get(6)?;
                 Ok(StepRow {
                     dest: match (dx, dy, dp) {
                         (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
@@ -173,7 +186,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                     next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
                     next_id: nid,
                     cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirement_id: req,
+                    requirements: parse_requirements(req),
                     lodestone: None,
                 })
             }).optional()?;
@@ -181,7 +194,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
         }
         NodeKind::Item => {
             let mut st = conn.prepare(
-                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirement_id FROM teleports_item_nodes WHERE id = ?1",
+                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_item_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
                 let dx: Option<i64> = r.get(0)?;
@@ -190,7 +203,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                 let ntype: Option<String> = r.get(3)?;
                 let nid: Option<i64> = r.get(4)?;
                 let cost: f64 = r.get(5)?;
-                let req: Option<i64> = r.get(6)?;
+                let req: Option<String> = r.get(6)?;
                 Ok(StepRow {
                     dest: match (dx, dy, dp) {
                         (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
@@ -199,7 +212,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                     next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
                     next_id: nid,
                     cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirement_id: req,
+                    requirements: parse_requirements(req),
                     lodestone: None,
                 })
             }).optional()?;
@@ -207,7 +220,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
         }
         NodeKind::Ifslot => {
             let mut st = conn.prepare(
-                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirement_id FROM teleports_ifslot_nodes WHERE id = ?1",
+                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_ifslot_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
                 let dx: Option<i64> = r.get(0)?;
@@ -216,7 +229,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                 let ntype: Option<String> = r.get(3)?;
                 let nid: Option<i64> = r.get(4)?;
                 let cost: f64 = r.get(5)?;
-                let req: Option<i64> = r.get(6)?;
+                let req: Option<String> = r.get(6)?;
                 Ok(StepRow {
                     dest: match (dx, dy, dp) {
                         (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
@@ -225,7 +238,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                     next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
                     next_id: nid,
                     cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirement_id: req,
+                    requirements: parse_requirements(req),
                     lodestone: None,
                 })
             }).optional()?;
@@ -342,7 +355,7 @@ pub fn flatten_chains(
         let mut last_dest: Option<(i32, i32, i32)> = None;
         // Capture first-door info to generate a reverse inside->outside edge for doors only
         let mut first_door_dest: Option<(i32, i32, i32)> = None;
-        let mut first_door_req: Option<i64> = None;
+        let mut first_door_reqs: Vec<i64> = Vec::new();
         let mut first_door_cost: f32 = 0.0;
         let mut first_door_id: Option<i64> = None;
         let mut cycle = false;
@@ -351,15 +364,15 @@ pub fn flatten_chains(
             if !visited.insert((cur_kind, cur_id)) { cycle = true; break; }
             let Some(row) = fetch_step(conn, cur_kind, cur_id)? else { cycle = true; break; };
             cost_sum += row.cost;
-            if let Some(req) = row.requirement_id { requirement_ids.push(req); }
+            requirement_ids.extend(row.requirements.iter().copied());
             // Record the very first step details if this chain starts with a door
             if steps.is_empty() && start_kind == NodeKind::Door {
                 if let Some(d) = row.dest { first_door_dest = Some(d); }
-                first_door_req = row.requirement_id;
+                first_door_reqs = row.requirements.clone();
                 first_door_cost = row.cost;
                 first_door_id = Some(cur_id);
             }
-            steps.push(ChainStepMeta { kind: cur_kind.as_str(), id: cur_id, cost: row.cost, requirement_id: row.requirement_id, lodestone: row.lodestone });
+            steps.push(ChainStepMeta { kind: cur_kind.as_str(), id: cur_id, cost: row.cost, requirements: row.requirements, lodestone: row.lodestone });
             if let Some(d) = row.dest { last_dest = Some(d); }
             if let (Some(nk), Some(nid)) = (row.next_kind, row.next_id) {
                 cur_kind = nk; cur_id = nid;
@@ -390,15 +403,14 @@ pub fn flatten_chains(
         if start_kind == NodeKind::Door {
             if let Some((ix, iy, ip)) = first_door_dest {
                 if let Some(&inside_node) = node_id_of.get(&(ix, iy, ip)) {
-                    let mut rev_reqs: Vec<i64> = Vec::new();
-                    if let Some(r) = first_door_req { rev_reqs.push(r); }
+                    let rev_reqs: Vec<i64> = first_door_reqs.clone();
                     let door_id = first_door_id.unwrap_or(0);
                     result.push(MacroEdgeMeta {
                         src: inside_node,
                         dst: src_node,
                         cost: first_door_cost,
                         requirement_ids: rev_reqs,
-                        steps: vec![ChainStepMeta { kind: NodeKind::Door.as_str(), id: door_id, cost: first_door_cost, requirement_id: first_door_req, lodestone: None }],
+                        steps: vec![ChainStepMeta { kind: NodeKind::Door.as_str(), id: door_id, cost: first_door_cost, requirements: first_door_reqs.clone(), lodestone: None }],
                     });
                 }
             }
@@ -486,8 +498,8 @@ pub fn flatten_global_chains(
             if !visited.insert((cur_kind, cur_id)) { cycle = true; break; }
             let Some(row) = fetch_step(conn, cur_kind, cur_id)? else { cycle = true; break; };
             cost_sum += row.cost;
-            if let Some(req) = row.requirement_id { requirement_ids.push(req); }
-            steps.push(ChainStepMeta { kind: cur_kind.as_str(), id: cur_id, cost: row.cost, requirement_id: row.requirement_id, lodestone: row.lodestone });
+            requirement_ids.extend(row.requirements.iter().copied());
+            steps.push(ChainStepMeta { kind: cur_kind.as_str(), id: cur_id, cost: row.cost, requirements: row.requirements, lodestone: row.lodestone });
             if let Some(d) = row.dest { last_dest = Some(d); }
             if let (Some(nk), Some(nid)) = (row.next_kind, row.next_id) {
                 cur_kind = nk; cur_id = nid;
