@@ -54,6 +54,23 @@ pub struct Profile {
     pub requirements: Vec<RequirementKV>,
 }
 
+fn req_has_quick_tele(reqs: &[RequirementKV]) -> bool {
+    for r in reqs {
+        if r.key.trim().eq_ignore_ascii_case("hasQuickTele") {
+            if r.value.as_i64() == Some(1) || r.value.as_u64() == Some(1) {
+                return true;
+            }
+            if r.value.as_bool() == Some(true) {
+                return true;
+            }
+            if r.value.as_str().map(|s| s.trim()) == Some("1") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct RouteOptions {
     #[serde(default)]
@@ -176,6 +193,8 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         .iter()
         .map(|kv| (kv.key.clone(), kv.value.clone()))
         .collect();
+
+    let quick_tele = req_has_quick_tele(&req.profile.requirements);
     
     // Offload search to blocking thread pool
     let snap_arc = snap.clone();
@@ -221,7 +240,16 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                          for g in arr {
                              if let Some(dst) = g.get("dst").and_then(|v| v.as_u64()) {
                                  let dst = dst as u32;
-                                 let cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                                 let mut cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                                 let kind = g
+                                     .get("steps").and_then(|v| v.as_array())
+                                     .and_then(|a| a.first())
+                                     .and_then(|s| s.get("kind"))
+                                     .and_then(|v| v.as_str())
+                                     .unwrap_or("");
+                                 if quick_tele && kind == "lodestone" {
+                                     cost = 2400.0;
+                                 }
                                  global_cost.insert(dst, cost);
                                  global_meta.insert(dst, g.clone());
                              }
@@ -256,7 +284,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                 
                 if let Some(&idx) = cur.macro_lookup.get(&(u, v)) {
                     let idx = idx as usize;
-                    let cost_ms = snap.macro_w().get(idx).unwrap_or(0.0);
+                    let mut cost_ms = snap.macro_w().get(idx).unwrap_or(0.0);
                     let k = snap.macro_kind_first().get(idx).unwrap_or(0);
                     let kid = snap.macro_id_first().get(idx).unwrap_or(0);
                     let kstr = match k {
@@ -268,6 +296,9 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                         6 => "ifslot",
                         _ => "teleport",
                     };
+                    if quick_tele && kstr == "lodestone" {
+                        cost_ms = 2400.0;
+                    }
                     let mut meta = if let Some(bytes) = snap.macro_meta_at(idx) {
                         serde_json::from_slice(bytes).unwrap_or(serde_json::json!({}))
                     } else {
@@ -323,13 +354,23 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                         .and_then(|s| s.get("kind"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("global_teleport");
-                    acts.push(serde_json::json!({
-                        "type": kstr,
-                        "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
-                        "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
-                        "cost_ms": gc,
-                        "metadata": meta
-                    }));
+                    if quick_tele && kstr == "lodestone" {
+                        acts.push(serde_json::json!({
+                            "type": kstr,
+                            "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
+                            "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                            "cost_ms": 2400.0,
+                            "metadata": meta
+                        }));
+                    } else {
+                        acts.push(serde_json::json!({
+                            "type": kstr,
+                            "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
+                            "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                            "cost_ms": gc,
+                            "metadata": meta
+                        }));
+                    }
                 } else {
                     // Walk edge or unknown
                     // Check if it is a valid walk edge by querying neighbor provider
@@ -417,7 +458,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
 #[derive(Debug, Serialize)]
 pub struct ReloadResponse { pub reloaded: bool, pub snapshot_hash: Option<String>, pub loaded_at: u64 }
 
-pub async fn reload(State(state): State<AppState>) -> Result<Json<ReloadResponse>, StatusCode> {
+pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let cur = state.current.load();
     let path = cur.path.clone();
 
@@ -427,7 +468,7 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<ReloadResponse
             // Build coord index from newly loaded snapshot
             let idx = Arc::new(crate::build_coord_index(&new_snap));
             // Pre-compute neighbors and globals
-            let (neighbors, globals, macro_lookup) = engine_adapter::build_neighbor_provider(&new_snap);
+            let (neighbors, globals, macro_lookup) = crate::engine_adapter::build_neighbor_provider(&new_snap);
             let new_state = SnapshotState {
                 path: path.clone(),
                 snapshot: Some(Arc::new(new_snap)),
@@ -441,11 +482,15 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<ReloadResponse
             state.current.store(Arc::new(new_state));
             info!(path=?path, hash=?new_hash, "reloaded snapshot");
             let latest = state.current.load();
-            Ok(Json(ReloadResponse { reloaded: true, snapshot_hash: latest.snapshot_hash_hex.clone(), loaded_at: latest.loaded_at_unix }))
+            Ok(Json(serde_json::json!({
+                "reloaded": true,
+                "snapshot_hash": latest.snapshot_hash_hex,
+                "loaded_at": latest.loaded_at_unix
+            })))
         }
         Err(e) => {
             warn!(error=?e, path=?path, "reload failed; keeping old snapshot");
-            Err(StatusCode::CONFLICT)
+            Err((StatusCode::CONFLICT, e.to_string()))
         }
     }
 }

@@ -4,6 +4,8 @@ use arc_swap::ArcSwap;
 use axum::{routing::{get, post}, Router};
 use navpath_core::{Snapshot, NeighborProvider};
 
+use crate::engine_adapter::GlobalTeleport;
+
 pub mod routes;
 pub mod engine_adapter;
 
@@ -12,7 +14,7 @@ pub struct SnapshotState {
     pub path: PathBuf,
     pub snapshot: Option<Arc<Snapshot>>, // None when not loaded
     pub neighbors: Option<Arc<NeighborProvider>>,
-    pub globals: Arc<Vec<(u32, f32, Vec<usize>)>>, // dst, cost, reqs (indices)
+    pub globals: Arc<Vec<GlobalTeleport>>, // dst, cost, reqs (indices)
     pub macro_lookup: Arc<HashMap<(u32, u32), u32>>,
     pub loaded_at_unix: u64,
     pub snapshot_hash_hex: Option<String>,

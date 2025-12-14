@@ -13,6 +13,7 @@ pub struct SearchParams<'a, C: OctileCoords> {
     pub goal: u32,
     pub coords: Option<&'a C>,
     pub mask: Option<&'a EligibilityMask>,
+    pub quick_tele: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +136,7 @@ mod tests {
             lm_fw, lm_bw, 0,
         );
         let mut ctx = SearchContext::new(nodes);
-        let res = view.astar(SearchParams { start: 0, goal: 2, coords: Some(&NoCoords), mask: None }, &mut ctx);
+        let res = view.astar(SearchParams { start: 0, goal: 2, coords: Some(&NoCoords), mask: None, quick_tele: false }, &mut ctx);
         assert!(res.found);
         assert_eq!(res.path, vec![0,1,2]);
         assert!((res.cost - 2.0).abs() < 1e-6);
@@ -190,10 +191,10 @@ impl<'a> EngineView<'a> {
             if u == goal { break; }
             ctx.set_in_open(u, false);
             
-            let mut main_iter = self.neighbors.all_neighbors(id, params.mask);
+            let mut main_iter = self.neighbors.all_neighbors(id, params.mask, params.quick_tele);
             let mut next_main = main_iter.next();
             
-            let mut extra_vec = if let Some(cb) = &self.extra {
+            let extra_vec = if let Some(cb) = &self.extra {
                 let mut ex = cb(id);
                 ex.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)));
                 Some(ex)

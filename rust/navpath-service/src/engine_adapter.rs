@@ -30,7 +30,44 @@ impl<'a> OctileCoords for SnapshotCoords<'a> {
     }
 }
 
-pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<(u32, f32, Vec<usize>)>, HashMap<(u32, u32), u32>) {
+#[derive(Clone, Debug)]
+pub struct GlobalTeleport {
+    pub dst: u32,
+    pub cost: f32,
+    pub reqs: Vec<usize>,
+    pub kind_first: u32,
+}
+
+fn kind_code(kind: &str) -> u32 {
+    match kind {
+        "door" => 1,
+        "lodestone" => 2,
+        "npc" => 3,
+        "object" => 4,
+        "item" => 5,
+        "ifslot" => 6,
+        _ => 0,
+    }
+}
+
+fn has_quick_tele(client_reqs: &[(String, serde_json::Value)]) -> bool {
+    for (k, v) in client_reqs {
+        if k.trim().eq_ignore_ascii_case("hasQuickTele") {
+            if v.as_i64() == Some(1) || v.as_u64() == Some(1) {
+                return true;
+            }
+            if v.as_bool() == Some(true) {
+                return true;
+            }
+            if v.as_str().map(|s| s.trim()) == Some("1") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<GlobalTeleport>, HashMap<(u32, u32), u32>) {
     // 1. Build map of req_id -> tag_index
     let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
     let mut id_to_idx = std::collections::HashMap::new();
@@ -45,12 +82,13 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<(u
     let msrc = snapshot.macro_src();
     let len = msrc.len();
     let mut macro_reqs: Vec<Vec<usize>> = Vec::with_capacity(len);
-    let mut globals: Vec<(u32, f32, Vec<usize>)> = Vec::new();
+    let mut globals: Vec<GlobalTeleport> = Vec::new();
     let mut macro_lookup: HashMap<(u32, u32), u32> = HashMap::with_capacity(len);
     
     let msrc_vec: Vec<u32> = msrc.iter().collect();
     let mdst_vec: Vec<u32> = snapshot.macro_dst().iter().collect();
     let mw_vec: Vec<f32> = snapshot.macro_w().iter().collect();
+    let mkind_vec: Vec<u32> = snapshot.macro_kind_first().iter().collect();
 
     for idx in 0..len {
         let mut reqs = Vec::new();
@@ -66,6 +104,14 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<(u
                              let dst = g.get("dst").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                              let cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                              let mut g_reqs = Vec::new();
+                             let kind_first = g
+                                 .get("steps")
+                                 .and_then(|v| v.as_array())
+                                 .and_then(|a| a.first())
+                                 .and_then(|s| s.get("kind"))
+                                 .and_then(|v| v.as_str())
+                                 .map(kind_code)
+                                 .unwrap_or(0);
                              if let Some(r_arr) = g.get("requirements").and_then(|v| v.as_array()) {
                                  for ridv in r_arr {
                                      if let Some(rid) = ridv.as_u64() {
@@ -76,7 +122,7 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<(u
                                  }
                              }
                              if dst != 0 {
-                                 globals.push((dst, cost, g_reqs));
+                                 globals.push(GlobalTeleport { dst, cost, reqs: g_reqs, kind_first });
                              }
                          }
                     }
@@ -109,6 +155,7 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<(u
         nodes,
         &walk_src, &walk_dst, &walk_w,
         &msrc_vec, &mdst_vec, &mw_vec,
+        &mkind_vec,
         &macro_reqs
     );
     
@@ -118,7 +165,7 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<(u
 pub fn run_route(
     snapshot: Arc<Snapshot>,
     neighbors: Arc<NeighborProvider>,
-    globals: Arc<Vec<(u32, f32, Vec<usize>)>>,
+    globals: Arc<Vec<GlobalTeleport>>,
     start_id: u32, 
     goal_id: u32
 ) -> SearchResult {
@@ -128,7 +175,7 @@ pub fn run_route(
 pub fn run_route_with_requirements(
     snapshot: Arc<Snapshot>,
     neighbors: Arc<NeighborProvider>,
-    globals: Arc<Vec<(u32, f32, Vec<usize>)>>,
+    globals: Arc<Vec<GlobalTeleport>>,
     start_id: u32,
     goal_id: u32,
     client_reqs: &[(String, serde_json::Value)],
@@ -157,15 +204,21 @@ pub fn run_route_with_requirements(
         }),
     );
 
+    let quick_tele = has_quick_tele(client_reqs);
+
     // Eligible global teleports
     let mut eligible_globals: Vec<(u32, f32)> = Vec::new();
-    for (dst, cost, reqs) in globals.iter() {
+    for g in globals.iter() {
         let mut allowed = true;
-        for &idx in reqs {
+        for &idx in &g.reqs {
             if !mask.is_satisfied(idx) { allowed = false; break; }
         }
         if allowed {
-            eligible_globals.push((*dst, *cost));
+            let mut cost = g.cost;
+            if quick_tele && g.kind_first == 2 {
+                cost = 2400.0;
+            }
+            eligible_globals.push((g.dst, cost));
         }
     }
 
@@ -196,6 +249,6 @@ pub fn run_route_with_requirements(
 
     SEARCH_CONTEXT.with(|ctx_cell| {
         let mut ctx = ctx_cell.borrow_mut();
-        view.astar(SearchParams { start: start_id, goal: goal_id, coords: Some(&coords), mask: Some(&mask) }, &mut ctx)
+        view.astar(SearchParams { start: start_id, goal: goal_id, coords: Some(&coords), mask: Some(&mask), quick_tele }, &mut ctx)
     })
 }
