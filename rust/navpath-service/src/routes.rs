@@ -345,32 +345,6 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                         "node": {"type": kstr, "id": kid},
                         "metadata": meta
                     }));
-                } else if let Some(gc) = global_cost.get(&v).cloned() {
-                    let meta = global_meta.get(&v).cloned().unwrap_or(serde_json::json!({}));
-                    // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
-                    let kstr = meta
-                        .get("steps").and_then(|v| v.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|s| s.get("kind"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("global_teleport");
-                    if quick_tele && kstr == "lodestone" {
-                        acts.push(serde_json::json!({
-                            "type": kstr,
-                            "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
-                            "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
-                            "cost_ms": 2400.0,
-                            "metadata": meta
-                        }));
-                    } else {
-                        acts.push(serde_json::json!({
-                            "type": kstr,
-                            "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
-                            "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
-                            "cost_ms": gc,
-                            "metadata": meta
-                        }));
-                    }
                 } else {
                     // Walk edge or unknown
                     // Check if it is a valid walk edge by querying neighbor provider
@@ -392,6 +366,32 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                             "to":   [x2,y2,p2],
                             "cost_ms": w_cost.round()
                         }));
+                    } else if let Some(gc) = global_cost.get(&v).cloned() {
+                        let meta = global_meta.get(&v).cloned().unwrap_or(serde_json::json!({}));
+                        // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
+                        let kstr = meta
+                            .get("steps").and_then(|v| v.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|s| s.get("kind"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("global_teleport");
+                        if quick_tele && kstr == "lodestone" {
+                            acts.push(serde_json::json!({
+                                "type": kstr,
+                                "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
+                                "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                                "cost_ms": 2400.0,
+                                "metadata": meta
+                            }));
+                        } else {
+                            acts.push(serde_json::json!({
+                                "type": kstr,
+                                "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
+                                "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                                "cost_ms": gc,
+                                "metadata": meta
+                            }));
+                        }
                     } else {
                         // Fallback: unknown edge kind; emit as generic teleport with zero cost
                         acts.push(serde_json::json!({

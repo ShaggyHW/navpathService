@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use navpath_core::{EngineView, SearchParams, SearchResult, Snapshot, NeighborProvider};
 use navpath_core::engine::search::SearchContext;
 use serde_json::Value as JsonValue;
-use navpath_core::eligibility::{build_mask_from_u32, ClientValue};
+use navpath_core::eligibility::{build_mask_from_u32, fnv1a32, ClientValue};
 use navpath_core::engine::heuristics::{LandmarkHeuristic, OctileCoords};
 use navpath_core::snapshot::LeSliceI32;
+use tracing::{info, warn};
 
 thread_local! {
     static SEARCH_CONTEXT: RefCell<SearchContext> = RefCell::new(SearchContext::new(0));
@@ -90,6 +91,8 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
     let mw_vec: Vec<f32> = snapshot.macro_w().iter().collect();
     let mkind_vec: Vec<u32> = snapshot.macro_kind_first().iter().collect();
 
+    let mut missing_req_ids: u64 = 0;
+
     for idx in 0..len {
         let mut reqs = Vec::new();
         let mut is_global = false;
@@ -117,6 +120,10 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
                                      if let Some(rid) = ridv.as_u64() {
                                          if let Some(&tag_idx) = id_to_idx.get(&(rid as u32)) {
                                              g_reqs.push(tag_idx);
+                                         } else {
+                                             // Fail-closed: unknown requirement id means the edge can never be satisfied
+                                             g_reqs.push(usize::MAX);
+                                             missing_req_ids += 1;
                                          }
                                      }
                                  }
@@ -134,6 +141,10 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
                             if let Some(rid) = ridv.as_u64() {
                                 if let Some(&tag_idx) = id_to_idx.get(&(rid as u32)) {
                                     reqs.push(tag_idx);
+                                } else {
+                                    // Fail-closed: unknown requirement id means the edge can never be satisfied
+                                    reqs.push(usize::MAX);
+                                    missing_req_ids += 1;
                                 }
                             }
                         }
@@ -143,6 +154,10 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
         }
         macro_reqs.push(reqs);
         macro_lookup.insert((msrc_vec[idx], mdst_vec[idx]), idx as u32);
+    }
+
+    if missing_req_ids > 0 {
+        warn!(missing_req_ids, "snapshot macro metadata referenced unknown requirement ids (will be treated as unsatisfied)");
     }
 
     // 3. Build NeighborProvider
@@ -203,6 +218,29 @@ pub fn run_route_with_requirements(
             }
         }),
     );
+
+    if let Some((k, v)) = client_reqs
+        .iter()
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("hasGamesNeck"))
+    {
+        info!(key = %k, value = %v, "client requirement");
+    }
+
+    // Diagnostics: show computed satisfaction for requirement id 78 (expected key=hasGamesNeck, value=1)
+    let mut i = 0usize;
+    while i + 3 < req_words.len() {
+        if req_words[i] == 78 {
+            let tag_idx = i / 4;
+            let key_id = req_words[i + 1];
+            let opbits = req_words[i + 2];
+            let rhs_val = req_words[i + 3];
+            let expected_key_id = fnv1a32("hasgamesneck");
+            let key_matches = key_id == expected_key_id;
+            info!(tag_idx, key_id, expected_key_id, key_matches, opbits, rhs_val, satisfied = mask.is_satisfied(tag_idx), "req_id 78 evaluation");
+            break;
+        }
+        i += 4;
+    }
 
     let quick_tele = has_quick_tele(client_reqs);
 

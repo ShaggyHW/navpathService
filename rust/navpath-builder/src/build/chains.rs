@@ -9,13 +9,45 @@ fn parse_requirements(reqs: Option<String>) -> Vec<i64> {
     let Some(s) = reqs else { return Vec::new(); };
     let s = s.trim();
     if s.is_empty() { return Vec::new(); }
-    s.split(';')
+    s.split(|c| c == ';' || c == ',')
         .filter_map(|part| {
             let p = part.trim();
             if p.is_empty() { return None; }
             p.parse::<i64>().ok()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_requirements;
+
+    #[test]
+    fn parses_empty_and_none() {
+        assert_eq!(parse_requirements(None), Vec::<i64>::new());
+        assert_eq!(parse_requirements(Some("".to_string())), Vec::<i64>::new());
+        assert_eq!(parse_requirements(Some("  ".to_string())), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn parses_single_requirement() {
+        assert_eq!(parse_requirements(Some("78".to_string())), vec![78]);
+        assert_eq!(parse_requirements(Some(" 78 ".to_string())), vec![78]);
+    }
+
+    #[test]
+    fn parses_multi_requirement_semicolon() {
+        assert_eq!(parse_requirements(Some("55;58".to_string())), vec![55, 58]);
+        assert_eq!(parse_requirements(Some("55; 58".to_string())), vec![55, 58]);
+        assert_eq!(parse_requirements(Some("55;;58".to_string())), vec![55, 58]);
+        assert_eq!(parse_requirements(Some("55;58;".to_string())), vec![55, 58]);
+    }
+
+    #[test]
+    fn parses_multi_requirement_comma() {
+        assert_eq!(parse_requirements(Some("55,58".to_string())), vec![55, 58]);
+        assert_eq!(parse_requirements(Some("55, 58".to_string())), vec![55, 58]);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
