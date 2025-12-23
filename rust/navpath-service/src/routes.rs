@@ -6,42 +6,6 @@ use tracing::{info, warn};
 
 use crate::{engine_adapter, AppState, SnapshotState};
 
-// Helper function to find the nearest reachable tile to a given coordinate
-    fn find_nearest_tile(_snap: &navpath_core::Snapshot, coord_index: &std::collections::HashMap<(i32, i32, i32), u32>, target_x: i32, target_y: i32, target_plane: i32) -> u32 {
-        let mut nearest_id = 0;
-        let mut min_distance_sq: i64 = i64::MAX;
-
-        // First, try to find tiles on the same plane
-        for (&(x, y, plane), &id) in coord_index.iter() {
-            if plane == target_plane {
-                let dx = (x - target_x) as i64;
-                let dy = (y - target_y) as i64;
-                let dist_sq = dx * dx + dy * dy;
-                if dist_sq < min_distance_sq {
-                    min_distance_sq = dist_sq;
-                    nearest_id = id;
-                }
-            }
-        }
-
-        // If no tiles found on the same plane, find the closest tile on any plane
-        if min_distance_sq == i64::MAX {
-            for (&(x, y, plane), &id) in coord_index.iter() {
-                let dx = (x - target_x) as i64;
-                let dy = (y - target_y) as i64;
-                let plane_diff = (plane - target_plane) as i64;
-                let plane_penalty = plane_diff * plane_diff * 10_000_i64; // Heavy penalty for plane changes
-                let dist_sq = dx * dx + dy * dy + plane_penalty;
-                if dist_sq < min_distance_sq {
-                    min_distance_sq = dist_sq;
-                    nearest_id = id;
-                }
-            }
-        }
-
-        nearest_id
-    }
-
 #[derive(Debug, Deserialize)]
 pub struct RequirementKV {
     pub key: String,
@@ -163,18 +127,16 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
             let key_g = (g.wx, g.wy, g.plane);
             let Some(&gid) = idx.get(&key_g) else { return Err((StatusCode::BAD_REQUEST, "goal tile not found in snapshot".into())); };
             
-            // Handle start coordinate that doesn't exist - find nearest reachable tile
+            // If the start coordinate isn't present in the snapshot, do NOT snap to a nearby tile.
+            // Treat it as out-of-graph and force entry via a global teleport.
             let (sid, used_virtual_start) = if let Some(&sid) = idx.get(&key_s) {
                 (sid, false)
             } else {
-                // Start coordinate doesn't exist, find nearest reachable tile
-                let nearest_id = find_nearest_tile(snap, idx, s.wx, s.wy, s.plane);
                 info!(
                     start_x = s.wx, start_y = s.wy, start_plane = s.plane,
-                    nearest_id = nearest_id,
-                    "start coordinate not found, using nearest reachable tile"
+                    "start coordinate not found in snapshot; will force global teleport entry"
                 );
-                (nearest_id, true)
+                (0, true)
             };
             (sid, gid, used_virtual_start)
         }
@@ -182,7 +144,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
             return Err((StatusCode::BAD_REQUEST, "missing start/goal; provide start_id/goal_id or start/goal with {wx,wy,plane}".into()));
         }
     };
-    if sid >= counts.nodes || gid >= counts.nodes {
+    if (!used_virtual_start && sid >= counts.nodes) || gid >= counts.nodes {
         return Err((StatusCode::BAD_REQUEST, "start_id/goal_id out of range".into()));
     }
 
@@ -200,10 +162,23 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     let snap_arc = snap.clone();
     let neighbors_arc = neighbors.clone();
     let globals_arc = globals.clone();
-    
-    let res = tokio::task::spawn_blocking(move || {
-        engine_adapter::run_route_with_requirements(snap_arc, neighbors_arc, globals_arc, sid, gid, &client_reqs)
+
+    let used_virtual_start_for_search = used_virtual_start;
+    let res_and_entry = tokio::task::spawn_blocking(move || {
+        if used_virtual_start_for_search {
+            engine_adapter::run_route_with_requirements_virtual_start(
+                snap_arc,
+                neighbors_arc,
+                globals_arc,
+                gid,
+                &client_reqs,
+            )
+        } else {
+            (engine_adapter::run_route_with_requirements(snap_arc, neighbors_arc, globals_arc, sid, gid, &client_reqs), None)
+        }
     }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let (res, virtual_entry) = res_and_entry;
     
     let duration_ms = start.elapsed().as_millis();
 
@@ -267,7 +242,8 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
             let mut virtual_start_action: Option<serde_json::Value> = None;
             if used_virtual_start {
                 if let Some(start_coord) = req.start.as_ref() {
-                    let (actual_x, actual_y, actual_p) = coord(sid);
+                    let entry_id = virtual_entry.unwrap_or(sid);
+                    let (actual_x, actual_y, actual_p) = coord(entry_id);
                     virtual_start_action = Some(serde_json::json!({
                         "from": {"min": [start_coord.wx, start_coord.wy, start_coord.plane], "max": [start_coord.wx, start_coord.wy, start_coord.plane]},
                         "to":   {"min": [actual_x, actual_y, actual_p], "max": [actual_x, actual_y, actual_p]},
@@ -404,27 +380,28 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                 }
             }
             
-            // If we had a virtual start, add the action with the correct type determined from the first real action
+            // If we had a virtual start, add a synthetic first action derived from the selected global teleport metadata/cost.
             if let Some(mut virtual_action) = virtual_start_action {
-                if let Some(first_action) = acts.first() {
-                    // Copy the type and metadata from the first actual action (which should be the teleport)
-                    if let Some(action_type) = first_action.get("type").and_then(|v| v.as_str()) {
-                        virtual_action["type"] = serde_json::Value::String(action_type.to_string());
-                        // Also copy the metadata if it exists, but keep our reason
-                        if let Some(metadata) = first_action.get("metadata") {
-                            if let Some(obj) = virtual_action.get_mut("metadata").and_then(|v| v.as_object_mut()) {
-                                // Merge the first action's metadata, but preserve our reason
-                                for (key, value) in metadata.as_object().unwrap_or(&serde_json::Map::new()) {
-                                    if key != "reason" {
-                                        obj.insert(key.to_string(), value.clone());
-                                    }
-                                }
-                            }
+                if let Some(entry_id) = virtual_entry {
+                    if let Some(gc) = global_cost.get(&entry_id).cloned() {
+                        virtual_action["cost_ms"] = serde_json::Value::Number(serde_json::Number::from_f64(gc as f64).unwrap_or_else(|| serde_json::Number::from(0)));
+                    }
+                    if let Some(meta) = global_meta.get(&entry_id).cloned() {
+                        let kstr = meta
+                            .get("steps").and_then(|v| v.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|s| s.get("kind"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("global_teleport");
+                        virtual_action["type"] = serde_json::Value::String(kstr.to_string());
+                        if let Some(obj) = virtual_action.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+                            obj.insert("teleport".to_string(), meta);
                         }
+                    } else {
+                        virtual_action["type"] = serde_json::Value::String("global_teleport".to_string());
                     }
                 } else {
-                    // Fallback: no actions found, use generic teleport
-                    virtual_action["type"] = serde_json::Value::String("teleport".to_string());
+                    virtual_action["type"] = serde_json::Value::String("global_teleport".to_string());
                 }
                 acts.insert(0, virtual_action);
             }
