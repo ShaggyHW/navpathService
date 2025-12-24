@@ -270,6 +270,23 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                             for g in arr {
                                 if let Some(dst) = g.get("dst").and_then(|v| v.as_u64()) {
                                     let dst = dst as u32;
+                                    let mut allowed = true;
+                                    if let Some(reqs) = g.get("requirements").and_then(|v| v.as_array()) {
+                                        for ridv in reqs {
+                                            let Some(rid) = ridv.as_u64() else { continue; };
+                                            let Some(&tag_idx) = req_id_to_tag_idx.get(&(rid as u32)) else {
+                                                allowed = false;
+                                                break;
+                                            };
+                                            if !mask.is_satisfied(tag_idx) {
+                                                allowed = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !allowed {
+                                        continue;
+                                    }
                                     let mut cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                                     let kind = g
                                         .get("steps").and_then(|v| v.as_array())
@@ -280,8 +297,11 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                                     if quick_tele && kind == "lodestone" {
                                         cost = 2400.0;
                                     }
-                                    global_cost.insert(dst, cost);
-                                    global_meta.insert(dst, g.clone());
+                                    let should_replace = global_cost.get(&dst).map(|c| cost < *c).unwrap_or(true);
+                                    if should_replace {
+                                        global_cost.insert(dst, cost);
+                                        global_meta.insert(dst, g.clone());
+                                    }
                                 }
                             }
                             break;
