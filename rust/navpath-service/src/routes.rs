@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+use navpath_core::eligibility::{build_mask_from_u32, ClientValue};
 
 use crate::{engine_adapter, AppState, SnapshotState};
 
@@ -33,6 +34,35 @@ fn req_has_quick_tele(reqs: &[RequirementKV]) -> bool {
         }
     }
     false
+}
+
+fn build_req_id_to_tag_index(req_words: &[u32]) -> std::collections::HashMap<u32, usize> {
+    let mut map = std::collections::HashMap::new();
+    let mut i = 0usize;
+    while i + 3 < req_words.len() {
+        map.insert(req_words[i], i / 4);
+        i += 4;
+    }
+    map
+}
+
+fn macro_edge_allowed_by_profile(
+    snap: &navpath_core::Snapshot,
+    macro_idx: usize,
+    req_id_to_tag_idx: &std::collections::HashMap<u32, usize>,
+    mask: &navpath_core::eligibility::EligibilityMask,
+) -> bool {
+    let Some(bytes) = snap.macro_meta_at(macro_idx) else { return true; };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else { return true; };
+    let Some(arr) = val.get("requirements").and_then(|v| v.as_array()) else { return true; };
+    for ridv in arr {
+        let Some(rid) = ridv.as_u64() else { continue; };
+        let Some(&tag_idx) = req_id_to_tag_idx.get(&(rid as u32)) else { return false; };
+        if !mask.is_satisfied(tag_idx) {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -86,7 +116,7 @@ pub struct RouteResponse {
     #[serde(skip_serializing_if = "Option::is_none")] pub geometry: Option<Vec<serde_json::Value>>,
 }
 
-    pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let cur = state.current.load();
     let counts = cur.snapshot.as_ref().map(|s| s.counts()).map(|c| Counts {
         nodes: c.nodes,
@@ -148,7 +178,6 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         return Err((StatusCode::BAD_REQUEST, "start_id/goal_id out of range".into()));
     }
 
-    // Build client requirements and run route with eligibility gating
     let client_reqs: Vec<(String, serde_json::Value)> = req
         .profile
         .requirements
@@ -157,6 +186,30 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         .collect();
 
     let quick_tele = req_has_quick_tele(&req.profile.requirements);
+
+    let req_words: Vec<u32> = snap.req_tags().iter().collect();
+    let req_id_to_tag_idx = build_req_id_to_tag_index(&req_words);
+    let mask = build_mask_from_u32(
+        &req_words,
+        client_reqs.iter().filter_map(|(k, v)| {
+            if let Some(n) = v.as_i64() {
+                Some((k.as_str(), ClientValue::Num(n)))
+            } else if let Some(u) = v.as_u64() {
+                Some((k.as_str(), ClientValue::Num(u as i64)))
+            } else if let Some(b) = v.as_bool() {
+                Some((k.as_str(), ClientValue::Num(if b { 1 } else { 0 })))
+            } else if let Some(s) = v.as_str() {
+                let st = s.trim();
+                if let Ok(n) = st.parse::<i64>() {
+                    Some((k.as_str(), ClientValue::Num(n)))
+                } else {
+                    Some((k.as_str(), ClientValue::Str(st)))
+                }
+            } else {
+                None
+            }
+        }),
+    );
     
     // Offload search to blocking thread pool
     let snap_arc = snap.clone();
@@ -208,30 +261,34 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         // Parse global teleports encoded under a synthetic 0->0 macro edge
         let mut global_cost: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
         let mut global_meta: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
-        if let Some(&idx) = cur.macro_lookup.get(&(0, 0)) {
-             if let Some(bytes) = snap.macro_meta_at(idx as usize) {
-                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                     if let Some(arr) = val.get("global").and_then(|v| v.as_array()) {
-                         for g in arr {
-                             if let Some(dst) = g.get("dst").and_then(|v| v.as_u64()) {
-                                 let dst = dst as u32;
-                                 let mut cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                                 let kind = g
-                                     .get("steps").and_then(|v| v.as_array())
-                                     .and_then(|a| a.first())
-                                     .and_then(|s| s.get("kind"))
-                                     .and_then(|v| v.as_str())
-                                     .unwrap_or("");
-                                 if quick_tele && kind == "lodestone" {
-                                     cost = 2400.0;
-                                 }
-                                 global_cost.insert(dst, cost);
-                                 global_meta.insert(dst, g.clone());
-                             }
-                         }
-                     }
-                 }
-             }
+        if let Some(idxs) = cur.macro_lookup.get(&(0, 0)) {
+            for &idx_u32 in idxs {
+                let idx = idx_u32 as usize;
+                if let Some(bytes) = snap.macro_meta_at(idx) {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                        if let Some(arr) = val.get("global").and_then(|v| v.as_array()) {
+                            for g in arr {
+                                if let Some(dst) = g.get("dst").and_then(|v| v.as_u64()) {
+                                    let dst = dst as u32;
+                                    let mut cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                                    let kind = g
+                                        .get("steps").and_then(|v| v.as_array())
+                                        .and_then(|a| a.first())
+                                        .and_then(|s| s.get("kind"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if quick_tele && kind == "lodestone" {
+                                        cost = 2400.0;
+                                    }
+                                    global_cost.insert(dst, cost);
+                                    global_meta.insert(dst, g.clone());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         if req.options.only_actions || req.options.return_geometry {
@@ -258,9 +315,29 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                 let (x1,y1,p1) = coord(u);
                 let (x2,y2,p2) = coord(v);
                 
-                if let Some(&idx) = cur.macro_lookup.get(&(u, v)) {
-                    let idx = idx as usize;
-                    let mut cost_ms = snap.macro_w().get(idx).unwrap_or(0.0);
+                if let Some(idxs) = cur.macro_lookup.get(&(u, v)) {
+                    let mut chosen: Option<(usize, f32)> = None;
+                    for &idx_u32 in idxs {
+                        let idx = idx_u32 as usize;
+                        if !macro_edge_allowed_by_profile(snap, idx, &req_id_to_tag_idx, &mask) {
+                            continue;
+                        }
+                        let mut cost_ms = snap.macro_w().get(idx).unwrap_or(0.0);
+                        let k = snap.macro_kind_first().get(idx).unwrap_or(0);
+                        if quick_tele && k == 2 {
+                            cost_ms = 2400.0;
+                        }
+                        if chosen.map_or(true, |(_, best_cost)| cost_ms < best_cost) {
+                            chosen = Some((idx, cost_ms));
+                        }
+                    }
+                    let (idx, mut cost_ms) = if let Some(best) = chosen {
+                        best
+                    } else {
+                        let idx = idxs.first().copied().unwrap_or(0) as usize;
+                        (idx, snap.macro_w().get(idx).unwrap_or(0.0))
+                    };
+
                     let k = snap.macro_kind_first().get(idx).unwrap_or(0);
                     let kid = snap.macro_id_first().get(idx).unwrap_or(0);
                     let kstr = match k {

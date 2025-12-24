@@ -15,7 +15,7 @@ pub struct SnapshotState {
     pub snapshot: Option<Arc<Snapshot>>, // None when not loaded
     pub neighbors: Option<Arc<NeighborProvider>>,
     pub globals: Arc<Vec<GlobalTeleport>>, // dst, cost, reqs (indices)
-    pub macro_lookup: Arc<HashMap<(u32, u32), u32>>,
+    pub macro_lookup: Arc<HashMap<(u32, u32), Vec<u32>>>,
     pub loaded_at_unix: u64,
     pub snapshot_hash_hex: Option<String>,
     pub coord_index: Option<Arc<HashMap<(i32,i32,i32), u32>>>,

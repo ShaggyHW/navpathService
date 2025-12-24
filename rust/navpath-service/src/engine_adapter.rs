@@ -68,7 +68,7 @@ fn has_quick_tele(client_reqs: &[(String, serde_json::Value)]) -> bool {
     false
 }
 
-pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<GlobalTeleport>, HashMap<(u32, u32), u32>) {
+pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<GlobalTeleport>, HashMap<(u32, u32), Vec<u32>>) {
     // 1. Build map of req_id -> tag_index
     let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
     let mut id_to_idx = std::collections::HashMap::new();
@@ -84,7 +84,7 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
     let len = msrc.len();
     let mut macro_reqs: Vec<Vec<usize>> = Vec::with_capacity(len);
     let mut globals: Vec<GlobalTeleport> = Vec::new();
-    let mut macro_lookup: HashMap<(u32, u32), u32> = HashMap::with_capacity(len);
+    let mut macro_lookup: HashMap<(u32, u32), Vec<u32>> = HashMap::with_capacity(len);
     
     let msrc_vec: Vec<u32> = msrc.iter().collect();
     let mdst_vec: Vec<u32> = snapshot.macro_dst().iter().collect();
@@ -153,7 +153,10 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
             }
         }
         macro_reqs.push(reqs);
-        macro_lookup.insert((msrc_vec[idx], mdst_vec[idx]), idx as u32);
+        macro_lookup
+            .entry((msrc_vec[idx], mdst_vec[idx]))
+            .or_insert_with(Vec::new)
+            .push(idx as u32);
     }
 
     if missing_req_ids > 0 {

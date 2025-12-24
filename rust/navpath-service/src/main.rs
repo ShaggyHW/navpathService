@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         },
         Err(e) => {
             error!(error=?e, path=?snapshot_path, "failed to open snapshot; service will still start but /route will 503");
-            (None, None, Arc::new(Vec::new()), Arc::new(std::collections::HashMap::new()))
+            (None, None, Arc::new(Vec::new()), Arc::new(std::collections::HashMap::<(u32, u32), Vec<u32>>::new()))
         }
     };
 
