@@ -73,6 +73,406 @@ pub struct RouteOptions {
     pub only_actions: bool,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct SurgeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub charges: u32,
+    #[serde(default = "default_cooldown_ms")]
+    pub cooldown_ms: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiveConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub available_in_ms: f64,
+    #[serde(default = "default_cooldown_ms")]
+    pub cooldown_ms: f64,
+}
+
+fn default_cooldown_ms() -> f64 {
+    20400.0
+}
+
+impl Default for SurgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            charges: 0,
+            cooldown_ms: default_cooldown_ms(),
+        }
+    }
+}
+
+impl Default for DiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            available_in_ms: 0.0,
+            cooldown_ms: default_cooldown_ms(),
+        }
+    }
+}
+
+/// Minimum tiles required to use surge or dive (not worth cooldown for less)
+const MIN_ABILITY_TILES: usize = 5;
+/// Maximum tiles surge/dive can cover
+const MAX_ABILITY_TILES: usize = 10;
+/// Minimum tiles to walk in surge direction before using surge (to establish facing)
+const MIN_WALK_BEFORE_SURGE: usize = 3;
+
+/// Represents direction for surge (must be straight line)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Direction {
+    North,      // y increases
+    South,      // y decreases
+    East,       // x increases
+    West,       // x decreases
+    NorthEast,  // x+, y+
+    NorthWest,  // x-, y+
+    SouthEast,  // x+, y-
+    SouthWest,  // x-, y-
+}
+
+impl Direction {
+    fn from_delta(dx: i32, dy: i32) -> Option<Self> {
+        match (dx.signum(), dy.signum()) {
+            (0, 1) => Some(Direction::North),
+            (0, -1) => Some(Direction::South),
+            (1, 0) => Some(Direction::East),
+            (-1, 0) => Some(Direction::West),
+            (1, 1) => Some(Direction::NorthEast),
+            (-1, 1) => Some(Direction::NorthWest),
+            (1, -1) => Some(Direction::SouthEast),
+            (-1, -1) => Some(Direction::SouthWest),
+            _ => None,
+        }
+    }
+}
+
+/// Extract coordinates from a move action
+fn extract_move_coords(action: &serde_json::Value) -> Option<(i32, i32, i32)> {
+    let to = action.get("to")?.as_array()?;
+    if to.len() != 3 {
+        return None;
+    }
+    Some((
+        to[0].as_i64()? as i32,
+        to[1].as_i64()? as i32,
+        to[2].as_i64()? as i32,
+    ))
+}
+
+/// Find the first available surge charge and return its index
+fn find_available_surge_charge(charges: &[f64], elapsed_ms: f64) -> Option<usize> {
+    charges.iter().position(|&available_at| available_at <= elapsed_ms)
+}
+
+/// Calculate straight-line distance between two points
+fn straight_line_distance(x1: i32, y1: i32, x2: i32, y2: i32) -> f64 {
+    let dx = (x2 - x1) as f64;
+    let dy = (y2 - y1) as f64;
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Check if a dive path is valid (no obstacles - path is direct enough)
+/// If walked tiles significantly exceeds straight-line distance, there's likely an obstacle
+fn is_valid_dive_path(start: (i32, i32, i32), end: (i32, i32, i32), tiles_walked: usize) -> bool {
+    if start.2 != end.2 {
+        return false; // Different planes
+    }
+    let straight_dist = straight_line_distance(start.0, start.1, end.0, end.1);
+    // Allow some tolerance: walked path can be up to 1.5x the straight line distance
+    // This accounts for diagonal vs cardinal movement differences
+    // If it's much longer, we're going around an obstacle
+    (tiles_walked as f64) <= straight_dist * 1.5 + 1.0
+}
+
+/// Optimize actions by inserting surge and dive abilities
+fn optimize_with_surge_dive(
+    actions: Vec<serde_json::Value>,
+    surge_config: &SurgeConfig,
+    dive_config: &DiveConfig,
+) -> Vec<serde_json::Value> {
+    // If neither ability is enabled, return as-is
+    if !surge_config.enabled && !dive_config.enabled {
+        return actions;
+    }
+
+    // Track cooldowns: each charge has its own "available_at" time (all start at 0)
+    let mut surge_charges: Vec<f64> = vec![0.0; surge_config.charges as usize];
+    let mut dive_available_at: f64 = dive_config.available_in_ms;
+
+    let mut result: Vec<serde_json::Value> = Vec::with_capacity(actions.len());
+    let mut elapsed_ms: f64 = 0.0;
+    let mut i = 0;
+
+    while i < actions.len() {
+        let action = &actions[i];
+        let action_type = action.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Only process sequences of "move" actions
+        if action_type != "move" {
+            // Add non-move action and accumulate its cost
+            let cost = action.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            elapsed_ms += cost;
+            result.push(action.clone());
+            i += 1;
+            continue;
+        }
+
+        // We have a move action - look for a sequence we can optimize
+        let mut move_sequence: Vec<(usize, i32, i32, i32, f64)> = Vec::new(); // (index, x, y, plane, cost)
+
+        // Get the starting position from the previous action or the first move
+        let start_pos = if let Some(prev) = result.last() {
+            // Try to get "to" coords from previous action
+            if let Some(to) = prev.get("to") {
+                if let Some(arr) = to.as_array() {
+                    if arr.len() == 3 {
+                        Some((
+                            arr[0].as_i64().unwrap_or(0) as i32,
+                            arr[1].as_i64().unwrap_or(0) as i32,
+                            arr[2].as_i64().unwrap_or(0) as i32,
+                        ))
+                    } else {
+                        None
+                    }
+                } else if let Some(min) = to.get("min").and_then(|v| v.as_array()) {
+                    if min.len() == 3 {
+                        Some((
+                            min[0].as_i64().unwrap_or(0) as i32,
+                            min[1].as_i64().unwrap_or(0) as i32,
+                            min[2].as_i64().unwrap_or(0) as i32,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Collect consecutive move actions
+        let mut j = i;
+        while j < actions.len() {
+            let act = &actions[j];
+            if act.get("type").and_then(|v| v.as_str()) != Some("move") {
+                break;
+            }
+            if let Some((x, y, p)) = extract_move_coords(act) {
+                let cost = act.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                move_sequence.push((j, x, y, p, cost));
+                j += 1;
+            } else {
+                break;
+            }
+        }
+
+        if move_sequence.is_empty() {
+            result.push(action.clone());
+            i += 1;
+            continue;
+        }
+
+        // Now try to find surge/dive opportunities within this move sequence
+        let mut seq_idx = 0;
+        while seq_idx < move_sequence.len() {
+            // Determine current position
+            let current_pos = if seq_idx == 0 {
+                start_pos.unwrap_or_else(|| {
+                    let (_, x, y, p, _) = move_sequence[0];
+                    (x, y, p) // fallback: use first move destination (not ideal but handles edge case)
+                })
+            } else {
+                let (_, x, y, p, _) = move_sequence[seq_idx - 1];
+                (x, y, p)
+            };
+
+            // Try surge first (requires straight line AND at least 3 prior moves in the same direction)
+            let mut surge_used = false;
+
+            if surge_config.enabled && !surge_charges.is_empty() {
+                if let Some(charge_idx) = find_available_surge_charge(&surge_charges, elapsed_ms) {
+                    // Find longest straight line from current position
+                    let mut straight_count = 0;
+                    let mut last_dir: Option<Direction> = None;
+                    let mut prev_pos = current_pos;
+
+                    for k in seq_idx..move_sequence.len().min(seq_idx + MAX_ABILITY_TILES) {
+                        let (_, x, y, p, _) = move_sequence[k];
+                        if p != current_pos.2 {
+                            break; // Different plane, can't surge
+                        }
+                        let dx = x - prev_pos.0;
+                        let dy = y - prev_pos.1;
+                        let dir = Direction::from_delta(dx, dy);
+
+                        if let Some(d) = dir {
+                            if last_dir.is_none() || last_dir == Some(d) {
+                                last_dir = Some(d);
+                                straight_count += 1;
+                                prev_pos = (x, y, p);
+                            } else {
+                                break; // Direction changed
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Check if we have at least MIN_WALK_BEFORE_SURGE (3) moves in the surge direction
+                    let mut prior_moves_in_direction = 0;
+                    if let Some(surge_dir) = last_dir {
+                        // Check previous moves in result for same direction
+                        let result_len = result.len();
+                        for idx in (0..result_len).rev() {
+                            let prev_action = &result[idx];
+                            if prev_action.get("type").and_then(|v| v.as_str()) != Some("move") {
+                                break; // Hit a non-move action, stop counting
+                            }
+                            // Get this move's destination
+                            let prev_to = match extract_move_coords(prev_action) {
+                                Some(c) => c,
+                                None => break,
+                            };
+                            // Get the move before this one's destination (or start_pos if first)
+                            let prev_from = if idx > 0 {
+                                let before = &result[idx - 1];
+                                if let Some(to) = before.get("to") {
+                                    if let Some(arr) = to.as_array() {
+                                        if arr.len() == 3 {
+                                            (arr[0].as_i64().unwrap_or(0) as i32,
+                                             arr[1].as_i64().unwrap_or(0) as i32,
+                                             arr[2].as_i64().unwrap_or(0) as i32)
+                                        } else {
+                                            break;
+                                        }
+                                    } else if let Some(min) = to.get("min").and_then(|v| v.as_array()) {
+                                        if min.len() == 3 {
+                                            (min[0].as_i64().unwrap_or(0) as i32,
+                                             min[1].as_i64().unwrap_or(0) as i32,
+                                             min[2].as_i64().unwrap_or(0) as i32)
+                                        } else {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break; // No previous action to get position from
+                            };
+
+                            let dx = prev_to.0 - prev_from.0;
+                            let dy = prev_to.1 - prev_from.1;
+                            let move_dir = Direction::from_delta(dx, dy);
+
+                            if move_dir == Some(surge_dir) {
+                                prior_moves_in_direction += 1;
+                            } else {
+                                break; // Different direction, stop counting
+                            }
+
+                            if prior_moves_in_direction >= MIN_WALK_BEFORE_SURGE {
+                                break; // We have enough
+                            }
+                        }
+                    }
+
+                    if straight_count >= MIN_ABILITY_TILES && prior_moves_in_direction >= MIN_WALK_BEFORE_SURGE {
+                        // Use surge!
+                        let end_idx = seq_idx + straight_count - 1;
+                        let (_, end_x, end_y, end_p, _) = move_sequence[end_idx];
+
+                        // Add surge action
+                        result.push(serde_json::json!({
+                            "type": "surge",
+                            "from": [current_pos.0, current_pos.1, current_pos.2],
+                            "to": [end_x, end_y, end_p],
+                            "cost_ms": 0,
+                            "tiles_covered": straight_count
+                        }));
+
+                        // Update cooldown for this charge
+                        surge_charges[charge_idx] = elapsed_ms + surge_config.cooldown_ms;
+
+                        // Don't add to elapsed_ms since surge is instant (cost_ms = 0)
+                        // But we skip the walking time
+
+                        seq_idx = end_idx + 1;
+                        surge_used = true;
+                    }
+                }
+            }
+
+            // Try dive if surge wasn't used (dive doesn't require straight line but can't skip obstacles)
+            if !surge_used && dive_config.enabled && dive_available_at <= elapsed_ms {
+                // For dive, find the longest valid path (no obstacles)
+                // We check by comparing walked distance to straight-line distance
+                let mut best_dive_count = 0;
+
+                for dive_count in (MIN_ABILITY_TILES..=MAX_ABILITY_TILES.min(move_sequence.len() - seq_idx)).rev() {
+                    let end_idx = seq_idx + dive_count - 1;
+                    let (_, end_x, end_y, end_p, _) = move_sequence[end_idx];
+                    let end_pos = (end_x, end_y, end_p);
+
+                    if is_valid_dive_path(current_pos, end_pos, dive_count) {
+                        best_dive_count = dive_count;
+                        break;
+                    }
+                }
+
+                if best_dive_count >= MIN_ABILITY_TILES {
+                    // Use dive!
+                    let end_idx = seq_idx + best_dive_count - 1;
+                    let (_, end_x, end_y, end_p, _) = move_sequence[end_idx];
+
+                    // Add dive action
+                    result.push(serde_json::json!({
+                        "type": "dive",
+                        "from": [current_pos.0, current_pos.1, current_pos.2],
+                        "to": [end_x, end_y, end_p],
+                        "cost_ms": 0,
+                        "tiles_covered": best_dive_count
+                    }));
+
+                    // Update cooldown
+                    dive_available_at = elapsed_ms + dive_config.cooldown_ms;
+
+                    seq_idx = end_idx + 1;
+                } else {
+                    // Can't use ability, add single move action
+                    let (orig_idx, _, _, _, cost) = move_sequence[seq_idx];
+                    elapsed_ms += cost;
+                    result.push(actions[orig_idx].clone());
+                    seq_idx += 1;
+                }
+            } else if !surge_used {
+                // No ability available, add single move action
+                let (orig_idx, _, _, _, cost) = move_sequence[seq_idx];
+                elapsed_ms += cost;
+                result.push(actions[orig_idx].clone());
+                seq_idx += 1;
+            }
+        }
+
+        i = j; // Skip past all the moves we processed
+    }
+
+    result
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct NodeTile { pub wx: i32, pub wy: i32, pub plane: i32 }
 
@@ -86,6 +486,9 @@ pub struct RouteRequest {
     #[serde(default)] pub goal: Option<NodeTile>,
     #[serde(default)] pub profile: Profile,
     #[serde(default)] pub options: RouteOptions,
+    // Surge and Dive abilities
+    #[serde(default)] pub surge: SurgeConfig,
+    #[serde(default)] pub dive: DiveConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -502,8 +905,10 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                 }
                 acts.insert(0, virtual_action);
             }
-            
-            actions = Some(acts);
+
+            // Apply surge/dive optimization to the actions
+            let optimized_acts = optimize_with_surge_dive(acts, &req.surge, &req.dive);
+            actions = Some(optimized_acts);
         }
     }
 
