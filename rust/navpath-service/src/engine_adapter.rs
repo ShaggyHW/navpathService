@@ -39,6 +39,20 @@ pub struct GlobalTeleport {
     pub kind_first: u32,
 }
 
+/// Runtime representation of a Fairy Ring node
+#[derive(Clone, Debug)]
+pub struct FairyRing {
+    pub node: u32,
+    pub object_id: u64,
+    pub x: i32,
+    pub y: i32,
+    pub plane: i32,
+    pub cost_ms: f32,
+    pub code: String,
+    pub action: Option<String>,
+    pub req_tag_idxs: Vec<usize>, // usize::MAX for fail-closed unknown requirements
+}
+
 fn kind_code(kind: &str) -> u32 {
     match kind {
         "door" => 1,
@@ -180,6 +194,89 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
     (provider, globals, macro_lookup)
 }
 
+/// Build fairy ring runtime data from snapshot.
+/// Returns: (Vec<FairyRing>, HashMap<node_id, ring_index>)
+pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, HashMap<u32, usize>) {
+    // Build req_id -> tag_index map
+    let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
+    let mut id_to_idx: HashMap<u32, usize> = HashMap::new();
+    let mut i = 0;
+    while i + 3 < req_words.len() {
+        let req_id = req_words[i];
+        id_to_idx.insert(req_id, i / 4);
+        i += 4;
+    }
+
+    let fairy_count = snapshot.counts().fairy_rings as usize;
+    let mut rings: Vec<FairyRing> = Vec::with_capacity(fairy_count);
+    let mut node_to_ring: HashMap<u32, usize> = HashMap::with_capacity(fairy_count);
+    let mut missing_req_ids: u64 = 0;
+
+    let nodes = snapshot.fairy_nodes();
+    let costs = snapshot.fairy_cost_ms();
+
+    for idx in 0..fairy_count {
+        let node = nodes.get(idx).unwrap_or(0);
+        let cost_ms = costs.get(idx).unwrap_or(0.0);
+
+        // Parse metadata JSON
+        let (object_id, x, y, plane, code, action, req_tag_idxs) =
+            if let Some(bytes) = snapshot.fairy_meta_at(idx) {
+                if let Ok(val) = serde_json::from_slice::<JsonValue>(bytes) {
+                    let object_id = val.get("object_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let x = val.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let y = val.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let plane = val.get("plane").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let code = val.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let action = val.get("action").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                    // Parse requirements and map to tag indices
+                    let mut reqs = Vec::new();
+                    if let Some(arr) = val.get("requirements").and_then(|v| v.as_array()) {
+                        for ridv in arr {
+                            if let Some(rid) = ridv.as_u64() {
+                                if let Some(&tag_idx) = id_to_idx.get(&(rid as u32)) {
+                                    reqs.push(tag_idx);
+                                } else {
+                                    // Fail-closed: unknown requirement id
+                                    reqs.push(usize::MAX);
+                                    missing_req_ids += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    (object_id, x, y, plane, code, action, reqs)
+                } else {
+                    (0, 0, 0, 0, String::new(), None, Vec::new())
+                }
+            } else {
+                (0, 0, 0, 0, String::new(), None, Vec::new())
+            };
+
+        node_to_ring.insert(node, idx);
+        rings.push(FairyRing {
+            node,
+            object_id,
+            x,
+            y,
+            plane,
+            cost_ms,
+            code,
+            action,
+            req_tag_idxs,
+        });
+    }
+
+    if missing_req_ids > 0 {
+        warn!(missing_req_ids, "fairy ring metadata referenced unknown requirement ids (will be treated as unsatisfied)");
+    }
+
+    info!(fairy_ring_count = rings.len(), "loaded fairy rings from snapshot");
+
+    (rings, node_to_ring)
+}
+
 pub fn run_route(
     snapshot: Arc<Snapshot>,
     neighbors: Arc<NeighborProvider>,
@@ -198,6 +295,23 @@ pub fn run_route_with_requirements(
     goal_id: u32,
     client_reqs: &[(String, serde_json::Value)],
     seed: Option<u64>,
+) -> SearchResult {
+    run_route_with_requirements_and_fairy_rings(
+        snapshot, neighbors, globals, start_id, goal_id, client_reqs, seed,
+        &[], &HashMap::new(),
+    )
+}
+
+pub fn run_route_with_requirements_and_fairy_rings(
+    snapshot: Arc<Snapshot>,
+    neighbors: Arc<NeighborProvider>,
+    globals: Arc<Vec<GlobalTeleport>>,
+    start_id: u32,
+    goal_id: u32,
+    client_reqs: &[(String, serde_json::Value)],
+    seed: Option<u64>,
+    fairy_rings: &[FairyRing],
+    node_to_fairy_ring: &HashMap<u32, usize>,
 ) -> SearchResult {
     // Build eligibility mask from snapshot req tags
     let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
@@ -264,14 +378,32 @@ pub fn run_route_with_requirements(
         }
     }
 
+    // Pre-compute eligible fairy ring destinations (rings whose requirements are satisfied)
+    // For each eligible source ring, we can teleport to any other eligible ring
+    let mut eligible_fairy_dests: Vec<(u32, f32)> = Vec::new();
+    let mut eligible_fairy_sources: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for ring in fairy_rings {
+        let mut allowed = true;
+        for &idx in &ring.req_tag_idxs {
+            if !mask.is_satisfied(idx) {
+                allowed = false;
+                break;
+            }
+        }
+        if allowed {
+            eligible_fairy_sources.insert(ring.node);
+            eligible_fairy_dests.push((ring.node, ring.cost_ms));
+        }
+    }
+
     let nodes = snapshot.counts().nodes as usize;
-    let lm = LandmarkHeuristic { 
-        nodes, 
-        landmarks: snapshot.counts().landmarks as usize, 
-        lm_fw: snapshot.lm_fw(), 
-        lm_bw: snapshot.lm_bw() 
+    let lm = LandmarkHeuristic {
+        nodes,
+        landmarks: snapshot.counts().landmarks as usize,
+        lm_fw: snapshot.lm_fw(),
+        lm_bw: snapshot.lm_bw()
     };
-    
+
     let mut view = EngineView {
         nodes,
         neighbors,
@@ -279,8 +411,21 @@ pub fn run_route_with_requirements(
         extra: None,
     };
 
-    if !eligible_globals.is_empty() {
-        view.extra = Some(Box::new(move |_u: u32| -> Vec<(u32, f32)> { eligible_globals.clone() }));
+    // Combine globals and fairy ring expansion in the extra function
+    let node_to_fairy_ring = node_to_fairy_ring.clone();
+    if !eligible_globals.is_empty() || !eligible_fairy_dests.is_empty() {
+        view.extra = Some(Box::new(move |u: u32| -> Vec<(u32, f32)> {
+            let mut result = eligible_globals.clone();
+            // If u is an eligible fairy ring source, add edges to all other eligible fairy rings
+            if eligible_fairy_sources.contains(&u) {
+                for &(dst_node, cost) in &eligible_fairy_dests {
+                    if dst_node != u {
+                        result.push((dst_node, cost));
+                    }
+                }
+            }
+            result
+        }));
     }
 
     let coords = SnapshotCoords {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{body::Body, http::{Request, StatusCode}};
@@ -49,6 +50,12 @@ fn make_snapshot_file(nodes: usize) -> tempfile::TempPath {
     let landmarks: Vec<u32> = vec![];
     let lm_fw: Vec<f32> = vec![];
     let lm_bw: Vec<f32> = vec![];
+    // Empty fairy ring data for basic tests
+    let fairy_nodes: Vec<u32> = vec![];
+    let fairy_cost_ms: Vec<f32> = vec![];
+    let fairy_meta_offs: Vec<u32> = vec![];
+    let fairy_meta_lens: Vec<u32> = vec![];
+    let fairy_meta_blob: Vec<u8> = vec![];
 
     write_snapshot(
         &path,
@@ -71,6 +78,11 @@ fn make_snapshot_file(nodes: usize) -> tempfile::TempPath {
         &landmarks,
         &lm_fw,
         &lm_bw,
+        &fairy_nodes,
+        &fairy_cost_ms,
+        &fairy_meta_offs,
+        &fairy_meta_lens,
+        &fairy_meta_blob,
     ).expect("write snapshot");
 
     tmp.into_temp_path()
@@ -93,6 +105,8 @@ async fn health_and_route_and_reload() {
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
         coord_index,
+        fairy_rings: Arc::new(Vec::new()),
+        node_to_fairy_ring: Arc::new(HashMap::new()),
     })) };
 
     let app = build_router(state.clone());
@@ -147,6 +161,8 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
         coord_index,
+        fairy_rings: Arc::new(Vec::new()),
+        node_to_fairy_ring: Arc::new(HashMap::new()),
     })) };
 
     let app = build_router(state.clone());

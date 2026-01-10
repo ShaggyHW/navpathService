@@ -639,6 +639,8 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     let snap_arc = snap.clone();
     let neighbors_arc = neighbors.clone();
     let globals_arc = globals.clone();
+    let fairy_rings_arc = cur.fairy_rings.clone();
+    let node_to_fairy_ring_arc = cur.node_to_fairy_ring.clone();
     let seed = req.seed;
 
     let used_virtual_start_for_search = used_virtual_start;
@@ -653,7 +655,10 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                 seed,
             )
         } else {
-            (engine_adapter::run_route_with_requirements(snap_arc, neighbors_arc, globals_arc, sid, gid, &client_reqs, seed), None)
+            (engine_adapter::run_route_with_requirements_and_fairy_rings(
+                snap_arc, neighbors_arc, globals_arc, sid, gid, &client_reqs, seed,
+                &fairy_rings_arc, &node_to_fairy_ring_arc,
+            ), None)
         }
     }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -892,13 +897,36 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                             }));
                         }
                     } else {
-                        // Fallback: unknown edge kind; emit as generic teleport with zero cost
-                        acts.push(serde_json::json!({
-                            "type": "teleport",
-                            "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
-                            "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
-                            "cost_ms": 0
-                        }));
+                        // Check if this is a fairy ring hop (u and v are both fairy ring nodes)
+                        let src_ring_idx = cur.node_to_fairy_ring.get(&u);
+                        let dst_ring_idx = cur.node_to_fairy_ring.get(&v);
+                        if let (Some(&src_idx), Some(&dst_idx)) = (src_ring_idx, dst_ring_idx) {
+                            // Fairy ring teleport
+                            let src_ring = &cur.fairy_rings[src_idx];
+                            let dst_ring = &cur.fairy_rings[dst_idx];
+                            let mut meta = serde_json::Map::new();
+                            meta.insert("source_code".to_string(), serde_json::Value::String(src_ring.code.clone()));
+                            meta.insert("destination_code".to_string(), serde_json::Value::String(dst_ring.code.clone()));
+                            if let Some(ref action) = dst_ring.action {
+                                meta.insert("action".to_string(), serde_json::Value::String(action.clone()));
+                            }
+                            acts.push(serde_json::json!({
+                                "type": "fairy_ring",
+                                "from": {"min": [x1,y1,p1], "max": [x1,y1,p1], "object_id": src_ring.object_id},
+                                "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                                "code": dst_ring.code,
+                                "cost_ms": dst_ring.cost_ms,
+                                "metadata": serde_json::Value::Object(meta)
+                            }));
+                        } else {
+                            // Fallback: unknown edge kind; emit as generic teleport with zero cost
+                            acts.push(serde_json::json!({
+                                "type": "teleport",
+                                "from": {"min": [x1,y1,p1], "max": [x1,y1,p1]},
+                                "to":   {"min": [x2,y2,p2], "max": [x2,y2,p2]},
+                                "cost_ms": 0
+                            }));
+                        }
                     }
                 }
             }
@@ -971,6 +999,8 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
             let idx = Arc::new(crate::build_coord_index(&new_snap));
             // Pre-compute neighbors and globals
             let (neighbors, globals, macro_lookup) = crate::engine_adapter::build_neighbor_provider(&new_snap);
+            // Pre-compute fairy rings
+            let (fairy_rings, node_to_fairy_ring) = crate::engine_adapter::build_fairy_rings(&new_snap);
             let new_state = SnapshotState {
                 path: path.clone(),
                 snapshot: Some(Arc::new(new_snap)),
@@ -980,6 +1010,8 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
                 loaded_at_unix: crate::now_unix(),
                 snapshot_hash_hex: new_hash.clone(),
                 coord_index: Some(idx),
+                fairy_rings: Arc::new(fairy_rings),
+                node_to_fairy_ring: Arc::new(node_to_fairy_ring),
             };
             state.current.store(Arc::new(new_state));
             info!(path=?path, hash=?new_hash, "reloaded snapshot");

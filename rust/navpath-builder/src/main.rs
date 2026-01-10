@@ -13,7 +13,7 @@ use navpath_core::snapshot::write_snapshot;
 
 mod build;
 use build::graph::compile_walk_edges;
-use build::load_sqlite::load_all_tiles;
+use build::load_sqlite::{load_all_tiles, load_fairy_rings};
 use build::chains::{flatten_chains, flatten_global_chains};
 use build::requirements::compile_requirement_tags;
 use build::landmarks::compute_alt_tables;
@@ -472,6 +472,45 @@ fn main() -> Result<()> {
         )
     } else { (Vec::new(), Vec::new()) };
 
+    // Load Fairy Rings
+    let fairy_ring_rows = load_fairy_rings(&conn, &node_id_of).unwrap_or_else(|e| {
+        // Fail-soft: log warning and proceed with empty list if table doesn't exist
+        tracing::warn!(error = ?e, "failed to load fairy rings (table may not exist); proceeding with empty list");
+        Vec::new()
+    });
+    info!(count = fairy_ring_rows.len(), "loaded fairy rings from SQLite");
+
+    // Encode Fairy Rings into snapshot sections
+    let mut fairy_nodes: Vec<u32> = Vec::with_capacity(fairy_ring_rows.len());
+    let mut fairy_cost_ms: Vec<f32> = Vec::with_capacity(fairy_ring_rows.len());
+    let mut fairy_meta_offs: Vec<u32> = Vec::with_capacity(fairy_ring_rows.len());
+    let mut fairy_meta_lens: Vec<u32> = Vec::with_capacity(fairy_ring_rows.len());
+    let mut fairy_meta_blob: Vec<u8> = Vec::new();
+
+    for ring in &fairy_ring_rows {
+        fairy_nodes.push(ring.node_id);
+        fairy_cost_ms.push(ring.cost);
+
+        // Build per-ring JSON metadata
+        let mut meta_obj = serde_json::Map::new();
+        meta_obj.insert("object_id".to_string(), serde_json::Value::from(ring.object_id));
+        meta_obj.insert("x".to_string(), serde_json::Value::from(ring.x));
+        meta_obj.insert("y".to_string(), serde_json::Value::from(ring.y));
+        meta_obj.insert("plane".to_string(), serde_json::Value::from(ring.plane));
+        meta_obj.insert("code".to_string(), serde_json::Value::String(ring.code.clone()));
+        meta_obj.insert("action".to_string(), ring.action.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+        meta_obj.insert("requirements".to_string(), serde_json::Value::from(ring.requirements.clone()));
+        meta_obj.insert("next_node_type".to_string(), ring.next_node_type.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+        meta_obj.insert("next_node_id".to_string(), ring.next_node_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+
+        let meta = serde_json::Value::Object(meta_obj);
+        let bytes = serde_json::to_vec(&meta).unwrap_or_else(|_| b"{}".to_vec());
+        let off = fairy_meta_blob.len() as u32;
+        fairy_meta_offs.push(off);
+        fairy_meta_lens.push(bytes.len() as u32);
+        fairy_meta_blob.extend_from_slice(&bytes);
+    }
+
     // Write snapshot
     let res = write_snapshot(
         &args.out_snapshot,
@@ -494,6 +533,11 @@ fn main() -> Result<()> {
         &landmarks,
         &lm_fw,
         &lm_bw,
+        &fairy_nodes,
+        &fairy_cost_ms,
+        &fairy_meta_offs,
+        &fairy_meta_lens,
+        &fairy_meta_blob,
     );
 
     match res {

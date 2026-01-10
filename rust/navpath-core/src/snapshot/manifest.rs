@@ -1,7 +1,7 @@
 use byteorder::{ByteOrder, LittleEndian};
 
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"NPSS"; // NavPath SnapShot
-pub const SNAPSHOT_VERSION: u32 = 5;
+pub const SNAPSHOT_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotCounts {
@@ -10,6 +10,7 @@ pub struct SnapshotCounts {
     pub macro_edges: u32,
     pub req_tags: u32,     // number of u32 entries (not necessarily triplets)
     pub landmarks: u32,
+    pub fairy_rings: u32,  // number of fairy ring nodes
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,10 +36,16 @@ pub struct Manifest {
     pub off_landmarks: u64,
     pub off_lm_fw: u64,
     pub off_lm_bw: u64,
+    // Fairy Ring sections (v6+)
+    pub off_fairy_nodes: u64,
+    pub off_fairy_cost_ms: u64,
+    pub off_fairy_meta_offs: u64,
+    pub off_fairy_meta_lens: u64,
+    pub off_fairy_meta_blob: u64,
 }
 
 impl Manifest {
-    pub const SIZE: usize = 4 /*magic*/ + 4 /*version*/ + 5*4 /*counts*/ + 19*8 /*offsets*/;
+    pub const SIZE: usize = 4 /*magic*/ + 4 /*version*/ + 6*4 /*counts*/ + 24*8 /*offsets*/;
 
     pub fn parse(header: &[u8]) -> Result<Self, ManifestError> {
         if header.len() < Self::SIZE { return Err(ManifestError::HeaderTooSmall); }
@@ -51,7 +58,8 @@ impl Manifest {
         let macro_edges = LittleEndian::read_u32(&header[c0+8..c0+12]);
         let req_tags = LittleEndian::read_u32(&header[c0+12..c0+16]);
         let landmarks = LittleEndian::read_u32(&header[c0+16..c0+20]);
-        let o0 = c0 + 20;
+        let fairy_rings = LittleEndian::read_u32(&header[c0+20..c0+24]);
+        let o0 = c0 + 24;
         let off_nodes_ids = LittleEndian::read_u64(&header[o0..o0+8]);
         let off_nodes_x = LittleEndian::read_u64(&header[o0+8..o0+16]);
         let off_nodes_y = LittleEndian::read_u64(&header[o0+16..o0+24]);
@@ -71,9 +79,14 @@ impl Manifest {
         let off_landmarks = LittleEndian::read_u64(&header[o0+128..o0+136]);
         let off_lm_fw = LittleEndian::read_u64(&header[o0+136..o0+144]);
         let off_lm_bw = LittleEndian::read_u64(&header[o0+144..o0+152]);
+        let off_fairy_nodes = LittleEndian::read_u64(&header[o0+152..o0+160]);
+        let off_fairy_cost_ms = LittleEndian::read_u64(&header[o0+160..o0+168]);
+        let off_fairy_meta_offs = LittleEndian::read_u64(&header[o0+168..o0+176]);
+        let off_fairy_meta_lens = LittleEndian::read_u64(&header[o0+176..o0+184]);
+        let off_fairy_meta_blob = LittleEndian::read_u64(&header[o0+184..o0+192]);
         Ok(Manifest {
             version,
-            counts: SnapshotCounts { nodes, walk_edges, macro_edges, req_tags, landmarks },
+            counts: SnapshotCounts { nodes, walk_edges, macro_edges, req_tags, landmarks, fairy_rings },
             off_nodes_ids,
             off_nodes_x,
             off_nodes_y,
@@ -93,6 +106,11 @@ impl Manifest {
             off_landmarks,
             off_lm_fw,
             off_lm_bw,
+            off_fairy_nodes,
+            off_fairy_cost_ms,
+            off_fairy_meta_offs,
+            off_fairy_meta_lens,
+            off_fairy_meta_blob,
         })
     }
 
@@ -122,6 +140,12 @@ impl Manifest {
         let alt_table_bytes = (self.counts.nodes as usize)
             .saturating_mul(self.counts.landmarks as usize)
             .saturating_mul(f32b);
+        // Fairy ring sections
+        let fairy_nodes_bytes = (self.counts.fairy_rings as usize) * u32b;
+        let fairy_cost_bytes = (self.counts.fairy_rings as usize) * f32b;
+        let fairy_meta_offs_bytes = (self.counts.fairy_rings as usize) * u32b;
+        let fairy_meta_lens_bytes = (self.counts.fairy_rings as usize) * u32b;
+
         if !fits(self.off_nodes_ids, nodes_bytes_u32, file_len) { return Err(ManifestError::OutOfBounds("nodes_ids")); }
         if !fits(self.off_nodes_x, nodes_bytes_i32, file_len) { return Err(ManifestError::OutOfBounds("nodes_x")); }
         if !fits(self.off_nodes_y, nodes_bytes_i32, file_len) { return Err(ManifestError::OutOfBounds("nodes_y")); }
@@ -145,6 +169,15 @@ impl Manifest {
             if !fits(self.off_lm_fw, alt_table_bytes, file_len) { return Err(ManifestError::OutOfBounds("lm_fw")); }
             if !fits(self.off_lm_bw, alt_table_bytes, file_len) { return Err(ManifestError::OutOfBounds("lm_bw")); }
         }
+        // Fairy ring sections (may be zero-sized if fairy_rings == 0)
+        if self.counts.fairy_rings > 0 {
+            if !fits(self.off_fairy_nodes, fairy_nodes_bytes, file_len) { return Err(ManifestError::OutOfBounds("fairy_nodes")); }
+            if !fits(self.off_fairy_cost_ms, fairy_cost_bytes, file_len) { return Err(ManifestError::OutOfBounds("fairy_cost_ms")); }
+            if !fits(self.off_fairy_meta_offs, fairy_meta_offs_bytes, file_len) { return Err(ManifestError::OutOfBounds("fairy_meta_offs")); }
+            if !fits(self.off_fairy_meta_lens, fairy_meta_lens_bytes, file_len) { return Err(ManifestError::OutOfBounds("fairy_meta_lens")); }
+        }
+        // fairy_meta_blob can be variable length; ensure start is within file
+        if (self.off_fairy_meta_blob as usize) > file_len { return Err(ManifestError::OutOfBounds("fairy_meta_blob")); }
         Ok(())
     }
 }

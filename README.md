@@ -53,9 +53,9 @@ Response if tile doesn't exist:
 curl -s http://127.0.0.1:8080/route \
   -H 'content-type: application/json' \
   -d '{
-    "start": {"wx": 3296, "wy": 3184, "plane": 0},
-    "goal":  {"wx": 3435, "wy": 3082, "plane": 0},
-    "profile": {"requirements": [{"key":"coins","value":100},{"key":"hasDungCape","value":1},{"key":"varp_2102","value":15}]},
+    "start": {"wx": 3259, "wy": 3101, "plane": 0},
+    "goal":  {"wx": 3425, "wy": 3017, "plane": 0},
+    "profile": {"requirements": [{"key":"coins","value":100},{"key":"hasDungCape","value":1},{"key":"varp_2102","value":15},{"key":"varbit_9928","value":180}]},
     "options": {"return_geometry": false, "only_actions": true},
     "surge": {
     "enabled": true,

@@ -1,84 +1,3 @@
--- ========== TABLES ==========
-
---CREATE TABLE IF NOT EXISTS abstract_teleport_edges (
---  edge_id INTEGER PRIMARY KEY,
---  kind TEXT NOT NULL
---       CHECK (kind IN ('door','lodestone','npc','object','item','ifslot')),
---  node_id INTEGER NOT NULL,
-
---  -- abstract graph geometry
---  src_x INTEGER,
---  src_y INTEGER,
---  src_plane INTEGER,
---  dst_x INTEGER NOT NULL,
---  dst_y INTEGER NOT NULL,
---  dst_plane INTEGER NOT NULL,
-
---  -- planning metadata
---  cost INTEGER NOT NULL CHECK (cost >= 0),
---  requirements TEXT,
---  src_entrance INTEGER,
---  dst_entrance INTEGER,
-
---  -- ensure one concrete node maps to at most one abstract edge
---  UNIQUE(kind, node_id)
---);
-
---CREATE TABLE clusters (
---    cluster_id INTEGER PRIMARY KEY,
---    plane INTEGER NOT NULL,
---    label INTEGER,
---    tile_count INTEGER
---);
-
---CREATE TABLE cluster_entrances (
---    entrance_id INTEGER PRIMARY KEY,
---    cluster_id INTEGER NOT NULL REFERENCES clusters(cluster_id),
---    x INTEGER NOT NULL,
---    y INTEGER NOT NULL,
---    plane INTEGER NOT NULL,
---    neighbor_dir TEXT NOT NULL CHECK (neighbor_dir IN ('N','S','E','W','TP')),
---    teleport_edge_id INTEGER REFERENCES abstract_teleport_edges(edge_id),
---    UNIQUE (cluster_id, x, y, plane, neighbor_dir)
---);
-
---CREATE TABLE cluster_interconnections (
---    entrance_from INTEGER NOT NULL,
---    entrance_to INTEGER NOT NULL,
---    cost INTEGER NOT NULL,
---    PRIMARY KEY (entrance_from, entrance_to),
---    FOREIGN KEY (entrance_from) REFERENCES cluster_entrances(entrance_id),
---    FOREIGN KEY (entrance_to) REFERENCES cluster_entrances(entrance_id),
---    CONSTRAINT chk_cc_cost_nonneg CHECK (cost >= 0)
---);
-
---CREATE TABLE cluster_intraconnections (
---    entrance_from INTEGER NOT NULL,
---    entrance_to INTEGER NOT NULL,
---    cost INTEGER NOT NULL,
---    path_blob BLOB,
---    PRIMARY KEY (entrance_from, entrance_to),
---    FOREIGN KEY (entrance_from) REFERENCES cluster_entrances(entrance_id),
---    FOREIGN KEY (entrance_to) REFERENCES cluster_entrances(entrance_id),
---     CONSTRAINT chk_ci_cost_nonneg CHECK (cost >= 0)
---);
-
---CREATE TABLE cluster_tiles (
---    cluster_id INTEGER NOT NULL REFERENCES clusters(cluster_id),
---    x INTEGER NOT NULL,
---    y INTEGER NOT NULL,
---    plane INTEGER NOT NULL,
---    PRIMARY KEY (cluster_id, x, y, plane)
---);
-
---CREATE TABLE meta (
---  key   TEXT PRIMARY KEY
---        CHECK (key IN (
---          'schema_version','tileset_version','map_build_at',
---          'generator_commit', 'coordinate_origin'
---        )),
---  value TEXT NOT NULL
---);
 
 
 CREATE TABLE teleports_door_nodes (
@@ -197,6 +116,20 @@ CREATE TABLE teleports_object_nodes (
     requirements TEXT
 );
 
+CREATE TABLE teleports_fairy_rings_nodes (
+    id INTEGER PRIMARY KEY,
+    object_id INTEGER,
+    x INTEGER,
+    y INTEGER,
+    plane INTEGER,
+    cost INTEGER,
+    code TEXT,
+    action TEXT,
+    next_node_type TEXT,
+    next_node_id INTEGER,
+    requirements TEXT
+);
+
 CREATE TABLE teleports_requirements (
     id INTEGER PRIMARY KEY,
     metaInfo TEXT,
@@ -257,6 +190,7 @@ CREATE INDEX IF NOT EXISTS idx_tobj_req  ON teleports_object_nodes(requirements)
 CREATE INDEX IF NOT EXISTS idx_titem_req ON teleports_item_nodes(requirements);
 CREATE INDEX IF NOT EXISTS idx_tif_req   ON teleports_ifslot_nodes(requirements);
 CREATE INDEX IF NOT EXISTS idx_tlode_req ON teleports_lodestone_nodes(requirements);
+CREATE INDEX IF NOT EXISTS idx_tfairy_req ON teleports_fairy_rings_nodes(requirements);
 
 -- ========== VIEW ==========
 

@@ -4,7 +4,7 @@ use arc_swap::ArcSwap;
 use axum::{routing::{get, post}, Router};
 use navpath_core::{Snapshot, NeighborProvider};
 
-use crate::engine_adapter::GlobalTeleport;
+use crate::engine_adapter::{GlobalTeleport, FairyRing};
 
 pub mod routes;
 pub mod engine_adapter;
@@ -19,6 +19,9 @@ pub struct SnapshotState {
     pub loaded_at_unix: u64,
     pub snapshot_hash_hex: Option<String>,
     pub coord_index: Option<Arc<HashMap<(i32,i32,i32), u32>>>,
+    // Fairy Ring data
+    pub fairy_rings: Arc<Vec<FairyRing>>,
+    pub node_to_fairy_ring: Arc<HashMap<u32, usize>>,
 }
 
 #[derive(Clone)]
