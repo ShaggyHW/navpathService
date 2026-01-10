@@ -14,6 +14,21 @@ pub struct SearchParams<'a, C: OctileCoords> {
     pub coords: Option<&'a C>,
     pub mask: Option<&'a EligibilityMask>,
     pub quick_tele: bool,
+    /// Optional seed for path randomization. If Some, adds deterministic jitter to edge weights.
+    pub seed: Option<u64>,
+}
+
+/// Simple hash function for deterministic jitter based on edge and seed
+#[inline]
+fn edge_jitter(seed: u64, from: u32, to: u32) -> f32 {
+    // FNV-1a inspired hash combining seed, from, and to
+    let mut h = seed;
+    h ^= from as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    h ^= to as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    // Convert to small jitter in range [0, 0.1)
+    ((h & 0xFFFF) as f32) / 655360.0
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +151,7 @@ mod tests {
             lm_fw, lm_bw, 0,
         );
         let mut ctx = SearchContext::new(nodes);
-        let res = view.astar(SearchParams { start: 0, goal: 2, coords: Some(&NoCoords), mask: None, quick_tele: false }, &mut ctx);
+        let res = view.astar(SearchParams { start: 0, goal: 2, coords: Some(&NoCoords), mask: None, quick_tele: false, seed: None }, &mut ctx);
         assert!(res.found);
         assert_eq!(res.path, vec![0,1,2]);
         assert!((res.cost - 2.0).abs() < 1e-6);
@@ -227,7 +242,12 @@ impl<'a> EngineView<'a> {
                 };
 
                 let v = v_id as usize;
-                let ng = gcur + w;
+                // Add deterministic jitter if seed is provided
+                let w_jittered = match params.seed {
+                    Some(seed) => w + edge_jitter(seed, id, v_id),
+                    None => w,
+                };
+                let ng = gcur + w_jittered;
                 if ng < ctx.get_g(v) {
                     ctx.set_g(v, ng);
                     ctx.set_parent(v, id);

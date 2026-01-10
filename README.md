@@ -27,18 +27,63 @@ export RUST_LOG=info
 cargo run -p navpath-service --release
 ```
 
-How to do a request, it will save to a file aswell.
+## API Endpoints
+
+### Check if a tile exists
+
+Check whether a tile exists (is walkable) at the given coordinates.
+
+```sh
+curl -s "http://127.0.0.1:8080/tile/exists?x=2994&y=3280&plane=0"
+```
+
+Response if tile exists:
+```json
+{"exists": true, "node_id": 12345}
+```
+
+Response if tile doesn't exist:
+```json
+{"exists": false}
+```
+
+### Calculate a route
 
 ```sh
 curl -s http://127.0.0.1:8080/route \
   -H 'content-type: application/json' \
   -d '{
-    "start": {"wx": 3225, "wy": 3902, "plane": 0},
-    "goal":  {"wx": 2885, "wy": 2951, "plane": 0},
-    "profile": {"requirements": [{"key":"coins","value":100}]},
-    "options": {"return_geometry": false, "only_actions": true}
+    "start": {"wx": 3296, "wy": 3184, "plane": 0},
+    "goal":  {"wx": 3435, "wy": 3082, "plane": 0},
+    "profile": {"requirements": [{"key":"coins","value":100},{"key":"hasDungCape","value":1},{"key":"varp_2102","value":15}]},
+    "options": {"return_geometry": false, "only_actions": true},
+    "surge": {
+    "enabled": true,
+    "charges": 2,
+    "cooldown_ms": 20400
+  },
+  "dive": {
+    "enabled": true,
+    "cooldown_ms": 20400
+  }
   }'
 ```
+
+### Path Randomization
+
+You can add a `seed` parameter to get different paths for the same start/goal. Same seed = same path. Different seeds = different paths (when alternatives exist).
+
+```sh
+curl -s http://127.0.0.1:8080/route \
+  -H 'content-type: application/json' \
+  -d '{
+    "start": {"wx": 3296, "wy": 3184, "plane": 0},
+    "goal":  {"wx": 3435, "wy": 3082, "plane": 0},
+    "seed": 12345
+  }'
+```
+
+If no seed is provided, the same optimal path is always returned. With a seed, small random jitter is added to edge weights to explore alternative routes.
 
 You can check the rest of the keys in the worldReachableTiles.db TeleportRequirement Tables. if more keys are passed more connections will become available.
 

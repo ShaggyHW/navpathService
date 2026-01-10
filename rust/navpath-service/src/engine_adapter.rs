@@ -184,10 +184,10 @@ pub fn run_route(
     snapshot: Arc<Snapshot>,
     neighbors: Arc<NeighborProvider>,
     globals: Arc<Vec<GlobalTeleport>>,
-    start_id: u32, 
+    start_id: u32,
     goal_id: u32
 ) -> SearchResult {
-    run_route_with_requirements(snapshot, neighbors, globals, start_id, goal_id, &[])
+    run_route_with_requirements(snapshot, neighbors, globals, start_id, goal_id, &[], None)
 }
 
 pub fn run_route_with_requirements(
@@ -197,6 +197,7 @@ pub fn run_route_with_requirements(
     start_id: u32,
     goal_id: u32,
     client_reqs: &[(String, serde_json::Value)],
+    seed: Option<u64>,
 ) -> SearchResult {
     // Build eligibility mask from snapshot req tags
     let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
@@ -290,7 +291,7 @@ pub fn run_route_with_requirements(
 
     SEARCH_CONTEXT.with(|ctx_cell| {
         let mut ctx = ctx_cell.borrow_mut();
-        view.astar(SearchParams { start: start_id, goal: goal_id, coords: Some(&coords), mask: Some(&mask), quick_tele }, &mut ctx)
+        view.astar(SearchParams { start: start_id, goal: goal_id, coords: Some(&coords), mask: Some(&mask), quick_tele, seed }, &mut ctx)
     })
 }
 
@@ -300,6 +301,7 @@ pub fn run_route_with_requirements_virtual_start(
     globals: Arc<Vec<GlobalTeleport>>,
     goal_id: u32,
     client_reqs: &[(String, serde_json::Value)],
+    seed: Option<u64>,
 ) -> (SearchResult, Option<u32>) {
     let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
     let mut client_pairs: Vec<(String, ClientValue)> = Vec::with_capacity(client_reqs.len());
@@ -379,7 +381,7 @@ pub fn run_route_with_requirements_virtual_start(
 
         for (dst, tele_cost) in eligible_globals.into_iter() {
             let res = view.astar(
-                SearchParams { start: dst, goal: goal_id, coords: Some(&coords), mask: Some(&mask), quick_tele },
+                SearchParams { start: dst, goal: goal_id, coords: Some(&coords), mask: Some(&mask), quick_tele, seed },
                 &mut ctx,
             );
             if !res.found {

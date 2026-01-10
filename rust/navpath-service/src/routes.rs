@@ -463,6 +463,8 @@ pub struct RouteRequest {
     // Surge and Dive abilities
     #[serde(default)] pub surge: SurgeConfig,
     #[serde(default)] pub dive: DiveConfig,
+    /// Optional seed for path randomization. Same seed = same path. Different seeds = potentially different paths.
+    #[serde(default)] pub seed: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -637,6 +639,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     let snap_arc = snap.clone();
     let neighbors_arc = neighbors.clone();
     let globals_arc = globals.clone();
+    let seed = req.seed;
 
     let used_virtual_start_for_search = used_virtual_start;
     let res_and_entry = tokio::task::spawn_blocking(move || {
@@ -647,9 +650,10 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                 globals_arc,
                 gid,
                 &client_reqs,
+                seed,
             )
         } else {
-            (engine_adapter::run_route_with_requirements(snap_arc, neighbors_arc, globals_arc, sid, gid, &client_reqs), None)
+            (engine_adapter::run_route_with_requirements(snap_arc, neighbors_arc, globals_arc, sid, gid, &client_reqs, seed), None)
         }
     }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
