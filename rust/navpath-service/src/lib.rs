@@ -51,6 +51,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(routes::health))
         .route("/healthz", get(routes::health))
         .route("/route", post(routes::route))
+        .route("/tile/exists", get(routes::tile_exists))
         .route("/admin/reload", post(routes::reload))
         .with_state(state)
 }

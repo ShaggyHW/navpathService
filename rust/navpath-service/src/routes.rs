@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::{Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use navpath_core::eligibility::{build_mask_from_u32, ClientValue};
@@ -493,6 +493,22 @@ pub struct RouteResponse {
     #[serde(skip_serializing_if = "Option::is_none")] pub geometry: Option<Vec<serde_json::Value>>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TileExistsQuery {
+    pub x: i32,
+    pub y: i32,
+    pub plane: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TileExistsResponse {
+    pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walk_mask: Option<u8>,
+}
+
 pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let cur = state.current.load();
     let counts = cur.snapshot.as_ref().map(|s| s.counts()).map(|c| Counts {
@@ -509,6 +525,35 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         loaded_at: cur.loaded_at_unix,
         counts,
     })
+}
+
+pub async fn tile_exists(
+    State(state): State<AppState>,
+    Query(params): Query<TileExistsQuery>,
+) -> Result<Json<TileExistsResponse>, (StatusCode, String)> {
+    let cur = state.current.load();
+
+    let Some(coord_index) = cur.coord_index.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coordinate index not loaded".into(),
+        ));
+    };
+
+    match coord_index.get(&(params.x, params.y, params.plane)) {
+        Some(&node_id) => {
+            Ok(Json(TileExistsResponse {
+                exists: true,
+                node_id: Some(node_id),
+                walk_mask: None, // tiles.bin not currently loaded into state
+            }))
+        }
+        None => Ok(Json(TileExistsResponse {
+            exists: false,
+            node_id: None,
+            walk_mask: None,
+        })),
+    }
 }
 
 pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>) -> Result<Json<RouteResponse>, (StatusCode, String)> {
