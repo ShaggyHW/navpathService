@@ -1,7 +1,9 @@
 use byteorder::{ByteOrder, LittleEndian};
 
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"NPSS"; // NavPath SnapShot
-pub const SNAPSHOT_VERSION: u32 = 6;
+// v7: landmark distance tables (lm_fw/lm_bw) switched from landmark-major to node-major
+// layout for cache-friendly ALT heuristic reads. Snapshots must be rebuilt.
+pub const SNAPSHOT_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotCounts {

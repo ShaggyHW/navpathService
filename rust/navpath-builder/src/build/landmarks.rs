@@ -42,17 +42,20 @@ pub fn compute_alt_tables(
     let mut lm_fw = vec![f32::INFINITY; nodes * lm_count];
     let mut lm_bw = vec![f32::INFINITY; nodes * lm_count];
 
+    // Tables are stored node-major: node `n`'s landmark distances are contiguous at
+    // `[n * lm_count, n * lm_count + lm_count)`. This matches the reader's cache-friendly
+    // layout (see navpath-core `LandmarkHeuristic`).
     for (li, &lmid) in landmarks.iter().enumerate() {
         let src = lmid as usize;
         // forward distances: from landmark to nodes
         let df = dijkstra(&adj_fwd, src);
         for n in 0..nodes {
-            lm_fw[li * nodes + n] = df[n];
+            lm_fw[n * lm_count + li] = df[n];
         }
         // backward distances: to landmark (run on reverse graph)
         let db = dijkstra(&adj_rev, src);
         for n in 0..nodes {
-            lm_bw[li * nodes + n] = db[n];
+            lm_bw[n * lm_count + li] = db[n];
         }
     }
 

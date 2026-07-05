@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::snapshot::Snapshot;
 use crate::eligibility::EligibilityMask;
 
-use super::heuristics::{LandmarkHeuristic, OctileCoords, octile};
+use super::heuristics::{LandmarkHeuristic, OctileCoords, octile, ACTIVE_LANDMARKS};
 use super::neighbors::NeighborProvider;
 
 pub struct SearchParams<'a, C: OctileCoords> {
@@ -222,8 +222,14 @@ impl<'a> EngineView<'a> {
         
         ctx.reset(n);
         ctx.set_g(start, 0.0);
-        
-        let h0 = self.lm.h(params.start, params.goal) + params.coords.map(|c| octile(c, params.start, params.goal)).unwrap_or(0.0);
+
+        // Pick the best landmarks for this (start, goal) pair once, and cache the goal's
+        // landmark row inside the returned selection. Every heuristic call below evaluates
+        // only these active landmarks, keeping the ALT bound admissible while cutting the
+        // per-node cost from all landmarks to a small constant.
+        let active = self.lm.select_active(params.start, params.goal, ACTIVE_LANDMARKS);
+
+        let h0 = self.lm.h_active(params.start, &active) + params.coords.map(|c| octile(c, params.start, params.goal)).unwrap_or(0.0);
         ctx.open.push(Key { f: h0, g: 0.0, id: params.start });
         ctx.set_in_open(start, true);
 
@@ -286,7 +292,7 @@ impl<'a> EngineView<'a> {
                 if ng < ctx.get_g(v) {
                     ctx.set_g(v, ng);
                     ctx.set_parent(v, id);
-                    let h = self.lm.h(v_id, params.goal) + params.coords.map(|c| octile(c, v_id, params.goal)).unwrap_or(0.0);
+                    let h = self.lm.h_active(v_id, &active) + params.coords.map(|c| octile(c, v_id, params.goal)).unwrap_or(0.0);
                     let f = ng + h;
                     let key = Key { f, g: ng, id: v_id };
                     ctx.open.push(key);
