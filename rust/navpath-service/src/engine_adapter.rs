@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -12,6 +13,19 @@ use tracing::{info, warn};
 
 thread_local! {
     static SEARCH_CONTEXT: RefCell<SearchContext> = RefCell::new(SearchContext::new(0));
+}
+
+/// Whether per-request requirement diagnostics are enabled, controlled by the
+/// `NAVPATH_DEBUG_REQS` env var (`1`/`true`). Cached once so the hot path never
+/// performs an env lookup.
+fn req_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NAVPATH_DEBUG_REQS").ok().as_deref().map(str::trim),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
 }
 
 struct SnapshotCoords<'a> {
@@ -337,27 +351,31 @@ pub fn run_route_with_requirements_and_fairy_rings(
         }),
     );
 
-    if let Some((k, v)) = client_reqs
-        .iter()
-        .find(|(k, _)| k.trim().eq_ignore_ascii_case("hasGamesNeck"))
-    {
-        info!(key = %k, value = %v, "client requirement");
-    }
-
-    // Diagnostics: show computed satisfaction for requirement id 78 (expected key=hasGamesNeck, value=1)
-    let mut i = 0usize;
-    while i + 3 < req_words.len() {
-        if req_words[i] == 78 {
-            let tag_idx = i / 4;
-            let key_id = req_words[i + 1];
-            let opbits = req_words[i + 2];
-            let rhs_val = req_words[i + 3];
-            let expected_key_id = fnv1a32("hasgamesneck");
-            let key_matches = key_id == expected_key_id;
-            info!(tag_idx, key_id, expected_key_id, key_matches, opbits, rhs_val, satisfied = mask.is_satisfied(tag_idx), "req_id 78 evaluation");
-            break;
+    // Per-request requirement diagnostics, gated behind NAVPATH_DEBUG_REQS=1 so the hot
+    // path skips this scan/logging by default. Enable when debugging requirement matching.
+    if req_debug_enabled() {
+        if let Some((k, v)) = client_reqs
+            .iter()
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("hasGamesNeck"))
+        {
+            info!(key = %k, value = %v, "client requirement");
         }
-        i += 4;
+
+        // Diagnostics: show computed satisfaction for requirement id 78 (expected key=hasGamesNeck, value=1)
+        let mut i = 0usize;
+        while i + 3 < req_words.len() {
+            if req_words[i] == 78 {
+                let tag_idx = i / 4;
+                let key_id = req_words[i + 1];
+                let opbits = req_words[i + 2];
+                let rhs_val = req_words[i + 3];
+                let expected_key_id = fnv1a32("hasgamesneck");
+                let key_matches = key_id == expected_key_id;
+                info!(tag_idx, key_id, expected_key_id, key_matches, opbits, rhs_val, satisfied = mask.is_satisfied(tag_idx), "req_id 78 evaluation");
+                break;
+            }
+            i += 4;
+        }
     }
 
     let quick_tele = has_quick_tele(client_reqs);

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use axum::{extract::{Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,19 @@ use tracing::{info, warn};
 use navpath_core::eligibility::{build_mask_from_u32, ClientValue};
 
 use crate::{engine_adapter, AppState, SnapshotState};
+
+/// Optional path to dump each route response as pretty JSON, controlled by the
+/// `NAVPATH_DUMP_RESULT` env var. Disabled unless the var is set to a non-empty path.
+/// Cached once so the hot path never performs an env lookup.
+fn result_dump_path() -> Option<&'static std::path::Path> {
+    static DUMP_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DUMP_PATH
+        .get_or_init(|| match std::env::var("NAVPATH_DUMP_RESULT") {
+            Ok(p) if !p.trim().is_empty() => Some(std::path::PathBuf::from(p)),
+            _ => None,
+        })
+        .as_deref()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RequirementKV {
@@ -972,8 +986,10 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         actions,
         geometry,
     };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&resp) {
-        let _ = std::fs::write("/home/query/Dev/navpathService/result.json", bytes);
+    if let Some(dump_path) = result_dump_path() {
+        if let Ok(bytes) = serde_json::to_vec_pretty(&resp) {
+            let _ = std::fs::write(dump_path, bytes);
+        }
     }
     info!(
         duration_ms = duration_ms,
