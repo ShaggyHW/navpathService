@@ -14,8 +14,10 @@ use navpath_service::{
     env_var,
     read_tail_hash_hex,
     now_unix,
-    build_coord_index,
 };
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,9 +42,8 @@ async fn main() -> Result<()> {
 
     // Provide not-ready state if snapshot failed to load
     let hash_hex = read_tail_hash_hex(&snapshot_path);
-    let coord_index = snapshot.as_ref().map(|s| Arc::new(build_coord_index(s)));
-    let init = SnapshotState { path: snapshot_path.clone(), snapshot, neighbors, globals, macro_lookup, loaded_at_unix: now_unix(), snapshot_hash_hex: hash_hex, coord_index, fairy_rings, node_to_fairy_ring };
-    let state = AppState { current: Arc::new(ArcSwap::from_pointee(init)) };
+    let init = SnapshotState { path: snapshot_path.clone(), snapshot, neighbors, globals, macro_lookup, loaded_at_unix: now_unix(), snapshot_hash_hex: hash_hex, fairy_rings, node_to_fairy_ring };
+    let state = AppState { current: Arc::new(ArcSwap::from_pointee(init)), search_permits: navpath_service::default_search_permits() };
 
     let app = build_router(state.clone());
     let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap();

@@ -3,12 +3,17 @@ use std::sync::OnceLock;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use navpath_core::{EngineView, SearchParams, SearchResult, Snapshot, NeighborProvider};
+use navpath_core::{EngineView, SearchParams, SearchResult, SearchStatus, Snapshot, NeighborProvider};
 use navpath_core::engine::search::{ExtraEdges, SearchContext};
+use navpath_core::engine::neighbors::WalkGraph;
+
+/// Empty "no path" result for early-exit paths in this module.
+fn not_found_result() -> SearchResult {
+    SearchResult { found: false, status: SearchStatus::NotFound, path: Vec::new(), cost: f32::INFINITY, pops: 0 }
+}
 use serde_json::Value as JsonValue;
-use navpath_core::eligibility::{build_mask_from_u32, fnv1a32, ClientValue};
-use navpath_core::engine::heuristics::{LandmarkHeuristic, OctileCoords};
-use navpath_core::snapshot::LeSliceI32;
+use navpath_core::eligibility::{fnv1a32, EligibilityMask};
+use navpath_core::engine::heuristics::LandmarkHeuristic;
 use tracing::{info, warn};
 
 thread_local! {
@@ -28,21 +33,18 @@ fn req_debug_enabled() -> bool {
     })
 }
 
-struct SnapshotCoords<'a> {
-    x: LeSliceI32<'a>,
-    y: LeSliceI32<'a>,
-    p: LeSliceI32<'a>,
-}
-
-impl<'a> OctileCoords for SnapshotCoords<'a> {
-    fn coords(&self, node: u32) -> (i32, i32, i32) {
-        let i = node as usize;
-        (
-            self.x.get(i).unwrap_or(0),
-            self.y.get(i).unwrap_or(0),
-            self.p.get(i).unwrap_or(0)
-        )
-    }
+/// Pop budget for a single search, from `NAVPATH_MAX_POPS` (0 disables). Defaults to
+/// 500k pops — enough for any legitimate route, while capping unreachable-goal floods.
+/// Cached once so the hot path never performs an env lookup.
+fn default_max_pops() -> Option<u32> {
+    static MAX_POPS: OnceLock<Option<u32>> = OnceLock::new();
+    *MAX_POPS.get_or_init(|| {
+        match std::env::var("NAVPATH_MAX_POPS").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => Some(500_000),
+        }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +53,9 @@ pub struct GlobalTeleport {
     pub cost: f32,
     pub reqs: Vec<usize>,
     pub kind_first: u32,
+    /// The teleport's parsed metadata entry from the snapshot's "global" array, cached
+    /// at load time so /route never re-parses the ~113KB JSON blob per request.
+    pub meta: Arc<JsonValue>,
 }
 
 /// Runtime representation of a Fairy Ring node
@@ -88,26 +93,9 @@ fn kind_code(kind: &str) -> u32 {
     }
 }
 
-fn has_quick_tele(client_reqs: &[(String, serde_json::Value)]) -> bool {
-    for (k, v) in client_reqs {
-        if k.trim().eq_ignore_ascii_case("hasQuickTele") {
-            if v.as_i64() == Some(1) || v.as_u64() == Some(1) {
-                return true;
-            }
-            if v.as_bool() == Some(true) {
-                return true;
-            }
-            if v.as_str().map(|s| s.trim()) == Some("1") {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<GlobalTeleport>, HashMap<(u32, u32), Vec<u32>>) {
     // 1. Build map of req_id -> tag_index
-    let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
+    let req_words: &[u32] = snapshot.req_tags();
     let mut id_to_idx = std::collections::HashMap::new();
     let mut i = 0;
     while i + 3 < req_words.len() {
@@ -123,10 +111,10 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
     let mut globals: Vec<GlobalTeleport> = Vec::new();
     let mut macro_lookup: HashMap<(u32, u32), Vec<u32>> = HashMap::with_capacity(len);
     
-    let msrc_vec: Vec<u32> = msrc.iter().collect();
-    let mdst_vec: Vec<u32> = snapshot.macro_dst().iter().collect();
-    let mw_vec: Vec<f32> = snapshot.macro_w().iter().collect();
-    let mkind_vec: Vec<u32> = snapshot.macro_kind_first().iter().collect();
+    let msrc_vec: &[u32] = msrc;
+    let mdst_vec: &[u32] = snapshot.macro_dst();
+    let mw_vec: &[f32] = snapshot.macro_w();
+    let mkind_vec: &[u32] = snapshot.macro_kind_first();
 
     let mut missing_req_ids: u64 = 0;
 
@@ -166,7 +154,7 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
                                  }
                              }
                              if dst != 0 {
-                                 globals.push(GlobalTeleport { dst, cost, reqs: g_reqs, kind_first });
+                                 globals.push(GlobalTeleport { dst, cost, reqs: g_reqs, kind_first, meta: Arc::new(g.clone()) });
                              }
                          }
                     }
@@ -200,20 +188,16 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
         warn!(missing_req_ids, "snapshot macro metadata referenced unknown requirement ids (will be treated as unsatisfied)");
     }
 
-    // 3. Build NeighborProvider
+    // 3. Build the macro-edge provider (~1k edges; the walk grid is served zero-copy
+    // from the snapshot's CSR sections and never rebuilt on the heap).
     let nodes = snapshot.counts().nodes as usize;
-    let walk_src: Vec<u32> = snapshot.walk_src().iter().collect();
-    let walk_dst: Vec<u32> = snapshot.walk_dst().iter().collect();
-    let walk_w: Vec<f32> = snapshot.walk_w().iter().collect();
-
     let provider = NeighborProvider::new_with_reqs(
         nodes,
-        &walk_src, &walk_dst, &walk_w,
-        &msrc_vec, &mdst_vec, &mw_vec,
-        &mkind_vec,
-        &macro_reqs
+        msrc_vec, mdst_vec, mw_vec,
+        mkind_vec,
+        &macro_reqs,
     );
-    
+
     (provider, globals, macro_lookup)
 }
 
@@ -221,7 +205,7 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
 /// Returns: (Vec<FairyRing>, HashMap<node_id, ring_index>)
 pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, HashMap<u32, usize>) {
     // Build req_id -> tag_index map
-    let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
+    let req_words: &[u32] = snapshot.req_tags();
     let mut id_to_idx: HashMap<u32, usize> = HashMap::new();
     let mut i = 0;
     while i + 3 < req_words.len() {
@@ -239,8 +223,8 @@ pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, HashMap<u32, u
     let costs = snapshot.fairy_cost_ms();
 
     for idx in 0..fairy_count {
-        let node = nodes.get(idx).unwrap_or(0);
-        let cost_ms = costs.get(idx).unwrap_or(0.0);
+        let node = nodes.get(idx).copied().unwrap_or(0);
+        let cost_ms = costs.get(idx).copied().unwrap_or(0.0);
 
         // Parse metadata JSON
         let (object_id, x, y, plane, code, action, req_tag_idxs) =
@@ -300,78 +284,25 @@ pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, HashMap<u32, u
     (rings, node_to_ring)
 }
 
-pub fn run_route(
-    snapshot: Arc<Snapshot>,
-    neighbors: Arc<NeighborProvider>,
-    globals: Arc<Vec<GlobalTeleport>>,
-    start_id: u32,
-    goal_id: u32
-) -> SearchResult {
-    run_route_with_requirements(snapshot, neighbors, globals, start_id, goal_id, &[], None)
-}
-
-pub fn run_route_with_requirements(
-    snapshot: Arc<Snapshot>,
-    neighbors: Arc<NeighborProvider>,
-    globals: Arc<Vec<GlobalTeleport>>,
-    start_id: u32,
-    goal_id: u32,
-    client_reqs: &[(String, serde_json::Value)],
-    seed: Option<u64>,
-) -> SearchResult {
-    run_route_with_requirements_and_fairy_rings(
-        snapshot, neighbors, globals, start_id, goal_id, client_reqs, seed,
-        &[], &HashMap::new(),
-    )
-}
-
 pub fn run_route_with_requirements_and_fairy_rings(
     snapshot: Arc<Snapshot>,
     neighbors: Arc<NeighborProvider>,
     globals: Arc<Vec<GlobalTeleport>>,
     start_id: u32,
     goal_id: u32,
-    client_reqs: &[(String, serde_json::Value)],
+    mask: &EligibilityMask,
+    quick_tele: bool,
     seed: Option<u64>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     fairy_rings: &[FairyRing],
     // Kept for API symmetry with the caller; eligible fairy sources/dests are derived
     // from `fairy_rings` directly, so the node->ring map is not needed here.
     _node_to_fairy_ring: &HashMap<u32, usize>,
 ) -> SearchResult {
-    // Build eligibility mask from snapshot req tags
-    let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
-    let mut client_pairs: Vec<(String, ClientValue)> = Vec::with_capacity(client_reqs.len());
-    for (k, v) in client_reqs.iter() {
-        if let Some(n) = v.as_i64() {
-            client_pairs.push((k.clone(), ClientValue::Num(n)));
-        } else if let Some(u) = v.as_u64() {
-            client_pairs.push((k.clone(), ClientValue::Num(u as i64)));
-        } else if let Some(f) = v.as_f64() {
-            client_pairs.push((k.clone(), ClientValue::Num(f as i64)));
-        } else if let Some(s) = v.as_str() {
-            client_pairs.push((k.clone(), ClientValue::Str(s)));
-        }
-    }
-    let mask = build_mask_from_u32(
-        &req_words,
-        client_pairs.iter().map(|(k, cv)| {
-            match cv {
-                ClientValue::Num(n) => (k.as_str(), ClientValue::Num(*n)),
-                ClientValue::Str(s) => (k.as_str(), ClientValue::Str(s)),
-            }
-        }),
-    );
-
     // Per-request requirement diagnostics, gated behind NAVPATH_DEBUG_REQS=1 so the hot
     // path skips this scan/logging by default. Enable when debugging requirement matching.
     if req_debug_enabled() {
-        if let Some((k, v)) = client_reqs
-            .iter()
-            .find(|(k, _)| k.trim().eq_ignore_ascii_case("hasGamesNeck"))
-        {
-            info!(key = %k, value = %v, "client requirement");
-        }
-
+        let req_words: &[u32] = snapshot.req_tags();
         // Diagnostics: show computed satisfaction for requirement id 78 (expected key=hasGamesNeck, value=1)
         let mut i = 0usize;
         while i + 3 < req_words.len() {
@@ -388,8 +319,6 @@ pub fn run_route_with_requirements_and_fairy_rings(
             i += 4;
         }
     }
-
-    let quick_tele = has_quick_tele(client_reqs);
 
     // Eligible global teleports
     let mut eligible_globals: Vec<(u32, f32)> = Vec::new();
@@ -408,9 +337,11 @@ pub fn run_route_with_requirements_and_fairy_rings(
     }
 
     // Pre-compute eligible fairy ring destinations (rings whose requirements are satisfied)
-    // For each eligible source ring, we can teleport to any other eligible ring
+    // For each eligible source ring, we can teleport to any other eligible ring. Both
+    // collections are sorted: the engine binary-searches sources per pop and merges the
+    // shared destination slice in dst order (skipping the self-hop).
     let mut eligible_fairy_dests: Vec<(u32, f32)> = Vec::new();
-    let mut eligible_fairy_sources: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut eligible_fairy_sources: Vec<u32> = Vec::new();
     for ring in fairy_rings {
         let mut allowed = true;
         for &idx in &ring.req_tag_idxs {
@@ -420,58 +351,42 @@ pub fn run_route_with_requirements_and_fairy_rings(
             }
         }
         if allowed {
-            eligible_fairy_sources.insert(ring.node);
+            eligible_fairy_sources.push(ring.node);
             eligible_fairy_dests.push((ring.node, ring.cost_ms));
         }
     }
+    eligible_fairy_sources.sort_unstable();
+    eligible_fairy_sources.dedup();
+    sort_extra_edges(&mut eligible_fairy_dests);
 
     let nodes = snapshot.counts().nodes as usize;
+    let snap_ref: &Snapshot = &snapshot;
     let lm = LandmarkHeuristic {
         nodes,
-        landmarks: snapshot.counts().landmarks as usize,
-        lm_fw: snapshot.lm_fw(),
-        lm_bw: snapshot.lm_bw()
+        landmarks: snap_ref.counts().landmarks as usize,
+        tab: snap_ref.lm_tab(),
     };
 
     let mut view = EngineView {
         nodes,
-        neighbors,
+        walk: WalkGraph::from_snapshot(snap_ref),
+        macros: neighbors,
         lm,
         extra: ExtraEdges::default(),
     };
 
-    // Global teleports are available from every node; pre-sort them once so the search
-    // shares a single slice across all node expansions instead of cloning and re-sorting
-    // on every pop.
+    // Global teleports are available from every node; the engine relaxes them once from
+    // the start node, so they never enter per-pop neighbor merges.
     sort_extra_edges(&mut eligible_globals);
     view.extra.global = eligible_globals;
+    view.extra.fairy_sources = eligible_fairy_sources;
+    view.extra.fairy_dests = eligible_fairy_dests;
 
-    // Fairy-ring hops are location-specific: only ring source nodes have them. The
-    // per-node closure returns just the fairy edges (an empty, non-allocating Vec for
-    // every other node); the search merges them with the shared global edges on demand.
-    if !eligible_fairy_dests.is_empty() {
-        view.extra.per_node = Some(Box::new(move |u: u32| -> Vec<(u32, f32)> {
-            if eligible_fairy_sources.contains(&u) {
-                eligible_fairy_dests
-                    .iter()
-                    .filter(|&&(dst_node, _)| dst_node != u)
-                    .copied()
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        }));
-    }
-
-    let coords = SnapshotCoords {
-        x: snapshot.nodes_x(),
-        y: snapshot.nodes_y(),
-        p: snapshot.nodes_plane(),
-    };
+    let macro_filter = view.macros.macro_filter(mask, quick_tele);
 
     SEARCH_CONTEXT.with(|ctx_cell| {
         let mut ctx = ctx_cell.borrow_mut();
-        view.astar(SearchParams { start: start_id, goal: goal_id, coords: Some(&coords), mask: Some(&mask), quick_tele, seed }, &mut ctx)
+        view.astar(SearchParams { start: start_id, goal: goal_id, macro_filter: Some(&macro_filter), seed, max_pops: default_max_pops(), cancel }, &mut ctx)
     })
 }
 
@@ -480,34 +395,11 @@ pub fn run_route_with_requirements_virtual_start(
     neighbors: Arc<NeighborProvider>,
     globals: Arc<Vec<GlobalTeleport>>,
     goal_id: u32,
-    client_reqs: &[(String, serde_json::Value)],
+    mask: &EligibilityMask,
+    quick_tele: bool,
     seed: Option<u64>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> (SearchResult, Option<u32>) {
-    let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
-    let mut client_pairs: Vec<(String, ClientValue)> = Vec::with_capacity(client_reqs.len());
-    for (k, v) in client_reqs.iter() {
-        if let Some(n) = v.as_i64() {
-            client_pairs.push((k.clone(), ClientValue::Num(n)));
-        } else if let Some(u) = v.as_u64() {
-            client_pairs.push((k.clone(), ClientValue::Num(u as i64)));
-        } else if let Some(f) = v.as_f64() {
-            client_pairs.push((k.clone(), ClientValue::Num(f as i64)));
-        } else if let Some(s) = v.as_str() {
-            client_pairs.push((k.clone(), ClientValue::Str(s)));
-        }
-    }
-    let mask = build_mask_from_u32(
-        &req_words,
-        client_pairs.iter().map(|(k, cv)| {
-            match cv {
-                ClientValue::Num(n) => (k.as_str(), ClientValue::Num(*n)),
-                ClientValue::Str(s) => (k.as_str(), ClientValue::Str(s)),
-            }
-        }),
-    );
-
-    let quick_tele = has_quick_tele(client_reqs);
-
     let mut eligible_globals: Vec<(u32, f32)> = Vec::new();
     for g in globals.iter() {
         let mut allowed = true;
@@ -527,64 +419,43 @@ pub fn run_route_with_requirements_virtual_start(
     }
 
     let nodes = snapshot.counts().nodes as usize;
+    let snap_ref: &Snapshot = &snapshot;
     let lm = LandmarkHeuristic {
         nodes,
-        landmarks: snapshot.counts().landmarks as usize,
-        lm_fw: snapshot.lm_fw(),
-        lm_bw: snapshot.lm_bw(),
+        landmarks: snap_ref.counts().landmarks as usize,
+        tab: snap_ref.lm_tab(),
     };
-    let mut view = EngineView {
+    let view = EngineView {
         nodes,
-        neighbors,
+        walk: WalkGraph::from_snapshot(snap_ref),
+        macros: neighbors,
         lm,
         extra: ExtraEdges::default(),
     };
 
-    // Global teleports apply to every node; pre-sort once and share as a slice. The
-    // candidate loop below still iterates `eligible_globals` to pick entry teleports.
-    sort_extra_edges(&mut eligible_globals);
-    view.extra.global = eligible_globals.clone();
-
-    let coords = SnapshotCoords {
-        x: snapshot.nodes_x(),
-        y: snapshot.nodes_y(),
-        p: snapshot.nodes_plane(),
-    };
-
     if eligible_globals.is_empty() {
-        return (SearchResult { found: false, path: Vec::new(), cost: f32::INFINITY }, None);
+        return (not_found_result(), None);
     }
+    sort_extra_edges(&mut eligible_globals);
+    let macro_filter = view.macros.macro_filter(mask, quick_tele);
 
+    // One multi-source search replaces one full A* per eligible teleport: every teleport
+    // destination is seeded at g = its cost, and the winning entry is path[0]. The engine
+    // leaves `extra.global` unused in multi-source mode, and this out-of-graph start has
+    // no mid-route teleports by construction (a second teleport at any node u would cost
+    // g(u) + c >= c, dominated by seeding it directly).
     SEARCH_CONTEXT.with(|ctx_cell| {
         let mut ctx = ctx_cell.borrow_mut();
-        let mut best: Option<(SearchResult, u32)> = None;
-
-        for (dst, tele_cost) in eligible_globals.into_iter() {
-            let res = view.astar(
-                SearchParams { start: dst, goal: goal_id, coords: Some(&coords), mask: Some(&mask), quick_tele, seed },
-                &mut ctx,
-            );
-            if !res.found {
-                continue;
-            }
-            let total_cost = tele_cost + res.cost;
-            let mut combined = res.clone();
-            combined.cost = total_cost;
-
-            match &mut best {
-                None => best = Some((combined, dst)),
-                Some((cur_best, cur_dst)) => {
-                    if total_cost < cur_best.cost {
-                        *cur_best = combined;
-                        *cur_dst = dst;
-                    }
-                }
-            }
-        }
-
-        match best {
-            Some((res, dst)) => (res, Some(dst)),
-            None => (SearchResult { found: false, path: Vec::new(), cost: f32::INFINITY }, None),
+        let res = view.astar_multi(
+            &eligible_globals,
+            SearchParams { start: goal_id, goal: goal_id, macro_filter: Some(&macro_filter), seed, max_pops: default_max_pops(), cancel },
+            &mut ctx,
+        );
+        if res.found {
+            let entry = res.path.first().copied();
+            (res, entry)
+        } else {
+            (res, None)
         }
     })
 }

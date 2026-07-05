@@ -9,14 +9,18 @@ use rusqlite::{Connection, OpenFlags};
 use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 
-use navpath_core::snapshot::write_snapshot;
+use navpath_core::snapshot::{pack_coord, write_snapshot_v8, SnapshotSections};
+use navpath_core::engine::heuristics::quantize_alt_ms;
 
 mod build;
 use build::graph::compile_walk_edges;
 use build::load_sqlite::{load_all_tiles, load_fairy_rings};
 use build::chains::{flatten_chains, flatten_global_chains};
 use build::requirements::compile_requirement_tags;
-use build::landmarks::compute_alt_tables;
+use build::landmarks::{select_and_compute_alt, walk_component_ids};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser, Debug)]
 #[command(name = "navpath-builder", version, about = "Build RS3 pathfinding snapshot from worldReachableTiles.db")] 
@@ -42,7 +46,7 @@ struct Args {
 fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Value> {
     match kind {
         "door" => {
-            if let Ok(mut st) = conn.prepare(
+            if let Ok(mut st) = conn.prepare_cached(
                 "SELECT direction,
                         tile_inside_x, tile_inside_y, tile_inside_plane,
                         tile_outside_x, tile_outside_y, tile_outside_plane,
@@ -82,7 +86,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
             None
         }
         "lodestone" => {
-            if let Ok(mut st) = conn.prepare(
+            if let Ok(mut st) = conn.prepare_cached(
                 "SELECT lodestone, dest_x, dest_y, dest_plane, cost, next_node_type, next_node_id, requirements
                  FROM teleports_lodestone_nodes WHERE id = ?1"
             ) {
@@ -104,7 +108,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
             None
         }
         "object" => {
-            if let Ok(mut st) = conn.prepare(
+            if let Ok(mut st) = conn.prepare_cached(
                 "SELECT match_type, object_id, object_name, action,
                         dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
                         orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane,
@@ -145,7 +149,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
             None
         }
         "npc" => {
-            if let Ok(mut st) = conn.prepare(
+            if let Ok(mut st) = conn.prepare_cached(
                 "SELECT match_type, npc_id, npc_name, action,
                         dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
                         orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane,
@@ -186,7 +190,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
             None
         }
         "item" => {
-            if let Ok(mut st) = conn.prepare(
+            if let Ok(mut st) = conn.prepare_cached(
                 "SELECT match_type, name, item_id, action,
                         dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
                         cost, next_node_type, next_node_id, requirements
@@ -220,7 +224,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
             None
         }
         "ifslot" => {
-            if let Ok(mut st) = conn.prepare(
+            if let Ok(mut st) = conn.prepare_cached(
                 "SELECT interface_id, component_id, slot_id, click_id,
                         dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
                         cost, next_node_type, next_node_id, requirements
@@ -259,13 +263,17 @@ fn open_read_only(sqlite_path: &PathBuf) -> Result<Connection> {
         sqlite_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
-    // Best-effort pragmas; ignore failures
+    // Best-effort pragmas; ignore failures. mmap_size/cache_size/temp_store are the ones
+    // that matter for large sequential scans on a read-only connection.
     let _ = conn.execute_batch(
         r#"
         PRAGMA query_only=ON;
         PRAGMA foreign_keys=OFF;
         PRAGMA journal_mode=OFF;
         PRAGMA synchronous=OFF;
+        PRAGMA mmap_size=1073741824;
+        PRAGMA cache_size=-262144;
+        PRAGMA temp_store=MEMORY;
         "#,
     );
     Ok(conn)
@@ -293,11 +301,20 @@ fn main() -> Result<()> {
         node_id_of.insert((t.x, t.y, t.plane), i as u32);
     }
 
-    // Nodes ids are sequential 0..n-1 for now; also collect coordinates
-    let nodes_ids: Vec<u32> = (0..tiles.len() as u32).collect();
-    let nodes_x: Vec<i32> = tiles.iter().map(|t| t.x).collect();
-    let nodes_y: Vec<i32> = tiles.iter().map(|t| t.y).collect();
-    let nodes_plane: Vec<i32> = tiles.iter().map(|t| t.plane).collect();
+    // Node ids are sequential 0..n-1 in tile sort order; the packed keys are therefore
+    // ascending, which is what the snapshot's binary-search coordinate lookup relies on.
+    let node_count = tiles.len();
+    let coords_packed: Vec<u32> = tiles
+        .iter()
+        .map(|t| {
+            assert!(
+                (0..32768).contains(&t.x) && (0..32768).contains(&t.y) && (0..4).contains(&t.plane),
+                "tile coordinate out of packed range: ({}, {}, {})", t.x, t.y, t.plane
+            );
+            pack_coord(t.x, t.y, t.plane)
+        })
+        .collect();
+    debug_assert!(coords_packed.windows(2).all(|w| w[0] < w[1]));
 
     // Compile walk edges with diagonal/cardinal rules
     let walk = compile_walk_edges(&tiles, &node_id_of);
@@ -360,6 +377,10 @@ fn main() -> Result<()> {
             serde_json::Value::Object(obj)
         }).collect();
 
+        // The first step's db_row (with its next_db_row already attached) was just built
+        // for steps_json above; reuse it for the meta-level entry instead of re-querying.
+        let first_db_row = steps_json.first().and_then(|s| s.get("db_row")).cloned();
+
         // Start building meta object
         let mut meta_obj = serde_json::Map::new();
         meta_obj.insert("kind".to_string(), serde_json::Value::String(match k { 1=>"door",2=>"lodestone",3=>"npc",4=>"object",5=>"item",6=>"ifslot", _=>"unknown" }.to_string()));
@@ -367,23 +388,8 @@ fn main() -> Result<()> {
         meta_obj.insert("steps".to_string(), serde_json::Value::from(steps_json));
         meta_obj.insert("requirements".to_string(), serde_json::Value::from(m.requirement_ids.clone()));
 
-        // Best-effort: fetch db_row for the first step's kind/id for richer metadata on all teleport kinds
-        if let Some(first) = m.steps.first() {
-            let kind_str = first.kind;
-            let fid = first.id as i64;
-            if let Some(mut v) = fetch_db_row(&conn, kind_str, fid) {
-                // Attach shallow next_db_row if available
-                let next_t = v.get("next_node_type").and_then(|x| x.as_str()).map(|s| s.to_string());
-                let next_id = v.get("next_node_id").and_then(|x| x.as_i64());
-                if let (Some(t), Some(n)) = (next_t, next_id) {
-                    if let Some(next_v) = fetch_db_row(&conn, &t, n) {
-                        if let Some(map) = v.as_object_mut() {
-                            map.insert("next_db_row".to_string(), next_v);
-                        }
-                    }
-                }
-                meta_obj.insert("db_row".to_string(), v);
-            }
+        if let Some(v) = first_db_row {
+            meta_obj.insert("db_row".to_string(), v);
         }
 
         let meta = serde_json::Value::Object(meta_obj);
@@ -455,30 +461,55 @@ fn main() -> Result<()> {
     // Compile requirement tags from teleports_requirements
     let req_tags: Vec<u32> = compile_requirement_tags(&conn)?;
 
-    // Landmarks: pick first N nodes if requested
-    let mut landmarks: Vec<u32> = Vec::new();
-    if args.landmarks > 0 {
-        let n = args.landmarks.min(nodes_ids.len() as u32) as usize;
-        landmarks.extend((0..n as u32).into_iter());
-    }
-
-    // ALT tables (forward: LM->node, backward: node->LM via reverse graph)
-    let (lm_fw, lm_bw) = if !landmarks.is_empty() {
-        compute_alt_tables(
-            nodes_ids.len(),
-            &walk_src, &walk_dst, &walk_w,
-            &macro_src, &macro_dst, &macro_w,
-            &landmarks,
-        )
-    } else { (Vec::new(), Vec::new()) };
-
-    // Load Fairy Rings
+    // Load Fairy Rings (needed before the ALT stage: the landmark tables must cover
+    // every edge the search can relax mid-query, and fairy hops are such edges).
     let fairy_ring_rows = load_fairy_rings(&conn, &node_id_of).unwrap_or_else(|e| {
         // Fail-soft: log warning and proceed with empty list if table doesn't exist
         tracing::warn!(error = ?e, "failed to load fairy rings (table may not exist); proceeding with empty list");
         Vec::new()
     });
     info!(count = fairy_ring_rows.len(), "loaded fairy rings from SQLite");
+
+    // ALT graph edges: walk + macro + the full fairy-ring clique. Two admissibility
+    // details (the runtime graph must be a SUBSET of this graph, edge-for-edge, with
+    // weights >= the ones used here):
+    //  - fairy hops connect every ring to every other ring at the destination ring's
+    //    cost; per-request eligibility only removes rings, which keeps bounds valid;
+    //  - quick-tele can lower lodestone-first macro edges (kind_first == 2) to 2400ms
+    //    at query time, so the table graph uses min(w, 2400) for those.
+    let mut alt_macro_src = macro_src.clone();
+    let mut alt_macro_dst = macro_dst.clone();
+    let mut alt_macro_w: Vec<f32> = macro_w
+        .iter()
+        .zip(macro_kind_first.iter())
+        .map(|(&w, &k)| if k == 2 { w.min(2400.0) } else { w })
+        .collect();
+    for a in &fairy_ring_rows {
+        for b in &fairy_ring_rows {
+            if a.node_id != b.node_id {
+                alt_macro_src.push(a.node_id);
+                alt_macro_dst.push(b.node_id);
+                alt_macro_w.push(b.cost);
+            }
+        }
+    }
+
+    // Landmarks: farthest-point selection over that graph, plus the ALT tables
+    // (forward: LM->node, backward: node->LM via reverse graph) in one pass.
+    let alt_start = std::time::Instant::now();
+    let (landmarks, lm_fw, lm_bw) = select_and_compute_alt(
+        node_count,
+        &walk_src, &walk_dst, &walk_w,
+        &alt_macro_src, &alt_macro_dst, &alt_macro_w,
+        args.landmarks,
+    );
+    if !landmarks.is_empty() {
+        info!(
+            count = landmarks.len(),
+            elapsed_ms = alt_start.elapsed().as_millis() as u64,
+            "selected landmarks and computed ALT tables"
+        );
+    }
 
     // Encode Fairy Rings into snapshot sections
     let mut fairy_nodes: Vec<u32> = Vec::with_capacity(fairy_ring_rows.len());
@@ -511,33 +542,70 @@ fn main() -> Result<()> {
         fairy_meta_blob.extend_from_slice(&bytes);
     }
 
-    // Write snapshot
-    let res = write_snapshot(
+    // v8 sections: walk CSR + diagonal bitmap (weights derived from direction), packed
+    // coords, walk-component ids, and the quantized interleaved ALT table.
+    let walk_edge_count = walk_src.len();
+    let mut walk_offsets = vec![0u32; node_count + 1];
+    for &s in &walk_src {
+        walk_offsets[s as usize + 1] += 1;
+    }
+    for i in 0..node_count {
+        walk_offsets[i + 1] += walk_offsets[i];
+    }
+    let mut cur = walk_offsets.clone();
+    let mut walk_csr_dst = vec![0u32; walk_edge_count];
+    let mut walk_diag = vec![0u8; walk_edge_count.div_ceil(8)];
+    for i in 0..walk_edge_count {
+        let slot = cur[walk_src[i] as usize] as usize;
+        walk_csr_dst[slot] = walk_dst[i];
+        // Only two weights exist: 300 (cardinal) and 300*sqrt(2) (diagonal).
+        if walk_w[i] > 350.0 {
+            walk_diag[slot / 8] |= 1 << (slot % 8);
+        }
+        cur[walk_src[i] as usize] += 1;
+    }
+
+    let (comp_ids, walk_components) = walk_component_ids(node_count, &walk_src, &walk_dst);
+    info!(walk_components, "computed walk components");
+
+    // Interleave + quantize the ALT tables: [node][landmark][fw, bw] u16 quanta.
+    let lm_count = landmarks.len();
+    let mut lm_tab = vec![0u16; node_count * lm_count * 2];
+    for nidx in 0..node_count {
+        for li in 0..lm_count {
+            lm_tab[nidx * lm_count * 2 + 2 * li] = quantize_alt_ms(lm_fw[nidx * lm_count + li]);
+            lm_tab[nidx * lm_count * 2 + 2 * li + 1] = quantize_alt_ms(lm_bw[nidx * lm_count + li]);
+        }
+    }
+    drop(lm_fw);
+    drop(lm_bw);
+
+    let res = write_snapshot_v8(
         &args.out_snapshot,
-        &nodes_ids,
-        &nodes_x,
-        &nodes_y,
-        &nodes_plane,
-        &walk_src,
-        &walk_dst,
-        &walk_w,
-        &macro_src,
-        &macro_dst,
-        &macro_w,
-        &macro_kind_first,
-        &macro_id_first,
-        &macro_meta_offs,
-        &macro_meta_lens,
-        &macro_meta_blob,
-        &req_tags,
-        &landmarks,
-        &lm_fw,
-        &lm_bw,
-        &fairy_nodes,
-        &fairy_cost_ms,
-        &fairy_meta_offs,
-        &fairy_meta_lens,
-        &fairy_meta_blob,
+        &SnapshotSections {
+            coords_packed: &coords_packed,
+            walk_offsets: &walk_offsets,
+            walk_dst: &walk_csr_dst,
+            walk_diag: &walk_diag,
+            comp: &comp_ids,
+            walk_components,
+            macro_src: &macro_src,
+            macro_dst: &macro_dst,
+            macro_w: &macro_w,
+            macro_kind_first: &macro_kind_first,
+            macro_id_first: &macro_id_first,
+            macro_meta_offs: &macro_meta_offs,
+            macro_meta_lens: &macro_meta_lens,
+            macro_meta_blob: &macro_meta_blob,
+            req_tags: &req_tags,
+            landmarks: &landmarks,
+            lm_tab: &lm_tab,
+            fairy_nodes: &fairy_nodes,
+            fairy_cost_ms: &fairy_cost_ms,
+            fairy_meta_offs: &fairy_meta_offs,
+            fairy_meta_lens: &fairy_meta_lens,
+            fairy_meta_blob: &fairy_meta_blob,
+        },
     );
 
     match res {
@@ -554,10 +622,8 @@ fn main() -> Result<()> {
     if let Some(out_tiles) = args.out_tiles {
         let mut f = File::create(&out_tiles)
             .with_context(|| format!("creating {:?}", out_tiles))?;
-        for t in &tiles {
-            let b = (t.walk_mask & 0xFF) as u8;
-            f.write_all(&[b])?;
-        }
+        let bytes: Vec<u8> = tiles.iter().map(|t| (t.walk_mask & 0xFF) as u8).collect();
+        f.write_all(&bytes)?;
         f.flush()?;
         info!(path = ?out_tiles, bytes = tiles.len(), "wrote tiles.bin");
     }

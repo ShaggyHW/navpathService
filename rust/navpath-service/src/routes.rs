@@ -21,6 +21,18 @@ fn result_dump_path() -> Option<&'static std::path::Path> {
         .as_deref()
 }
 
+/// Per-request wall-clock deadline from `NAVPATH_ROUTE_TIMEOUT_MS` (default 10s, 0
+/// disables by using a very large timeout). Cached once.
+fn route_deadline() -> std::time::Duration {
+    static DL: OnceLock<std::time::Duration> = OnceLock::new();
+    *DL.get_or_init(|| {
+        let ms = std::env::var("NAVPATH_ROUTE_TIMEOUT_MS").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(10_000);
+        if ms == 0 { std::time::Duration::from_secs(24 * 3600) } else { std::time::Duration::from_millis(ms) }
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RequirementKV {
     pub key: String,
@@ -60,23 +72,27 @@ fn build_req_id_to_tag_index(req_words: &[u32]) -> std::collections::HashMap<u32
     map
 }
 
-fn macro_edge_allowed_by_profile(
+/// Parse a macro edge's metadata once and return it if the profile satisfies the edge's
+/// requirements (missing/unparseable metadata counts as allowed, matching the search's
+/// fail-open handling of empty requirement lists). None = edge not allowed.
+fn macro_edge_meta_if_allowed(
     snap: &navpath_core::Snapshot,
     macro_idx: usize,
     req_id_to_tag_idx: &std::collections::HashMap<u32, usize>,
     mask: &navpath_core::eligibility::EligibilityMask,
-) -> bool {
-    let Some(bytes) = snap.macro_meta_at(macro_idx) else { return true; };
-    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else { return true; };
-    let Some(arr) = val.get("requirements").and_then(|v| v.as_array()) else { return true; };
-    for ridv in arr {
-        let Some(rid) = ridv.as_u64() else { continue; };
-        let Some(&tag_idx) = req_id_to_tag_idx.get(&(rid as u32)) else { return false; };
-        if !mask.is_satisfied(tag_idx) {
-            return false;
+) -> Option<serde_json::Value> {
+    let Some(bytes) = snap.macro_meta_at(macro_idx) else { return Some(serde_json::json!({})); };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else { return Some(serde_json::json!({})); };
+    if let Some(arr) = val.get("requirements").and_then(|v| v.as_array()) {
+        for ridv in arr {
+            let Some(rid) = ridv.as_u64() else { continue; };
+            let Some(&tag_idx) = req_id_to_tag_idx.get(&(rid as u32)) else { return None; };
+            if !mask.is_satisfied(tag_idx) {
+                return None;
+            }
         }
     }
-    true
+    Some(val)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -502,9 +518,12 @@ pub struct Counts {
 pub struct RouteResponse {
     pub found: bool,
     pub cost: f32,
-    pub path: Vec<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")] pub path: Vec<u32>,
     pub length_tiles: usize,
     pub duration_ms: u128,
+    /// Present when found=false and the search gave up rather than proving no path
+    /// (currently only "budget_exceeded"). Absent on found or genuine not-found.
+    #[serde(skip_serializing_if = "Option::is_none")] pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub actions: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")] pub geometry: Option<Vec<serde_json::Value>>,
 }
@@ -549,15 +568,15 @@ pub async fn tile_exists(
 ) -> Result<Json<TileExistsResponse>, (StatusCode, String)> {
     let cur = state.current.load();
 
-    let Some(coord_index) = cur.coord_index.as_ref() else {
+    let Some(snap) = cur.snapshot.as_ref() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "coordinate index not loaded".into(),
+            "snapshot not loaded".into(),
         ));
     };
 
-    match coord_index.get(&(params.x, params.y, params.plane)) {
-        Some(&node_id) => {
+    match snap.find_node(params.x, params.y, params.plane) {
+        Some(node_id) => {
             Ok(Json(TileExistsResponse {
                 exists: true,
                 node_id: Some(node_id),
@@ -572,129 +591,39 @@ pub async fn tile_exists(
     }
 }
 
-pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>) -> Result<Json<RouteResponse>, (StatusCode, String)> {
-    let start = std::time::Instant::now();
-    let cur = state.current.load();
-    let Some(snap) = cur.snapshot.as_ref() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "snapshot not loaded".into()));
-    };
-    let Some(neighbors) = cur.neighbors.as_ref() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "neighbors not loaded".into()));
-    };
-    let globals = cur.globals.clone();
-    let counts = snap.counts();
-
-    // Resolve node ids
-    let (sid, gid, used_virtual_start) = match (req.start_id, req.goal_id, req.start.as_ref(), req.goal.as_ref()) {
-        (Some(sid), Some(gid), _, _) => (sid, gid, false),
-        (_, _, Some(s), Some(g)) => {
-            let Some(idx) = cur.coord_index.as_ref() else {
-                return Err((StatusCode::SERVICE_UNAVAILABLE, "snapshot missing coordinate index; reload a v3 snapshot".into()));
-            };
-            let key_s = (s.wx, s.wy, s.plane);
-            let key_g = (g.wx, g.wy, g.plane);
-            let Some(&gid) = idx.get(&key_g) else { return Err((StatusCode::BAD_REQUEST, "goal tile not found in snapshot".into())); };
-            
-            // If the start coordinate isn't present in the snapshot, do NOT snap to a nearby tile.
-            // Treat it as out-of-graph and force entry via a global teleport.
-            let (sid, used_virtual_start) = if let Some(&sid) = idx.get(&key_s) {
-                (sid, false)
-            } else {
-                info!(
-                    start_x = s.wx, start_y = s.wy, start_plane = s.plane,
-                    "start coordinate not found in snapshot; will force global teleport entry"
-                );
-                (0, true)
-            };
-            (sid, gid, used_virtual_start)
-        }
-        _ => {
-            return Err((StatusCode::BAD_REQUEST, "missing start/goal; provide start_id/goal_id or start/goal with {wx,wy,plane}".into()));
-        }
-    };
-    if (!used_virtual_start && sid >= counts.nodes) || gid >= counts.nodes {
-        return Err((StatusCode::BAD_REQUEST, "start_id/goal_id out of range".into()));
+/// Build the optional actions/geometry payload for a found route. Runs inside the
+/// request's blocking task so thousands of per-step JSON constructions never stall the
+/// async reactor threads.
+#[allow(clippy::too_many_arguments)]
+fn build_route_payload(
+    snap: &navpath_core::Snapshot,
+    neighbors: &navpath_core::NeighborProvider,
+    globals: &[engine_adapter::GlobalTeleport],
+    macro_lookup: &std::collections::HashMap<(u32, u32), Vec<u32>>,
+    fairy_rings: &[engine_adapter::FairyRing],
+    node_to_fairy_ring: &std::collections::HashMap<u32, usize>,
+    mask: &navpath_core::eligibility::EligibilityMask,
+    quick_tele: bool,
+    return_geometry: bool,
+    only_actions: bool,
+    surge: &SurgeConfig,
+    dive: &DiveConfig,
+    virtual_start_from: Option<(i32, i32, i32)>,
+    virtual_entry: Option<u32>,
+    sid: u32,
+    res: &navpath_core::SearchResult,
+) -> (Option<Vec<serde_json::Value>>, Option<Vec<serde_json::Value>>) {
+    if !res.found {
+        return (None, None);
     }
+    let req_id_to_tag_idx = build_req_id_to_tag_index(snap.req_tags());
 
-    let client_reqs: Vec<(String, serde_json::Value)> = req
-        .profile
-        .requirements
-        .iter()
-        .map(|kv| (kv.key.clone(), kv.value.clone()))
-        .collect();
-
-    let quick_tele = req_has_quick_tele(&req.profile.requirements);
-
-    let req_words: Vec<u32> = snap.req_tags().iter().collect();
-    let req_id_to_tag_idx = build_req_id_to_tag_index(&req_words);
-    let mask = build_mask_from_u32(
-        &req_words,
-        client_reqs.iter().filter_map(|(k, v)| {
-            if let Some(n) = v.as_i64() {
-                Some((k.as_str(), ClientValue::Num(n)))
-            } else if let Some(u) = v.as_u64() {
-                Some((k.as_str(), ClientValue::Num(u as i64)))
-            } else if let Some(b) = v.as_bool() {
-                Some((k.as_str(), ClientValue::Num(if b { 1 } else { 0 })))
-            } else if let Some(s) = v.as_str() {
-                let st = s.trim();
-                if let Ok(n) = st.parse::<i64>() {
-                    Some((k.as_str(), ClientValue::Num(n)))
-                } else {
-                    Some((k.as_str(), ClientValue::Str(st)))
-                }
-            } else {
-                None
-            }
-        }),
-    );
-    
-    // Offload search to blocking thread pool
-    let snap_arc = snap.clone();
-    let neighbors_arc = neighbors.clone();
-    let globals_arc = globals.clone();
-    let fairy_rings_arc = cur.fairy_rings.clone();
-    let node_to_fairy_ring_arc = cur.node_to_fairy_ring.clone();
-    let seed = req.seed;
-
-    let used_virtual_start_for_search = used_virtual_start;
-    let res_and_entry = tokio::task::spawn_blocking(move || {
-        if used_virtual_start_for_search {
-            engine_adapter::run_route_with_requirements_virtual_start(
-                snap_arc,
-                neighbors_arc,
-                globals_arc,
-                gid,
-                &client_reqs,
-                seed,
-            )
-        } else {
-            (engine_adapter::run_route_with_requirements_and_fairy_rings(
-                snap_arc, neighbors_arc, globals_arc, sid, gid, &client_reqs, seed,
-                &fairy_rings_arc, &node_to_fairy_ring_arc,
-            ), None)
-        }
-    }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let (res, virtual_entry) = res_and_entry;
-    
-    let duration_ms = start.elapsed().as_millis();
-
-    // Optionally build actions/geometry
     let mut actions: Option<Vec<serde_json::Value>> = None;
     let mut geometry: Option<Vec<serde_json::Value>> = None;
+    {
+        let coord = |id: u32| -> (i32, i32, i32) { snap.node_coord(id) };
 
-    if res.found {
-        // Helper to fetch coords
-        let xs = snap.nodes_x();
-        let ys = snap.nodes_y();
-        let ps = snap.nodes_plane();
-        let coord = |id: u32| -> (i32,i32,i32) {
-            let i = id as usize;
-            (xs.get(i).unwrap_or(0), ys.get(i).unwrap_or(0), ps.get(i).unwrap_or(0))
-        };
-
-        if req.options.return_geometry {
+        if return_geometry {
             let mut geom: Vec<serde_json::Value> = Vec::with_capacity(res.path.len());
             for &id in &res.path {
                 let (x,y,p) = coord(id);
@@ -703,76 +632,43 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
             geometry = Some(geom);
         }
 
-        // Parse global teleports encoded under a synthetic 0->0 macro edge
+        // Eligible global teleports for action annotation, from the metadata parsed once
+        // at snapshot load (no per-request 113KB JSON re-parse). Only needed when the
+        // response carries actions.
         let mut global_cost: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
-        let mut global_meta: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
-        if let Some(idxs) = cur.macro_lookup.get(&(0, 0)) {
-            for &idx_u32 in idxs {
-                let idx = idx_u32 as usize;
-                if let Some(bytes) = snap.macro_meta_at(idx) {
-                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                        if let Some(arr) = val.get("global").and_then(|v| v.as_array()) {
-                            for g in arr {
-                                if let Some(dst) = g.get("dst").and_then(|v| v.as_u64()) {
-                                    let dst = dst as u32;
-                                    let mut allowed = true;
-                                    if let Some(reqs) = g.get("requirements").and_then(|v| v.as_array()) {
-                                        for ridv in reqs {
-                                            let Some(rid) = ridv.as_u64() else { continue; };
-                                            let Some(&tag_idx) = req_id_to_tag_idx.get(&(rid as u32)) else {
-                                                allowed = false;
-                                                break;
-                                            };
-                                            if !mask.is_satisfied(tag_idx) {
-                                                allowed = false;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if !allowed {
-                                        continue;
-                                    }
-                                    let mut cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                                    let kind = g
-                                        .get("steps").and_then(|v| v.as_array())
-                                        .and_then(|a| a.first())
-                                        .and_then(|s| s.get("kind"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    if quick_tele && kind == "lodestone" {
-                                        cost = 2400.0;
-                                    }
-                                    let should_replace = global_cost.get(&dst).map(|c| cost < *c).unwrap_or(true);
-                                    if should_replace {
-                                        global_cost.insert(dst, cost);
-                                        global_meta.insert(dst, g.clone());
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
+        let mut global_meta: std::collections::HashMap<u32, Arc<serde_json::Value>> = std::collections::HashMap::new();
+        if only_actions || return_geometry {
+            for g in globals.iter() {
+                if g.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
+                    continue;
+                }
+                let mut cost = g.cost;
+                if quick_tele && g.kind_first == 2 {
+                    cost = 2400.0;
+                }
+                let should_replace = global_cost.get(&g.dst).map(|c| cost < *c).unwrap_or(true);
+                if should_replace {
+                    global_cost.insert(g.dst, cost);
+                    global_meta.insert(g.dst, g.meta.clone());
                 }
             }
         }
 
-        if req.options.only_actions || req.options.return_geometry {
+        if only_actions || return_geometry {
             let mut acts: Vec<serde_json::Value> = Vec::with_capacity(res.path.len().saturating_sub(1));
             
             // If we used a virtual start (non-existent start coordinate), we'll need to add the teleport action later
             // after we determine the actual teleport type from the first real action
             let mut virtual_start_action: Option<serde_json::Value> = None;
-            if used_virtual_start {
-                if let Some(start_coord) = req.start.as_ref() {
-                    let entry_id = virtual_entry.unwrap_or(sid);
-                    let (actual_x, actual_y, actual_p) = coord(entry_id);
-                    virtual_start_action = Some(serde_json::json!({
-                        "from": {"min": [start_coord.wx, start_coord.wy, start_coord.plane], "max": [start_coord.wx, start_coord.wy, start_coord.plane]},
-                        "to":   {"min": [actual_x, actual_y, actual_p], "max": [actual_x, actual_y, actual_p]},
-                        "cost_ms": 0,
-                        "metadata": {"reason": "start_coordinate_not_found"}
-                    }));
-                }
+            if let Some((vsx, vsy, vsp)) = virtual_start_from {
+                let entry_id = virtual_entry.unwrap_or(sid);
+                let (actual_x, actual_y, actual_p) = coord(entry_id);
+                virtual_start_action = Some(serde_json::json!({
+                    "from": {"min": [vsx, vsy, vsp], "max": [vsx, vsy, vsp]},
+                    "to":   {"min": [actual_x, actual_y, actual_p], "max": [actual_x, actual_y, actual_p]},
+                    "cost_ms": 0,
+                    "metadata": {"reason": "start_coordinate_not_found"}
+                }));
             }
             
             for w in res.path.windows(2) {
@@ -780,31 +676,34 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                 let (x1,y1,p1) = coord(u);
                 let (x2,y2,p2) = coord(v);
                 
-                if let Some(idxs) = cur.macro_lookup.get(&(u, v)) {
-                    let mut chosen: Option<(usize, f32)> = None;
+                if let Some(idxs) = macro_lookup.get(&(u, v)) {
+                    let mut chosen: Option<(usize, f32, serde_json::Value)> = None;
                     for &idx_u32 in idxs {
                         let idx = idx_u32 as usize;
-                        if !macro_edge_allowed_by_profile(snap, idx, &req_id_to_tag_idx, &mask) {
+                        let Some(meta) = macro_edge_meta_if_allowed(snap, idx, &req_id_to_tag_idx, mask) else {
                             continue;
-                        }
-                        let mut cost_ms = snap.macro_w().get(idx).unwrap_or(0.0);
-                        let k = snap.macro_kind_first().get(idx).unwrap_or(0);
+                        };
+                        let mut cost_ms = snap.macro_w().get(idx).copied().unwrap_or(0.0);
+                        let k = snap.macro_kind_first().get(idx).copied().unwrap_or(0);
                         if quick_tele && k == 2 {
                             cost_ms = 2400.0;
                         }
-                        if chosen.map_or(true, |(_, best_cost)| cost_ms < best_cost) {
-                            chosen = Some((idx, cost_ms));
+                        if chosen.as_ref().map_or(true, |(_, best_cost, _)| cost_ms < *best_cost) {
+                            chosen = Some((idx, cost_ms, meta));
                         }
                     }
-                    let (idx, mut cost_ms) = if let Some(best) = chosen {
+                    let (idx, mut cost_ms, mut meta) = if let Some(best) = chosen {
                         best
                     } else {
                         let idx = idxs.first().copied().unwrap_or(0) as usize;
-                        (idx, snap.macro_w().get(idx).unwrap_or(0.0))
+                        let meta = snap.macro_meta_at(idx)
+                            .and_then(|b| serde_json::from_slice(b).ok())
+                            .unwrap_or(serde_json::json!({}));
+                        (idx, snap.macro_w().get(idx).copied().unwrap_or(0.0), meta)
                     };
 
-                    let k = snap.macro_kind_first().get(idx).unwrap_or(0);
-                    let kid = snap.macro_id_first().get(idx).unwrap_or(0);
+                    let k = snap.macro_kind_first().get(idx).copied().unwrap_or(0);
+                    let kid = snap.macro_id_first().get(idx).copied().unwrap_or(0);
                     let kstr = match k {
                         1 => "door",
                         2 => "lodestone",
@@ -817,11 +716,6 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                     if quick_tele && kstr == "lodestone" {
                         cost_ms = 2400.0;
                     }
-                    let mut meta = if let Some(bytes) = snap.macro_meta_at(idx) {
-                        serde_json::from_slice(bytes).unwrap_or(serde_json::json!({}))
-                    } else {
-                        serde_json::json!({})
-                    };
                     
                     // For doors, compute dynamic approach direction (IN/OUT) using db_row tile_inside/tile_outside
                     if kstr == "door" {
@@ -864,28 +758,21 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                         "metadata": meta
                     }));
                 } else {
-                    // Walk edge or unknown
-                    // Check if it is a valid walk edge by querying neighbor provider
-                    let mut is_walk = false;
-                    let mut w_cost = 1.0; // Default
-                    // This is slightly inefficient to scan walk neighbors but degree is small
-                    let (wd, ww) = neighbors.walk.neighbors(u);
-                    for (i, &neighbor) in wd.iter().enumerate() {
-                        if neighbor == v {
-                            is_walk = true;
-                            w_cost = ww[i];
-                            break;
-                        }
-                    }
-                    
-                    if is_walk {
+                    // Walk edge or unknown: check the snapshot's walk CSR directly
+                    // (degree <= 8, weight derived from the diagonal bitmap).
+                    let walk_w = snap.walk_edge_weight(u, v);
+
+                    if let Some(w_cost) = walk_w {
                          acts.push(serde_json::json!({
                             "type": "move",
                             "to":   [x2,y2,p2],
                             "cost_ms": w_cost.round()
                         }));
                     } else if let Some(gc) = global_cost.get(&v).cloned() {
-                        let meta = global_meta.get(&v).cloned().unwrap_or(serde_json::json!({}));
+                        let meta: serde_json::Value = global_meta
+                            .get(&v)
+                            .map(|m| (**m).clone())
+                            .unwrap_or(serde_json::json!({}));
                         // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
                         let kstr = meta
                             .get("steps").and_then(|v| v.as_array())
@@ -912,12 +799,12 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                         }
                     } else {
                         // Check if this is a fairy ring hop (u and v are both fairy ring nodes)
-                        let src_ring_idx = cur.node_to_fairy_ring.get(&u);
-                        let dst_ring_idx = cur.node_to_fairy_ring.get(&v);
+                        let src_ring_idx = node_to_fairy_ring.get(&u);
+                        let dst_ring_idx = node_to_fairy_ring.get(&v);
                         if let (Some(&src_idx), Some(&dst_idx)) = (src_ring_idx, dst_ring_idx) {
                             // Fairy ring teleport
-                            let src_ring = &cur.fairy_rings[src_idx];
-                            let dst_ring = &cur.fairy_rings[dst_idx];
+                            let src_ring = &fairy_rings[src_idx];
+                            let dst_ring = &fairy_rings[dst_idx];
                             let mut meta = serde_json::Map::new();
                             meta.insert("source_code".to_string(), serde_json::Value::String(src_ring.code.clone()));
                             meta.insert("destination_code".to_string(), serde_json::Value::String(dst_ring.code.clone()));
@@ -951,7 +838,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
                     if let Some(gc) = global_cost.get(&entry_id).cloned() {
                         virtual_action["cost_ms"] = serde_json::Value::Number(serde_json::Number::from_f64(gc as f64).unwrap_or_else(|| serde_json::Number::from(0)));
                     }
-                    if let Some(meta) = global_meta.get(&entry_id).cloned() {
+                    if let Some(meta) = global_meta.get(&entry_id).map(|m| (**m).clone()) {
                         let kstr = meta
                             .get("steps").and_then(|v| v.as_array())
                             .and_then(|a| a.first())
@@ -972,17 +859,190 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
             }
 
             // Apply surge/dive optimization to the actions
-            let optimized_acts = optimize_with_surge_dive(acts, &req.surge, &req.dive);
+            let optimized_acts = optimize_with_surge_dive(acts, surge, dive);
             actions = Some(optimized_acts);
         }
     }
 
+    (actions, geometry)
+}
+
+pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>) -> Result<Json<RouteResponse>, (StatusCode, String)> {
+    let start = std::time::Instant::now();
+    let cur = state.current.load();
+    let Some(snap) = cur.snapshot.as_ref() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "snapshot not loaded".into()));
+    };
+    let Some(neighbors) = cur.neighbors.as_ref() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "neighbors not loaded".into()));
+    };
+    let globals = cur.globals.clone();
+    let counts = snap.counts();
+
+    // Resolve node ids
+    let (sid, gid, used_virtual_start) = match (req.start_id, req.goal_id, req.start.as_ref(), req.goal.as_ref()) {
+        (Some(sid), Some(gid), _, _) => (sid, gid, false),
+        (_, _, Some(s), Some(g)) => {
+            // Coordinate lookup is a binary search over the snapshot's packed-coords
+            // section (node ids are assigned in packed-key order) — no heap index.
+            let Some(gid) = snap.find_node(g.wx, g.wy, g.plane) else { return Err((StatusCode::BAD_REQUEST, "goal tile not found in snapshot".into())); };
+
+            // If the start coordinate isn't present in the snapshot, do NOT snap to a nearby tile.
+            // Treat it as out-of-graph and force entry via a global teleport.
+            let (sid, used_virtual_start) = if let Some(sid) = snap.find_node(s.wx, s.wy, s.plane) {
+                (sid, false)
+            } else {
+                info!(
+                    start_x = s.wx, start_y = s.wy, start_plane = s.plane,
+                    "start coordinate not found in snapshot; will force global teleport entry"
+                );
+                (0, true)
+            };
+            (sid, gid, used_virtual_start)
+        }
+        _ => {
+            return Err((StatusCode::BAD_REQUEST, "missing start/goal; provide start_id/goal_id or start/goal with {wx,wy,plane}".into()));
+        }
+    };
+    if (!used_virtual_start && sid >= counts.nodes) || gid >= counts.nodes {
+        return Err((StatusCode::BAD_REQUEST, "start_id/goal_id out of range".into()));
+    }
+
+    let quick_tele = req_has_quick_tele(&req.profile.requirements);
+
+    let mask = build_mask_from_u32(
+        snap.req_tags(),
+        req.profile.requirements.iter().filter_map(|kv| {
+            let (k, v) = (&kv.key, &kv.value);
+            if let Some(n) = v.as_i64() {
+                Some((k.as_str(), ClientValue::Num(n)))
+            } else if let Some(u) = v.as_u64() {
+                Some((k.as_str(), ClientValue::Num(u as i64)))
+            } else if let Some(b) = v.as_bool() {
+                Some((k.as_str(), ClientValue::Num(if b { 1 } else { 0 })))
+            } else if let Some(s) = v.as_str() {
+                let st = s.trim();
+                if let Ok(n) = st.parse::<i64>() {
+                    Some((k.as_str(), ClientValue::Num(n)))
+                } else {
+                    Some((k.as_str(), ClientValue::Str(st)))
+                }
+            } else {
+                None
+            }
+        }),
+    );
+    
+    // Offload search to a blocking thread, bounded by the search semaphore so a burst of
+    // slow queries cannot pin hundreds of blocking-pool threads (each holding a
+    // node-sized SearchContext). Overload fails fast instead of queueing floods.
+    let Ok(_permit) = state.search_permits.clone().try_acquire_owned() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "search capacity exhausted; retry".into()));
+    };
+
+    let snap_arc = snap.clone();
+    let neighbors_arc = neighbors.clone();
+    let globals_arc = globals.clone();
+    let fairy_rings_arc = cur.fairy_rings.clone();
+    let node_to_fairy_ring_arc = cur.node_to_fairy_ring.clone();
+    let seed = req.seed;
+    let mask_for_search = mask.clone();
+
+    // Cooperative cancellation: flipped when the client disconnects (the handler future
+    // is dropped) or the route deadline fires; the engine checks it every 1024 pops.
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>, bool);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            if !self.1 {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    let mut disconnect_guard = CancelOnDrop(cancel.clone(), false);
+
+    let used_virtual_start_for_search = used_virtual_start;
+    let cancel_for_search = cancel.clone();
+    let macro_lookup_arc = cur.macro_lookup.clone();
+    let return_geometry = req.options.return_geometry;
+    let only_actions = req.options.only_actions;
+    let surge_cfg = req.surge.clone();
+    let dive_cfg = req.dive.clone();
+    let virtual_start_from = if used_virtual_start {
+        req.start.as_ref().map(|c| (c.wx, c.wy, c.plane))
+    } else {
+        None
+    };
+    let join = tokio::task::spawn_blocking(move || {
+        let cancel_ref = Some(cancel_for_search.as_ref());
+        let (snap2, neighbors2, globals2) = (snap_arc.clone(), neighbors_arc.clone(), globals_arc.clone());
+        let (res, virtual_entry) = if used_virtual_start_for_search {
+            engine_adapter::run_route_with_requirements_virtual_start(
+                snap_arc,
+                neighbors_arc,
+                globals_arc,
+                gid,
+                &mask_for_search,
+                quick_tele,
+                seed,
+                cancel_ref,
+            )
+        } else {
+            (engine_adapter::run_route_with_requirements_and_fairy_rings(
+                snap_arc, neighbors_arc, globals_arc, sid, gid, &mask_for_search, quick_tele, seed,
+                cancel_ref,
+                &fairy_rings_arc, &node_to_fairy_ring_arc,
+            ), None)
+        };
+        let (actions, geometry) = build_route_payload(
+            &snap2,
+            &neighbors2,
+            &globals2,
+            &macro_lookup_arc,
+            &fairy_rings_arc,
+            &node_to_fairy_ring_arc,
+            &mask_for_search,
+            quick_tele,
+            return_geometry,
+            only_actions,
+            &surge_cfg,
+            &dive_cfg,
+            virtual_start_from,
+            virtual_entry,
+            sid,
+            &res,
+        );
+        (res, virtual_entry, actions, geometry)
+    });
+    let out = match tokio::time::timeout(route_deadline(), join).await {
+        Ok(joined) => joined.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        Err(_) => {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err((StatusCode::GATEWAY_TIMEOUT, "route deadline exceeded".into()));
+        }
+    };
+    // Search finished; disarm the disconnect guard so late drops don't poison anything.
+    disconnect_guard.1 = true;
+
+    let (mut res, _virtual_entry, actions, geometry) = out;
+
+    let duration_ms = start.elapsed().as_millis();
+    let length_tiles = res.path.len();
+    // only_actions means exactly that: skip the duplicate node-id path in the payload.
+    let path = if only_actions { Vec::new() } else { std::mem::take(&mut res.path) };
+
+    let reason = match res.status {
+        navpath_core::SearchStatus::BudgetExceeded => Some("budget_exceeded".to_string()),
+        navpath_core::SearchStatus::Cancelled => Some("cancelled".to_string()),
+        _ => None,
+    };
     let resp = RouteResponse {
         found: res.found,
         cost: res.cost,
-        path: res.path.clone(),
-        length_tiles: res.path.len(),
+        path,
+        length_tiles,
         duration_ms,
+        reason,
         actions,
         geometry,
     };
@@ -995,7 +1055,8 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         duration_ms = duration_ms,
         found = res.found,
         cost = res.cost,
-        length = res.path.len(),
+        length = length_tiles,
+        status = ?res.status,
         "route request completed"
     );
     Ok(Json(resp))
@@ -1011,8 +1072,6 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
     match navpath_core::Snapshot::open(&path) {
         Ok(new_snap) => {
             let new_hash = crate::read_tail_hash_hex(&path);
-            // Build coord index from newly loaded snapshot
-            let idx = Arc::new(crate::build_coord_index(&new_snap));
             // Pre-compute neighbors and globals
             let (neighbors, globals, macro_lookup) = crate::engine_adapter::build_neighbor_provider(&new_snap);
             // Pre-compute fairy rings
@@ -1025,7 +1084,6 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
                 macro_lookup: Arc::new(macro_lookup),
                 loaded_at_unix: crate::now_unix(),
                 snapshot_hash_hex: new_hash.clone(),
-                coord_index: Some(idx),
                 fairy_rings: Arc::new(fairy_rings),
                 node_to_fairy_ring: Arc::new(node_to_fairy_ring),
             };

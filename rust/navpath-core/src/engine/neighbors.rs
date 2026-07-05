@@ -1,18 +1,19 @@
 use crate::eligibility::EligibilityMask;
+use crate::snapshot::{walk_diagonal_ms, Snapshot, WALK_CARDINAL_MS};
 
-#[derive(Clone)]
+/// Per-request macro-edge eligibility, folded once from the request's requirement mask
+/// and quick-tele flag: the search then pays one bool index and one f32 load per macro
+/// edge instead of walking each edge's requirement list on every expansion. Slots are in
+/// macro-CSR order.
+pub struct MacroFilter {
+    pub allowed: Vec<bool>,
+    pub w: Vec<f32>,
+}
+
+#[derive(Clone, Default)]
 pub struct MacroEdgeData {
     pub reqs: Vec<usize>,
     pub kind_first: u32,
-}
-
-impl Default for MacroEdgeData {
-    fn default() -> Self {
-        Self {
-            reqs: Vec::new(),
-            kind_first: 0,
-        }
-    }
 }
 
 pub struct Adjacency {
@@ -28,12 +29,15 @@ impl Adjacency {
     }
 
     pub fn build_with_data<T: Clone + Default>(nodes: usize, src: &[u32], dst: &[u32], w: &[f32], data: Option<&[T]>) -> (Self, Vec<T>) {
+        // Counting-sort placement groups each node's neighbors contiguously. No per-node
+        // ordering is imposed: A* relaxation is order-independent, and the input edge
+        // order (builder emission order) keeps results deterministic.
         let mut counts = vec![0usize; nodes];
         for &s in src { counts[s as usize] += 1; }
         let mut offsets = vec![0usize; nodes + 1];
         for i in 0..nodes { offsets[i + 1] = offsets[i] + counts[i]; }
         let mut cur = offsets[..nodes].to_vec();
-        
+
         let len = dst.len();
         let mut adst = vec![0u32; len];
         let mut aw = vec![0f32; len];
@@ -49,37 +53,7 @@ impl Adjacency {
             }
             cur[s] += 1;
         }
-        
-        for u in 0..nodes {
-            let start = offsets[u];
-            let end = offsets[u + 1];
-            let slice = &mut adst[start..end];
-            let ws = &mut aw[start..end];
-            
-            let mut idx: Vec<usize> = (0..slice.len()).collect();
-            idx.sort_unstable_by(|&i, &j| {
-                let a = slice[i];
-                let b = slice[j];
-                if a != b { return a.cmp(&b); }
-                ws[i].partial_cmp(&ws[j]).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            
-            let mut nd = Vec::with_capacity(slice.len());
-            let mut nw = Vec::with_capacity(ws.len());
-            for &k in &idx { nd.push(slice[k]); nw.push(ws[k]); }
-            slice.copy_from_slice(&nd);
-            ws.copy_from_slice(&nw);
-            
-            if !adata.is_empty() {
-                let ds = &mut adata[start..end];
-                let mut n_data = Vec::with_capacity(ds.len());
-                for &k in &idx { n_data.push(ds[k].clone()); }
-                for (i, d) in n_data.into_iter().enumerate() {
-                    ds[i] = d;
-                }
-            }
-        }
-        
+
         (Adjacency { nodes, offsets, dst: adst, w: aw }, adata)
     }
 
@@ -92,133 +66,136 @@ impl Adjacency {
     }
 }
 
+/// The walk grid, either borrowed zero-copy from the snapshot's CSR sections (service
+/// path) or owned (tests / ad-hoc graphs). Weights are derived: cardinal 300ms,
+/// diagonal 300*sqrt(2), selected by the per-slot diagonal bitmap.
+pub enum WalkGraph<'a> {
+    Csr {
+        offsets: &'a [u32],
+        dst: &'a [u32],
+        diag: &'a [u8],
+    },
+    Owned(Adjacency),
+}
+
+impl<'a> WalkGraph<'a> {
+    pub fn from_snapshot(s: &'a Snapshot) -> Self {
+        WalkGraph::Csr { offsets: s.walk_offsets(), dst: s.walk_dst(), diag: s.walk_diag() }
+    }
+
+    pub fn from_edges(nodes: usize, src: &[u32], dst: &[u32], w: &[f32]) -> Self {
+        WalkGraph::Owned(Adjacency::build(nodes, src, dst, w))
+    }
+
+    #[inline]
+    pub fn neighbors(&self, u: u32) -> WalkIter<'_> {
+        match self {
+            WalkGraph::Csr { offsets, dst, diag } => {
+                let u = u as usize;
+                if u + 1 >= offsets.len() {
+                    return WalkIter::Owned { dst: &[], w: &[], i: 0 };
+                }
+                let (s, e) = (offsets[u] as usize, offsets[u + 1] as usize);
+                WalkIter::Csr { dst: &dst[s..e], diag, base: s, i: 0, diag_w: walk_diagonal_ms() }
+            }
+            WalkGraph::Owned(adj) => {
+                let (d, w) = adj.neighbors(u);
+                WalkIter::Owned { dst: d, w, i: 0 }
+            }
+        }
+    }
+}
+
+pub enum WalkIter<'a> {
+    Csr { dst: &'a [u32], diag: &'a [u8], base: usize, i: usize, diag_w: f32 },
+    Owned { dst: &'a [u32], w: &'a [f32], i: usize },
+}
+
+impl Iterator for WalkIter<'_> {
+    type Item = (u32, f32);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            WalkIter::Csr { dst, diag, base, i, diag_w } => {
+                if *i >= dst.len() { return None; }
+                let d = dst[*i];
+                let slot = *base + *i;
+                let is_diag = diag[slot / 8] & (1 << (slot % 8)) != 0;
+                *i += 1;
+                Some((d, if is_diag { *diag_w } else { WALK_CARDINAL_MS }))
+            }
+            WalkIter::Owned { dst, w, i } => {
+                if *i >= dst.len() { return None; }
+                let out = (dst[*i], w[*i]);
+                *i += 1;
+                Some(out)
+            }
+        }
+    }
+}
+
+/// Macro-edge graph (doors/teleport chains) plus per-edge requirement data. The walk
+/// grid lives in [`WalkGraph`]; this provider only carries the ~1k macro edges, so
+/// building it at load is trivial.
 pub struct NeighborProvider {
-    pub walk: Adjacency,
     pub macro_edges: Adjacency,
     pub macro_data: Vec<MacroEdgeData>,
 }
 
 impl NeighborProvider {
-    pub fn new(nodes: usize, walk_src: &[u32], walk_dst: &[u32], walk_w: &[f32], macro_src: &[u32], macro_dst: &[u32], macro_w: &[f32]) -> Self {
-        let (walk, _) = Adjacency::build_with_data::<()>(nodes, walk_src, walk_dst, walk_w, None);
+    pub fn new(nodes: usize, macro_src: &[u32], macro_dst: &[u32], macro_w: &[f32]) -> Self {
         let (macro_edges, _) = Adjacency::build_with_data::<()>(nodes, macro_src, macro_dst, macro_w, None);
-        NeighborProvider { walk, macro_edges, macro_data: Vec::new() }
+        NeighborProvider { macro_edges, macro_data: Vec::new() }
     }
 
-    pub fn new_with_reqs(nodes: usize, walk_src: &[u32], walk_dst: &[u32], walk_w: &[f32], macro_src: &[u32], macro_dst: &[u32], macro_w: &[f32], macro_kind_first: &[u32], macro_reqs: &[Vec<usize>]) -> Self {
-        let (walk, _) = Adjacency::build_with_data::<()>(nodes, walk_src, walk_dst, walk_w, None);
-
+    pub fn new_with_reqs(nodes: usize, macro_src: &[u32], macro_dst: &[u32], macro_w: &[f32], macro_kind_first: &[u32], macro_reqs: &[Vec<usize>]) -> Self {
         let data: Vec<MacroEdgeData> = macro_reqs
             .iter()
             .zip(macro_kind_first.iter())
             .map(|(r, &k)| MacroEdgeData { reqs: r.clone(), kind_first: k })
             .collect();
         let (macro_edges, sorted_data) = Adjacency::build_with_data(nodes, macro_src, macro_dst, macro_w, Some(&data));
-        NeighborProvider { walk, macro_edges, macro_data: sorted_data }
+        NeighborProvider { macro_edges, macro_data: sorted_data }
     }
 
-    pub fn all_neighbors<'a>(&'a self, u: u32, mask: Option<&'a EligibilityMask>, quick_tele: bool) -> impl Iterator<Item = (u32, f32)> + 'a {
-        let (wd, ww) = self.walk.neighbors(u);
-        let (md, mw) = self.macro_edges.neighbors(u);
-        
-        let data = if self.macro_data.is_empty() {
-            None
-        } else {
+    /// Fold the request's eligibility mask and quick-tele flag into per-slot allow flags
+    /// and effective weights. Called once per request, so the search's inner loop never
+    /// touches requirement lists.
+    pub fn macro_filter(&self, mask: &EligibilityMask, quick_tele: bool) -> MacroFilter {
+        let n = self.macro_edges.dst.len();
+        let mut allowed = vec![true; n];
+        let mut w = self.macro_edges.w.clone();
+        for (i, ed) in self.macro_data.iter().enumerate() {
+            if ed.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
+                allowed[i] = false;
+            }
+            // Hardcoded: lodestone cost when hasQuickTele=1
+            if quick_tele && ed.kind_first == 2 {
+                w[i] = 2400.0;
+            }
+        }
+        MacroFilter { allowed, w }
+    }
+
+    pub fn macro_neighbors<'a>(&'a self, u: u32, macro_filter: Option<&'a MacroFilter>) -> impl Iterator<Item = (u32, f32)> + 'a {
+        let (md, _raw_w) = self.macro_edges.neighbors(u);
+        let base = {
             let u = u as usize;
-            if u < self.macro_edges.offsets.len() - 1 {
-                 let s = self.macro_edges.offsets[u];
-                 let e = self.macro_edges.offsets[u + 1];
-                 Some(&self.macro_data[s..e])
-            } else {
-                None
-            }
+            if u < self.macro_edges.offsets.len() - 1 { self.macro_edges.offsets[u] } else { 0 }
         };
-
-        let walk_iter = wd.iter().copied().zip(ww.iter().copied());
-        
-        let macro_iter = md
-            .iter()
-            .copied()
-            .zip(mw.iter().copied())
-            .enumerate()
-            .filter_map(move |(i, (d, w))| {
-                let mut allowed = true;
-
-                if let Some(m) = mask {
-                    if let Some(ds) = data {
-                        if let Some(ed) = ds.get(i) {
-                            for &idx in &ed.reqs {
-                                if !m.is_satisfied(idx) {
-                                    allowed = false;
-                                    break;
-                                }
-                            }
-                        }
+        let raw_w = &self.macro_edges.w;
+        md.iter().copied().enumerate().filter_map(move |(i, d)| {
+            let slot = base + i;
+            match macro_filter {
+                Some(f) => {
+                    if f.allowed[slot] {
+                        Some((d, f.w[slot]))
+                    } else {
+                        None
                     }
                 }
-
-                if !allowed {
-                    return None;
-                }
-
-                let mut w_out = w;
-                if quick_tele {
-                    if let Some(ds) = data {
-                        if let Some(ed) = ds.get(i) {
-                            // Hardcoded: lodestone cost when hasQuickTele=1
-                            if ed.kind_first == 2 {
-                                w_out = 2400.0;
-                            }
-                        }
-                    }
-                }
-
-                Some((d, w_out))
-            });
-
-        MergeNeighbors {
-            left: walk_iter,
-            right: macro_iter,
-            next_left: None,
-            next_right: None,
-        }
-    }
-}
-
-pub struct MergeNeighbors<I1, I2> {
-    left: I1,
-    right: I2,
-    next_left: Option<(u32, f32)>,
-    next_right: Option<(u32, f32)>,
-}
-
-impl<I1, I2> Iterator for MergeNeighbors<I1, I2>
-where I1: Iterator<Item = (u32, f32)>, I2: Iterator<Item = (u32, f32)>
-{
-    type Item = (u32, f32);
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next_left.is_none() { self.next_left = self.left.next(); }
-        if self.next_right.is_none() { self.next_right = self.right.next(); }
-
-        match (self.next_left, self.next_right) {
-            (Some(l), Some(r)) => {
-                if l.0 <= r.0 {
-                    self.next_left = None;
-                    Some(l)
-                } else {
-                    self.next_right = None;
-                    Some(r)
-                }
+                None => Some((d, raw_w[slot])),
             }
-            (Some(l), None) => {
-                self.next_left = None;
-                Some(l)
-            }
-            (None, Some(r)) => {
-                self.next_right = None;
-                Some(r)
-            }
-            (None, None) => None
-        }
+        })
     }
 }

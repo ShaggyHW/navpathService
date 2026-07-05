@@ -114,7 +114,7 @@ struct StepRow {
 fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepRow>> {
     match kind {
         NodeKind::Door => {
-            let mut st = conn.prepare(
+            let mut st = conn.prepare_cached(
                 "SELECT tile_inside_x, tile_inside_y, tile_inside_plane, next_node_type, next_node_id, cost, requirements FROM teleports_door_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
@@ -140,7 +140,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
             Ok(row)
         }
         NodeKind::Lodestone => {
-            let mut st = conn.prepare(
+            let mut st = conn.prepare_cached(
                 "SELECT dest_x, dest_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_lodestone_nodes WHERE id = ?1",
             )?;
             let mut row = st.query_row(params![id], |r: &Row| {
@@ -165,7 +165,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
             }).optional()?;
             // Best-effort: fetch lodestone name if the column exists in this DB
             if let Some(ref mut sr) = row {
-                if let Ok(mut st_name) = conn.prepare("SELECT lodestone FROM teleports_lodestone_nodes WHERE id = ?1") {
+                if let Ok(mut st_name) = conn.prepare_cached("SELECT lodestone FROM teleports_lodestone_nodes WHERE id = ?1") {
                     let name_res: std::result::Result<Option<String>, _> = st_name.query_row(params![id], |r: &Row| r.get::<_, Option<String>>(0));
                     if let Ok(name_opt) = name_res { sr.lodestone = name_opt; }
                 }
@@ -173,7 +173,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
             Ok(row)
         }
         NodeKind::Npc => {
-            let mut st = conn.prepare(
+            let mut st = conn.prepare_cached(
                 "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_npc_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
@@ -199,7 +199,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
             Ok(row)
         }
         NodeKind::Object => {
-            let mut st = conn.prepare(
+            let mut st = conn.prepare_cached(
                 "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_object_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
@@ -225,7 +225,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
             Ok(row)
         }
         NodeKind::Item => {
-            let mut st = conn.prepare(
+            let mut st = conn.prepare_cached(
                 "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_item_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
@@ -251,7 +251,7 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
             Ok(row)
         }
         NodeKind::Ifslot => {
-            let mut st = conn.prepare(
+            let mut st = conn.prepare_cached(
                 "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_ifslot_nodes WHERE id = ?1",
             )?;
             let row = st.query_row(params![id], |r: &Row| {
@@ -283,7 +283,7 @@ fn collect_incoming_pairs(conn: &Connection) -> Result<HashSet<(NodeKind, i64)>>
     let mut set: HashSet<(NodeKind, i64)> = HashSet::new();
     // Helper to scan a table's next_node_type/id
     let mut add_from = |sql: &str| -> Result<()> {
-        let mut st = conn.prepare(sql)?;
+        let mut st = conn.prepare_cached(sql)?;
         let rows = st.query_map([], |r: &Row| {
             let nt: Option<String> = r.get(0)?;
             let nid: Option<i64> = r.get(1)?;
@@ -313,7 +313,7 @@ fn enumerate_chain_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64, (i32,
 
     // Doors: src is outside tile
     {
-        let mut st = conn.prepare(
+        let mut st = conn.prepare_cached(
             "SELECT id, tile_outside_x, tile_outside_y, tile_outside_plane FROM teleports_door_nodes \
              WHERE tile_outside_x IS NOT NULL AND tile_outside_y IS NOT NULL AND tile_outside_plane IS NOT NULL \
              ORDER BY tile_outside_plane, tile_outside_y, tile_outside_x",
@@ -330,7 +330,7 @@ fn enumerate_chain_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64, (i32,
 
     // NPCs: src is orig_min_*
     {
-        let mut st = conn.prepare(
+        let mut st = conn.prepare_cached(
             "SELECT id, orig_min_x, orig_min_y, orig_plane FROM teleports_npc_nodes \
              WHERE orig_min_x IS NOT NULL AND orig_min_y IS NOT NULL AND orig_plane IS NOT NULL \
              ORDER BY orig_plane, orig_min_y, orig_min_x",
@@ -347,7 +347,7 @@ fn enumerate_chain_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64, (i32,
 
     // Objects: src is orig_min_*
     {
-        let mut st = conn.prepare(
+        let mut st = conn.prepare_cached(
             "SELECT id, orig_min_x, orig_min_y, orig_plane FROM teleports_object_nodes \
              WHERE orig_min_x IS NOT NULL AND orig_min_y IS NOT NULL AND orig_plane IS NOT NULL \
              ORDER BY orig_plane, orig_min_y, orig_min_x",
@@ -473,7 +473,7 @@ fn enumerate_global_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64)>> {
     let mut out: Vec<(NodeKind, i64)> = Vec::new();
     // Lodestones
     {
-        let mut st = conn.prepare("SELECT id FROM teleports_lodestone_nodes ORDER BY id")?;
+        let mut st = conn.prepare_cached("SELECT id FROM teleports_lodestone_nodes ORDER BY id")?;
         let rows = st.query_map([], |r: &Row| {
             let id: i64 = r.get(0)?;
             Ok(id)
@@ -485,7 +485,7 @@ fn enumerate_global_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64)>> {
     }
     // Items
     {
-        let mut st = conn.prepare("SELECT id FROM teleports_item_nodes ORDER BY id")?;
+        let mut st = conn.prepare_cached("SELECT id FROM teleports_item_nodes ORDER BY id")?;
         let rows = st.query_map([], |r: &Row| {
             let id: i64 = r.get(0)?;
             Ok(id)
@@ -497,7 +497,7 @@ fn enumerate_global_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64)>> {
     }
     // Ifslots
     {
-        let mut st = conn.prepare("SELECT id FROM teleports_ifslot_nodes ORDER BY id")?;
+        let mut st = conn.prepare_cached("SELECT id FROM teleports_ifslot_nodes ORDER BY id")?;
         let rows = st.query_map([], |r: &Row| {
             let id: i64 = r.get(0)?;
             Ok(id)

@@ -1,9 +1,13 @@
 use std::{fs::File, path::Path};
 
-use byteorder::{ByteOrder, LittleEndian};
 use memmap2::Mmap;
 
-use super::manifest::{Manifest, ManifestError};
+use super::manifest::{pack_coord, unpack_coord, Manifest, ManifestError};
+
+// The v8 reader reinterprets aligned mmap sections as typed slices; that requires a
+// little-endian host (all deployment targets are x86-64/aarch64 LE).
+#[cfg(not(target_endian = "little"))]
+compile_error!("navpath snapshot reader requires a little-endian target");
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -28,53 +32,71 @@ impl Snapshot {
         let header = &mmap[0..Manifest::SIZE];
         let manifest = Manifest::parse(header)?;
         manifest.validate_layout(mmap.len())?;
+        // The ALT table is randomly accessed in ~100-byte rows; default readahead would
+        // fault in wasted pages around every touch. Optionally pre-populate everything
+        // (NAVPATH_MMAP_POPULATE=1) when RAM comfortably fits the snapshot.
+        let _ = mmap.advise(memmap2::Advice::Random);
+        if std::env::var("NAVPATH_MMAP_POPULATE").ok().as_deref() == Some("1") {
+            let _ = mmap.advise(memmap2::Advice::WillNeed);
+        }
         Ok(Snapshot { mmap, manifest })
     }
 
     pub fn manifest(&self) -> &Manifest { &self.manifest }
     pub fn counts(&self) -> super::manifest::SnapshotCounts { self.manifest.counts }
 
-    pub fn nodes_ids(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_nodes_ids, self.manifest.counts.nodes as usize)
+    /// # Safety rationale
+    /// `validate_layout` guarantees the section fits the file and starts on a 64-byte
+    /// boundary, and mmap bases are page-aligned, so the cast slice is in-bounds and
+    /// properly aligned for T.
+    #[inline]
+    fn section<T>(&self, off: u64, count: usize) -> &[T] {
+        let start = off as usize;
+        debug_assert!(start + count * core::mem::size_of::<T>() <= self.mmap.len());
+        debug_assert_eq!(start % core::mem::align_of::<T>(), 0);
+        unsafe { std::slice::from_raw_parts(self.mmap.as_ptr().add(start) as *const T, count) }
     }
-    pub fn nodes_x(&self) -> LeSliceI32<'_> {
-        self.view_i32(self.manifest.off_nodes_x, self.manifest.counts.nodes as usize)
+
+    #[inline]
+    pub fn coords_packed(&self) -> &[u32] {
+        self.section(self.manifest.off_coords, self.manifest.counts.nodes as usize)
     }
-    pub fn nodes_y(&self) -> LeSliceI32<'_> {
-        self.view_i32(self.manifest.off_nodes_y, self.manifest.counts.nodes as usize)
+    #[inline]
+    pub fn walk_offsets(&self) -> &[u32] {
+        self.section(self.manifest.off_walk_offsets, self.manifest.counts.nodes as usize + 1)
     }
-    pub fn nodes_plane(&self) -> LeSliceI32<'_> {
-        self.view_i32(self.manifest.off_nodes_plane, self.manifest.counts.nodes as usize)
+    #[inline]
+    pub fn walk_dst(&self) -> &[u32] {
+        self.section(self.manifest.off_walk_dst, self.manifest.counts.walk_edges as usize)
     }
-    pub fn walk_src(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_walk_src, self.manifest.counts.walk_edges as usize)
+    #[inline]
+    pub fn walk_diag(&self) -> &[u8] {
+        self.section(self.manifest.off_walk_diag, (self.manifest.counts.walk_edges as usize).div_ceil(8))
     }
-    pub fn walk_dst(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_walk_dst, self.manifest.counts.walk_edges as usize)
+    #[inline]
+    pub fn comp_ids(&self) -> &[u16] {
+        self.section(self.manifest.off_comp, self.manifest.counts.nodes as usize)
     }
-    pub fn walk_w(&self) -> LeSliceF32<'_> {
-        self.view_f32(self.manifest.off_walk_w, self.manifest.counts.walk_edges as usize)
+    pub fn macro_src(&self) -> &[u32] {
+        self.section(self.manifest.off_macro_src, self.manifest.counts.macro_edges as usize)
     }
-    pub fn macro_src(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_macro_src, self.manifest.counts.macro_edges as usize)
+    pub fn macro_dst(&self) -> &[u32] {
+        self.section(self.manifest.off_macro_dst, self.manifest.counts.macro_edges as usize)
     }
-    pub fn macro_dst(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_macro_dst, self.manifest.counts.macro_edges as usize)
+    pub fn macro_w(&self) -> &[f32] {
+        self.section(self.manifest.off_macro_w, self.manifest.counts.macro_edges as usize)
     }
-    pub fn macro_w(&self) -> LeSliceF32<'_> {
-        self.view_f32(self.manifest.off_macro_w, self.manifest.counts.macro_edges as usize)
+    pub fn macro_kind_first(&self) -> &[u32] {
+        self.section(self.manifest.off_macro_kind_first, self.manifest.counts.macro_edges as usize)
     }
-    pub fn macro_kind_first(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_macro_kind_first, self.manifest.counts.macro_edges as usize)
+    pub fn macro_id_first(&self) -> &[u32] {
+        self.section(self.manifest.off_macro_id_first, self.manifest.counts.macro_edges as usize)
     }
-    pub fn macro_id_first(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_macro_id_first, self.manifest.counts.macro_edges as usize)
+    pub fn macro_meta_offs(&self) -> &[u32] {
+        self.section(self.manifest.off_macro_meta_offs, self.manifest.counts.macro_edges as usize)
     }
-    pub fn macro_meta_offs(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_macro_meta_offs, self.manifest.counts.macro_edges as usize)
-    }
-    pub fn macro_meta_lens(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_macro_meta_lens, self.manifest.counts.macro_edges as usize)
+    pub fn macro_meta_lens(&self) -> &[u32] {
+        self.section(self.manifest.off_macro_meta_lens, self.manifest.counts.macro_edges as usize)
     }
     pub fn macro_meta_blob(&self) -> &[u8] {
         let start = self.manifest.off_macro_meta_blob as usize;
@@ -84,328 +106,190 @@ impl Snapshot {
     pub fn macro_meta_at(&self, idx: usize) -> Option<&[u8]> {
         let offs = self.macro_meta_offs();
         let lens = self.macro_meta_lens();
-        if idx >= offs.len() || idx >= lens.len() { return None; }
-        let o = offs.get(idx)? as usize;
-        let l = lens.get(idx)? as usize;
+        if idx >= offs.len() { return None; }
+        let o = offs[idx] as usize;
+        let l = lens[idx] as usize;
         let blob = self.macro_meta_blob();
-        if o + l <= blob.len() { Some(&blob[o..o+l]) } else { None }
+        if o + l <= blob.len() { Some(&blob[o..o + l]) } else { None }
     }
-    pub fn req_tags(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_req_tags, self.manifest.counts.req_tags as usize)
+    pub fn req_tags(&self) -> &[u32] {
+        self.section(self.manifest.off_req_tags, self.manifest.counts.req_tags as usize)
     }
-    pub fn landmarks(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_landmarks, self.manifest.counts.landmarks as usize)
+    pub fn landmarks(&self) -> &[u32] {
+        self.section(self.manifest.off_landmarks, self.manifest.counts.landmarks as usize)
     }
-    pub fn lm_fw(&self) -> LeSliceF32<'_> {
+    /// Interleaved quantized ALT table: `[node][landmark][fw, bw]` u16 quanta.
+    #[inline]
+    pub fn lm_tab(&self) -> &[u16] {
         let n = (self.manifest.counts.nodes as usize)
-            .saturating_mul(self.manifest.counts.landmarks as usize);
-        self.view_f32(self.manifest.off_lm_fw, n)
-    }
-    pub fn lm_bw(&self) -> LeSliceF32<'_> {
-        let n = (self.manifest.counts.nodes as usize)
-            .saturating_mul(self.manifest.counts.landmarks as usize);
-        self.view_f32(self.manifest.off_lm_bw, n)
+            .saturating_mul(self.manifest.counts.landmarks as usize)
+            .saturating_mul(2);
+        self.section(self.manifest.off_lm_tab, n)
     }
 
     // Fairy Ring accessors
-    pub fn fairy_nodes(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_fairy_nodes, self.manifest.counts.fairy_rings as usize)
+    pub fn fairy_nodes(&self) -> &[u32] {
+        self.section(self.manifest.off_fairy_nodes, self.manifest.counts.fairy_rings as usize)
     }
-    pub fn fairy_cost_ms(&self) -> LeSliceF32<'_> {
-        self.view_f32(self.manifest.off_fairy_cost_ms, self.manifest.counts.fairy_rings as usize)
+    pub fn fairy_cost_ms(&self) -> &[f32] {
+        self.section(self.manifest.off_fairy_cost_ms, self.manifest.counts.fairy_rings as usize)
     }
-    pub fn fairy_meta_offs(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_fairy_meta_offs, self.manifest.counts.fairy_rings as usize)
+    pub fn fairy_meta_offs(&self) -> &[u32] {
+        self.section(self.manifest.off_fairy_meta_offs, self.manifest.counts.fairy_rings as usize)
     }
-    pub fn fairy_meta_lens(&self) -> LeSliceU32<'_> {
-        self.view_u32(self.manifest.off_fairy_meta_lens, self.manifest.counts.fairy_rings as usize)
+    pub fn fairy_meta_lens(&self) -> &[u32] {
+        self.section(self.manifest.off_fairy_meta_lens, self.manifest.counts.fairy_rings as usize)
     }
     pub fn fairy_meta_blob(&self) -> &[u8] {
         let start = self.manifest.off_fairy_meta_blob as usize;
-        // The blob extends to the end of the file (minus the 32-byte hash) or to the next section
-        // For now we'll compute based on the last entry's offset + len
         let end = self.mmap.len().saturating_sub(32); // hash at tail
         if start <= end { &self.mmap[start..end] } else { &[] }
     }
     pub fn fairy_meta_at(&self, idx: usize) -> Option<&[u8]> {
         let offs = self.fairy_meta_offs();
         let lens = self.fairy_meta_lens();
-        if idx >= offs.len() || idx >= lens.len() { return None; }
-        let o = offs.get(idx)? as usize;
-        let l = lens.get(idx)? as usize;
+        if idx >= offs.len() { return None; }
+        let o = offs[idx] as usize;
+        let l = lens[idx] as usize;
         let blob = self.fairy_meta_blob();
-        if o + l <= blob.len() { Some(&blob[o..o+l]) } else { None }
+        if o + l <= blob.len() { Some(&blob[o..o + l]) } else { None }
     }
 
-    fn view_u32(&self, off: u64, count: usize) -> LeSliceU32<'_> {
-        let b = &self.mmap[off as usize..off as usize + count * core::mem::size_of::<u32>()];
-        LeSliceU32 { bytes: b }
+    /// Node coordinates, unpacked from the packed section.
+    #[inline]
+    pub fn node_coord(&self, id: u32) -> (i32, i32, i32) {
+        let cs = self.coords_packed();
+        match cs.get(id as usize) {
+            Some(&k) => unpack_coord(k),
+            None => (0, 0, 0),
+        }
     }
-    fn view_f32(&self, off: u64, count: usize) -> LeSliceF32<'_> {
-        let b = &self.mmap[off as usize..off as usize + count * core::mem::size_of::<f32>()];
-        LeSliceF32 { bytes: b }
+
+    /// Coordinate -> node id. Node ids are assigned in ascending packed-key order, so
+    /// this is a binary search over the mmap'd coords section — no heap index needed.
+    pub fn find_node(&self, x: i32, y: i32, plane: i32) -> Option<u32> {
+        if !(0..32768).contains(&x) || !(0..32768).contains(&y) || !(0..4).contains(&plane) {
+            return None;
+        }
+        let key = pack_coord(x, y, plane);
+        self.coords_packed().binary_search(&key).ok().map(|i| i as u32)
     }
-    fn view_i32(&self, off: u64, count: usize) -> LeSliceI32<'_> {
-        let b = &self.mmap[off as usize..off as usize + count * core::mem::size_of::<i32>()];
-        LeSliceI32 { bytes: b }
+
+    /// Weight of the walk edge u->v if it exists (scans u's neighbor slice; degree <= 8).
+    pub fn walk_edge_weight(&self, u: u32, v: u32) -> Option<f32> {
+        let offs = self.walk_offsets();
+        let u = u as usize;
+        if u + 1 >= offs.len() { return None; }
+        let (s, e) = (offs[u] as usize, offs[u + 1] as usize);
+        let dst = self.walk_dst();
+        let diag = self.walk_diag();
+        for slot in s..e {
+            if dst[slot] == v {
+                let is_diag = diag[slot / 8] & (1 << (slot % 8)) != 0;
+                return Some(if is_diag {
+                    super::manifest::walk_diagonal_ms()
+                } else {
+                    super::manifest::WALK_CARDINAL_MS
+                });
+            }
+        }
+        None
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct LeSliceU32<'a> { pub(crate) bytes: &'a [u8] }
-impl<'a> LeSliceU32<'a> {
-    pub fn len(&self) -> usize { self.bytes.len() / 4 }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
-    pub fn get(&self, idx: usize) -> Option<u32> {
-        if idx < self.len() {
-            let start = idx * 4;
-            Some(LittleEndian::read_u32(&self.bytes[start..start+4]))
-        } else { None }
-    }
-    pub fn iter(&self) -> LeIterU32<'a> { LeIterU32 { s: *self, i: 0 } }
-}
-
-pub struct LeIterU32<'a> { s: LeSliceU32<'a>, i: usize }
-impl<'a> Iterator for LeIterU32<'a> {
-    type Item = u32;
-    fn next(&mut self) -> Option<Self::Item> {
-        let v = self.s.get(self.i)?;
-        self.i += 1;
-        Some(v)
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let r = self.s.len() - self.i;
-        (r, Some(r))
-    }
-}
-impl<'a> ExactSizeIterator for LeIterU32<'a> {}
-
-#[derive(Clone, Copy)]
-pub struct LeSliceF32<'a> { pub(crate) bytes: &'a [u8] }
-impl<'a> LeSliceF32<'a> {
-    pub fn len(&self) -> usize { self.bytes.len() / 4 }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
-    pub fn get(&self, idx: usize) -> Option<f32> {
-        if idx < self.len() {
-            let start = idx * 4;
-            Some(LittleEndian::read_f32(&self.bytes[start..start+4]))
-        } else { None }
-    }
-    pub fn iter(&self) -> LeIterF32<'a> { LeIterF32 { s: *self, i: 0 } }
-}
-
-pub struct LeIterF32<'a> { s: LeSliceF32<'a>, i: usize }
-impl<'a> Iterator for LeIterF32<'a> {
-    type Item = f32;
-    fn next(&mut self) -> Option<Self::Item> {
-        let v = self.s.get(self.i)?;
-        self.i += 1;
-        Some(v)
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let r = self.s.len() - self.i;
-        (r, Some(r))
-    }
-}
-impl<'a> ExactSizeIterator for LeIterF32<'a> {}
-
-#[derive(Clone, Copy)]
-pub struct LeSliceI32<'a> { pub(crate) bytes: &'a [u8] }
-impl<'a> LeSliceI32<'a> {
-    pub fn len(&self) -> usize { self.bytes.len() / 4 }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
-    pub fn get(&self, idx: usize) -> Option<i32> {
-        if idx < self.len() {
-            let start = idx * 4;
-            Some(LittleEndian::read_i32(&self.bytes[start..start+4]))
-        } else { None }
-    }
-    pub fn iter(&self) -> LeIterI32<'a> { LeIterI32 { s: *self, i: 0 } }
-}
-
-pub struct LeIterI32<'a> { s: LeSliceI32<'a>, i: usize }
-impl<'a> Iterator for LeIterI32<'a> {
-    type Item = i32;
-    fn next(&mut self) -> Option<Self::Item> {
-        let v = self.s.get(self.i)?;
-        self.i += 1;
-        Some(v)
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let r = self.s.len() - self.i;
-        (r, Some(r))
-    }
-}
-impl<'a> ExactSizeIterator for LeIterI32<'a> {}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "builder"))]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;    
+    use crate::snapshot::manifest::{pack_coord, ALT_UNREACHABLE};
+    use crate::snapshot::writer::{write_snapshot_v8, SnapshotSections};
+    use tempfile::NamedTempFile;
 
     #[test]
-    fn open_and_read_small_fixture() {
-        // Build header
-        let mut header = vec![0u8; Manifest::SIZE];
-        header[0..4].copy_from_slice(&super::super::manifest::SNAPSHOT_MAGIC);
-        LittleEndian::write_u32(&mut header[4..8], super::super::manifest::SNAPSHOT_VERSION);
-        let n_nodes = 3u32; let walk = 2u32; let mac = 1u32; let req = 4u32; let lm = 2u32; let fairy = 1u32;
-        let c0 = 8;
-        LittleEndian::write_u32(&mut header[c0..c0+4], n_nodes);
-        LittleEndian::write_u32(&mut header[c0+4..c0+8], walk);
-        LittleEndian::write_u32(&mut header[c0+8..c0+12], mac);
-        LittleEndian::write_u32(&mut header[c0+12..c0+16], req);
-        LittleEndian::write_u32(&mut header[c0+16..c0+20], lm);
-        LittleEndian::write_u32(&mut header[c0+20..c0+24], fairy);
-        let o0 = c0 + 24;
-        let off_nodes_ids = Manifest::SIZE as u64;
-        let off_nodes_x = off_nodes_ids + (n_nodes as u64)*4;
-        let off_nodes_y = off_nodes_x + (n_nodes as u64)*4;
-        let off_nodes_plane = off_nodes_y + (n_nodes as u64)*4;
-        let off_walk_src = off_nodes_plane + (n_nodes as u64)*4;
-        let off_walk_dst = off_walk_src + (walk as u64)*4;
-        let off_walk_w = off_walk_dst + (walk as u64)*4;
-        let off_macro_src = off_walk_w + (walk as u64)*4;
-        let off_macro_dst = off_macro_src + (mac as u64)*4;
-        let off_macro_w = off_macro_dst + (mac as u64)*4;
-        let off_macro_kind_first = off_macro_w + (mac as u64)*4;
-        let off_macro_id_first = off_macro_kind_first + (mac as u64)*4;
-        let off_meta_offs = off_macro_id_first + (mac as u64)*4;
-        let off_meta_lens = off_meta_offs + (mac as u64)*4;
-        let off_meta_blob = off_meta_lens + (mac as u64)*4;
-        let off_req = off_meta_blob + 2u64; // "{}" blob
-        let off_lm = off_req + (req as u64)*4;
-        let alt_bytes = (n_nodes as u64)
-            .saturating_mul(lm as u64)
-            .saturating_mul(4);
-        let off_lm_fw = off_lm + (lm as u64)*4;
-        let off_lm_bw = off_lm_fw + alt_bytes;
-        // Fairy ring offsets
-        let off_fairy_nodes = off_lm_bw + alt_bytes;
-        let off_fairy_cost_ms = off_fairy_nodes + (fairy as u64)*4;
-        let off_fairy_meta_offs = off_fairy_cost_ms + (fairy as u64)*4;
-        let off_fairy_meta_lens = off_fairy_meta_offs + (fairy as u64)*4;
-        let off_fairy_meta_blob = off_fairy_meta_lens + (fairy as u64)*4;
+    fn v8_roundtrip() {
+        // 3 nodes in a line on plane 0: (100,50) (101,50) (102,50); edges 0<->1<->2
+        // cardinal; one diagonal edge 0->2 for bitmap coverage (synthetic).
+        let coords = [
+            pack_coord(100, 50, 0),
+            pack_coord(101, 50, 0),
+            pack_coord(102, 50, 0),
+        ];
+        let walk_offsets = [0u32, 2, 4, 6];
+        let walk_dst = [1u32, 2, 0, 2, 1, 0];
+        // slot 1 (0->2) and slot 5 (2->0) are diagonal
+        let walk_diag = [0b0010_0010u8];
+        let comp = [0u16, 0, 0];
+        let lm_ids = [0u32, 2];
+        // lm_tab: [node][lm][fw,bw]; node1 unreachable from lm1 for sentinel coverage
+        let lm_tab: [u16; 12] = [
+            0, 0, 5, 5,
+            2, 2, ALT_UNREACHABLE, 3,
+            5, 5, 0, 0,
+        ];
+        let meta_blob = b"{}".to_vec();
+        let fairy_blob = br#"{"code":"ALS"}"#.to_vec();
+        let s = SnapshotSections {
+            coords_packed: &coords,
+            walk_offsets: &walk_offsets,
+            walk_dst: &walk_dst,
+            walk_diag: &walk_diag,
+            comp: &comp,
+            walk_components: 1,
+            macro_src: &[0],
+            macro_dst: &[2],
+            macro_w: &[3.5],
+            macro_kind_first: &[2],
+            macro_id_first: &[42],
+            macro_meta_offs: &[0],
+            macro_meta_lens: &[2],
+            macro_meta_blob: &meta_blob,
+            req_tags: &[7, 8, 9, 10],
+            landmarks: &lm_ids,
+            lm_tab: &lm_tab,
+            fairy_nodes: &[0],
+            fairy_cost_ms: &[600.0],
+            fairy_meta_offs: &[0],
+            fairy_meta_lens: &[fairy_blob.len() as u32],
+            fairy_meta_blob: &fairy_blob,
+        };
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let res = write_snapshot_v8(&path, &s).expect("write v8");
 
-        LittleEndian::write_u64(&mut header[o0..o0+8], off_nodes_ids);
-        LittleEndian::write_u64(&mut header[o0+8..o0+16], off_nodes_x);
-        LittleEndian::write_u64(&mut header[o0+16..o0+24], off_nodes_y);
-        LittleEndian::write_u64(&mut header[o0+24..o0+32], off_nodes_plane);
-        LittleEndian::write_u64(&mut header[o0+32..o0+40], off_walk_src);
-        LittleEndian::write_u64(&mut header[o0+40..o0+48], off_walk_dst);
-        LittleEndian::write_u64(&mut header[o0+48..o0+56], off_walk_w);
-        LittleEndian::write_u64(&mut header[o0+56..o0+64], off_macro_src);
-        LittleEndian::write_u64(&mut header[o0+64..o0+72], off_macro_dst);
-        LittleEndian::write_u64(&mut header[o0+72..o0+80], off_macro_w);
-        LittleEndian::write_u64(&mut header[o0+80..o0+88], off_macro_kind_first);
-        LittleEndian::write_u64(&mut header[o0+88..o0+96], off_macro_id_first);
-        LittleEndian::write_u64(&mut header[o0+96..o0+104], off_meta_offs);
-        LittleEndian::write_u64(&mut header[o0+104..o0+112], off_meta_lens);
-        LittleEndian::write_u64(&mut header[o0+112..o0+120], off_meta_blob);
-        LittleEndian::write_u64(&mut header[o0+120..o0+128], off_req);
-        LittleEndian::write_u64(&mut header[o0+128..o0+136], off_lm);
-        LittleEndian::write_u64(&mut header[o0+136..o0+144], off_lm_fw);
-        LittleEndian::write_u64(&mut header[o0+144..o0+152], off_lm_bw);
-        LittleEndian::write_u64(&mut header[o0+152..o0+160], off_fairy_nodes);
-        LittleEndian::write_u64(&mut header[o0+160..o0+168], off_fairy_cost_ms);
-        LittleEndian::write_u64(&mut header[o0+168..o0+176], off_fairy_meta_offs);
-        LittleEndian::write_u64(&mut header[o0+176..o0+184], off_fairy_meta_lens);
-        LittleEndian::write_u64(&mut header[o0+184..o0+192], off_fairy_meta_blob);
-
-        // Build data
-        let mut data = Vec::new();
-        // nodes ids
-        for v in [10u32,11,12] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // nodes x
-        for v in [3200i32,3201,3202] { let mut b=[0u8;4]; LittleEndian::write_i32(&mut b, v); data.extend_from_slice(&b); }
-        // nodes y
-        for v in [3200i32,3200,3200] { let mut b=[0u8;4]; LittleEndian::write_i32(&mut b, v); data.extend_from_slice(&b); }
-        // nodes plane
-        for v in [0i32,0,0] { let mut b=[0u8;4]; LittleEndian::write_i32(&mut b, v); data.extend_from_slice(&b); }
-        // walk src
-        for v in [0u32,1] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // walk dst
-        for v in [1u32,2] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // walk w
-        for v in [1.5f32, 2.25] { let mut b=[0u8;4]; LittleEndian::write_f32(&mut b, v); data.extend_from_slice(&b); }
-        // macro src
-        for v in [0u32] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // macro dst
-        for v in [2u32] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // macro w
-        for v in [3.5f32] { let mut b=[0u8;4]; LittleEndian::write_f32(&mut b, v); data.extend_from_slice(&b); }
-        // macro kind first (e.g., 1 = door)
-        for v in [1u32] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // macro id first
-        for v in [42u32] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // meta offs/lens
-        for v in [0u32] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        for v in [2u32] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // meta blob = "{}"
-        data.extend_from_slice(b"{}");
-        // req tags
-        for v in [7u32,8,9,10] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // landmarks
-        for v in [100u32,200] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // lm_fw (zeros ok for test)
-        for _ in 0..(n_nodes as usize * lm as usize) { let mut b=[0u8;4]; LittleEndian::write_f32(&mut b, 0.0); data.extend_from_slice(&b); }
-        // lm_bw (zeros)
-        for _ in 0..(n_nodes as usize * lm as usize) { let mut b=[0u8;4]; LittleEndian::write_f32(&mut b, 0.0); data.extend_from_slice(&b); }
-        // fairy ring data
-        // fairy_nodes
-        for v in [0u32] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // fairy_cost_ms
-        for v in [500.0f32] { let mut b=[0u8;4]; LittleEndian::write_f32(&mut b, v); data.extend_from_slice(&b); }
-        // fairy_meta_offs
-        for v in [0u32] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // fairy_meta_lens
-        for v in [2u32] { let mut b=[0u8;4]; LittleEndian::write_u32(&mut b, v); data.extend_from_slice(&b); }
-        // fairy_meta_blob = "{}"
-        data.extend_from_slice(b"{}");
-        // Add 32-byte hash placeholder at end
-        data.extend_from_slice(&[0u8; 32]);
-
-        // write to file
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&header).unwrap();
-        tmp.write_all(&data).unwrap();
-        let path = tmp.into_temp_path();
-
-        let snap = Snapshot::open(&path).expect("open snapshot");
-        assert_eq!(snap.manifest().version, super::super::manifest::SNAPSHOT_VERSION);
+        let snap = Snapshot::open(&path).expect("open v8");
         let c = snap.counts();
         assert_eq!(c.nodes, 3);
-        assert_eq!(c.walk_edges, 2);
+        assert_eq!(c.walk_edges, 6);
         assert_eq!(c.macro_edges, 1);
-        assert_eq!(c.req_tags, 4);
         assert_eq!(c.landmarks, 2);
-        assert_eq!(c.fairy_rings, 1);
+        assert_eq!(c.walk_components, 1);
 
-        let nodes: Vec<u32> = snap.nodes_ids().iter().collect();
-        assert_eq!(nodes, vec![10,11,12]);
-        let wsrc: Vec<u32> = snap.walk_src().iter().collect();
-        let wdst: Vec<u32> = snap.walk_dst().iter().collect();
-        let ww: Vec<f32> = snap.walk_w().iter().collect();
-        assert_eq!(wsrc, vec![0,1]);
-        assert_eq!(wdst, vec![1,2]);
-        assert!((ww[0]-1.5).abs() < 1e-6 && (ww[1]-2.25).abs() < 1e-6);
-        let msrc: Vec<u32> = snap.macro_src().iter().collect();
-        let mdst: Vec<u32> = snap.macro_dst().iter().collect();
-        let mw: Vec<f32> = snap.macro_w().iter().collect();
-        assert_eq!(msrc, vec![0]);
-        assert_eq!(mdst, vec![2]);
-        assert!((mw[0]-3.5).abs() < 1e-6);
-        let req: Vec<u32> = snap.req_tags().iter().collect();
-        assert_eq!(req, vec![7,8,9,10]);
-        let lm: Vec<u32> = snap.landmarks().iter().collect();
-        assert_eq!(lm, vec![100,200]);
-        assert_eq!(snap.lm_fw().len(), (c.nodes as usize * 2));
-        assert_eq!(snap.lm_bw().len(), (c.nodes as usize * 2));
-        // Fairy ring assertions
-        let fairy_nodes: Vec<u32> = snap.fairy_nodes().iter().collect();
-        assert_eq!(fairy_nodes, vec![0]);
-        let fairy_costs: Vec<f32> = snap.fairy_cost_ms().iter().collect();
-        assert!((fairy_costs[0] - 500.0).abs() < 1e-6);
+        assert_eq!(snap.coords_packed(), &coords);
+        assert_eq!(snap.node_coord(1), (101, 50, 0));
+        assert_eq!(snap.find_node(102, 50, 0), Some(2));
+        assert_eq!(snap.find_node(103, 50, 0), None);
+
+        assert_eq!(snap.walk_offsets(), &walk_offsets);
+        assert_eq!(snap.walk_dst(), &walk_dst);
+        // slot 0 (0->1) cardinal, slot 1 (0->2) diagonal
+        assert_eq!(snap.walk_edge_weight(0, 1), Some(300.0));
+        let d = snap.walk_edge_weight(0, 2).unwrap();
+        assert!((d - 424.26407).abs() < 1e-3);
+        assert_eq!(snap.walk_edge_weight(1, 1), None);
+
+        assert_eq!(snap.comp_ids(), &comp);
+        assert_eq!(snap.macro_src(), &[0]);
+        assert_eq!(snap.macro_w(), &[3.5]);
+        assert_eq!(snap.macro_meta_at(0).unwrap(), b"{}");
+        assert_eq!(snap.req_tags(), &[7, 8, 9, 10]);
+        assert_eq!(snap.landmarks(), &lm_ids);
+        assert_eq!(snap.lm_tab(), &lm_tab);
+        assert_eq!(snap.fairy_meta_at(0).unwrap(), &fairy_blob[..]);
+
+        // hash tail matches
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[bytes.len() - 32..], &res.hash);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&bytes[..bytes.len() - 32]);
+        assert_eq!(hasher.finalize().as_bytes(), &res.hash);
     }
 }

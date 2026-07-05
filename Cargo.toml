@@ -15,3 +15,15 @@ codegen-units = 1
 panic = "abort"
 strip = true
 opt-level = 3
+
+# Release codegen with symbols kept for perf/flamegraph/samply.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
+# criterion benches: panic=abort is incompatible with the bench harness.
+[profile.bench]
+inherits = "release"
+panic = "unwind"
+strip = "none"

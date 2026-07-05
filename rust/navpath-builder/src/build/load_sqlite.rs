@@ -11,13 +11,6 @@ pub struct Tile {
     pub walk_mask: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct TeleEdge {
-    pub src: u32,
-    pub dst: u32,
-    pub cost: f32,
-}
-
 /// A Fairy Ring node loaded from SQLite
 #[derive(Debug, Clone)]
 pub struct FairyRingRow {
@@ -36,8 +29,11 @@ pub struct FairyRingRow {
 }
 
 pub fn load_all_tiles(conn: &Connection) -> Result<Vec<Tile>> {
+    // No SQL ORDER BY: the tiles PK is (x,y,plane), so ordering by (plane,y,x) forces a
+    // TEMP B-TREE sort over every row (~15x slower scan). Load in table order and sort
+    // in Rust below — node-id assignment stays byte-identical.
     let mut stmt = conn.prepare(
-        "SELECT x, y, plane, walk_mask FROM tiles ORDER BY plane, y, x",
+        "SELECT x, y, plane, walk_mask FROM tiles",
     )?;
     let rows = stmt.query_map([], |row: &Row| {
         let x: i32 = row.get(0)?;
@@ -48,7 +44,7 @@ pub fn load_all_tiles(conn: &Connection) -> Result<Vec<Tile>> {
             x,
             y,
             plane,
-            walk_mask: (walk_mask_val as i128 as i64) as u32, // truncate to 32 bits safely
+            walk_mask: walk_mask_val as u32,
         })
     })?;
 
@@ -56,47 +52,7 @@ pub fn load_all_tiles(conn: &Connection) -> Result<Vec<Tile>> {
     for r in rows {
         out.push(r?);
     }
-    Ok(out)
-}
-
-pub fn load_localized_teleports(
-    conn: &Connection,
-    node_id_of: &HashMap<(i32, i32, i32), u32>,
-) -> Result<Vec<TeleEdge>> {
-    // Only rows with concrete source and destination
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT src_x, src_y, src_plane, dst_x, dst_y, dst_plane, cost
-        FROM teleports_all
-        WHERE src_x IS NOT NULL AND src_y IS NOT NULL AND src_plane IS NOT NULL
-          AND dst_x IS NOT NULL AND dst_y IS NOT NULL AND dst_plane IS NOT NULL
-        ORDER BY src_plane, src_y, src_x
-        "#,
-    )?;
-
-    let rows = stmt.query_map([], |row: &Row| {
-        let sx: i32 = row.get(0)?;
-        let sy: i32 = row.get(1)?;
-        let sp: i32 = row.get(2)?;
-        let dx: i32 = row.get(3)?;
-        let dy: i32 = row.get(4)?;
-        let dp: i32 = row.get(5)?;
-        let cost_f: f64 = row.get(6)?;
-        Ok(((sx, sy, sp), (dx, dy, dp), cost_f as f32))
-    })?;
-
-    let mut out = Vec::new();
-    for r in rows {
-        let ((sx, sy, sp), (dx, dy, dp), cost) = r?;
-        if let (Some(&s), Some(&d)) = (
-            node_id_of.get(&(sx, sy, sp)),
-            node_id_of.get(&(dx, dy, dp)),
-        ) {
-            // Skip obviously invalid costs
-            let c = if cost.is_finite() && cost >= 0.0 { cost } else { 0.0 };
-            out.push(TeleEdge { src: s, dst: d, cost: c });
-        }
-    }
+    out.sort_unstable_by_key(|t| (t.plane, t.y, t.x));
     Ok(out)
 }
 

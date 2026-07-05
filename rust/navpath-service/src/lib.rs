@@ -18,7 +18,6 @@ pub struct SnapshotState {
     pub macro_lookup: Arc<HashMap<(u32, u32), Vec<u32>>>,
     pub loaded_at_unix: u64,
     pub snapshot_hash_hex: Option<String>,
-    pub coord_index: Option<Arc<HashMap<(i32,i32,i32), u32>>>,
     // Fairy Ring data
     pub fairy_rings: Arc<Vec<FairyRing>>,
     pub node_to_fairy_ring: Arc<HashMap<u32, usize>>,
@@ -27,6 +26,19 @@ pub struct SnapshotState {
 #[derive(Clone)]
 pub struct AppState {
     pub current: Arc<ArcSwap<SnapshotState>>, // atomic swap
+    /// Bounds concurrent searches (and therefore live node-sized SearchContexts and
+    /// blocking-pool threads). Sized from NAVPATH_MAX_CONCURRENT_SEARCHES, default =
+    /// available parallelism.
+    pub search_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// Semaphore sized from `NAVPATH_MAX_CONCURRENT_SEARCHES` (default: available cores).
+pub fn default_search_permits() -> Arc<tokio::sync::Semaphore> {
+    let n = std::env::var("NAVPATH_MAX_CONCURRENT_SEARCHES").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
+    Arc::new(tokio::sync::Semaphore::new(n))
 }
 
 pub fn env_var(name: &str, default: &str) -> String {
@@ -57,19 +69,4 @@ pub fn build_router(state: AppState) -> Router {
         .route("/tile/exists", get(routes::tile_exists))
         .route("/admin/reload", post(routes::reload))
         .with_state(state)
-}
-
-pub fn build_coord_index(s: &Snapshot) -> HashMap<(i32, i32, i32), u32> {
-    let n = s.counts().nodes as usize;
-    let mut map = HashMap::with_capacity(n);
-    let xs = s.nodes_x();
-    let ys = s.nodes_y();
-    let ps = s.nodes_plane();
-    for i in 0..n {
-        let x = xs.get(i).expect("nodes_x missing");
-        let y = ys.get(i).expect("nodes_y missing");
-        let p = ps.get(i).expect("nodes_plane missing");
-        map.insert((x, y, p), i as u32);
-    }
-    map
 }

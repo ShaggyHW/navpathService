@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use axum::{body::Body, http::{Request, StatusCode}};
 use http_body_util::BodyExt;
-use navpath_core::snapshot::write_snapshot;
-use navpath_service::{build_router, AppState, SnapshotState, build_coord_index};
+use navpath_core::snapshot::{pack_coord, write_snapshot_v8, SnapshotSections};
+use navpath_service::{build_router, AppState, SnapshotState};
 use arc_swap::ArcSwap;
 use serde_json::json;
 use tempfile::NamedTempFile;
@@ -13,20 +13,22 @@ use tower::ServiceExt; // for `oneshot`
 fn make_snapshot_file(nodes: usize) -> tempfile::TempPath {
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
-    let nodes_ids: Vec<u32> = (0..nodes as u32).collect();
-    let nodes_x: Vec<i32> = (0..nodes as i32).map(|i| 3200 + i).collect();
-    let nodes_y: Vec<i32> = vec![3200; nodes];
-    let nodes_plane: Vec<i32> = vec![0; nodes];
-    // simple chain 0->1->2
-    let walk_src = vec![0u32, 1u32];
+    assert_eq!(nodes, 3, "fixture is a 3-node chain");
+    // Nodes at (3200..3202, 3200, plane 0); packed keys ascend with x.
+    let coords_packed: Vec<u32> = (0..nodes as i32).map(|i| pack_coord(3200 + i, 3200, 0)).collect();
+    // simple chain 0->1->2 (cardinal edges)
+    let walk_offsets = vec![0u32, 1, 2, 2];
     let walk_dst = vec![1u32, 2u32];
-    let walk_w = vec![1.0f32, 1.0f32];
+    let walk_diag = vec![0u8];
+    let comp = vec![0u16, 0, 0];
 
     // Macro edges: include a synthetic 0->0 edge whose metadata encodes global teleports.
     // Global teleports are used when the requested start coordinate is not present in the snapshot.
     let macro_src: Vec<u32> = vec![0, 0];
     let macro_dst: Vec<u32> = vec![2, 0];
-    let macro_w: Vec<f32> = vec![3.5, 0.0];
+    // v8 derives walk weights (300ms/step), so walking 0->1->2 costs 600; keep the
+    // direct macro edge more expensive so the walk route stays optimal.
+    let macro_w: Vec<f32> = vec![700.0, 0.0];
     let macro_kind_first: Vec<u32> = vec![2, 0]; // lodestone, then synthetic
     let macro_id_first: Vec<u32> = vec![13, 0];
 
@@ -46,43 +48,33 @@ fn make_snapshot_file(nodes: usize) -> tempfile::TempPath {
     let mut macro_meta_blob: Vec<u8> = Vec::with_capacity(meta0.len() + meta1.len());
     macro_meta_blob.extend_from_slice(&meta0);
     macro_meta_blob.extend_from_slice(&meta1);
-    let req: Vec<u32> = vec![];
-    let landmarks: Vec<u32> = vec![];
-    let lm_fw: Vec<f32> = vec![];
-    let lm_bw: Vec<f32> = vec![];
-    // Empty fairy ring data for basic tests
-    let fairy_nodes: Vec<u32> = vec![];
-    let fairy_cost_ms: Vec<f32> = vec![];
-    let fairy_meta_offs: Vec<u32> = vec![];
-    let fairy_meta_lens: Vec<u32> = vec![];
-    let fairy_meta_blob: Vec<u8> = vec![];
 
-    write_snapshot(
+    write_snapshot_v8(
         &path,
-        &nodes_ids,
-        &nodes_x,
-        &nodes_y,
-        &nodes_plane,
-        &walk_src,
-        &walk_dst,
-        &walk_w,
-        &macro_src,
-        &macro_dst,
-        &macro_w,
-        &macro_kind_first,
-        &macro_id_first,
-        &macro_meta_offs,
-        &macro_meta_lens,
-        &macro_meta_blob,
-        &req,
-        &landmarks,
-        &lm_fw,
-        &lm_bw,
-        &fairy_nodes,
-        &fairy_cost_ms,
-        &fairy_meta_offs,
-        &fairy_meta_lens,
-        &fairy_meta_blob,
+        &SnapshotSections {
+            coords_packed: &coords_packed,
+            walk_offsets: &walk_offsets,
+            walk_dst: &walk_dst,
+            walk_diag: &walk_diag,
+            comp: &comp,
+            walk_components: 1,
+            macro_src: &macro_src,
+            macro_dst: &macro_dst,
+            macro_w: &macro_w,
+            macro_kind_first: &macro_kind_first,
+            macro_id_first: &macro_id_first,
+            macro_meta_offs: &macro_meta_offs,
+            macro_meta_lens: &macro_meta_lens,
+            macro_meta_blob: &macro_meta_blob,
+            req_tags: &[],
+            landmarks: &[],
+            lm_tab: &[],
+            fairy_nodes: &[],
+            fairy_cost_ms: &[],
+            fairy_meta_offs: &[],
+            fairy_meta_lens: &[],
+            fairy_meta_blob: &[],
+        },
     ).expect("write snapshot");
 
     tmp.into_temp_path()
@@ -94,7 +86,6 @@ async fn health_and_route_and_reload() {
     let snap_path = make_snapshot_file(3);
     let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
     let (neighbors, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
-    let coord_index = Some(Arc::new(build_coord_index(&opened)));
     let snapshot = Some(Arc::new(opened));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
@@ -104,10 +95,9 @@ async fn health_and_route_and_reload() {
         macro_lookup: Arc::new(macro_lookup),
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
-        coord_index,
         fairy_rings: Arc::new(Vec::new()),
         node_to_fairy_ring: Arc::new(HashMap::new()),
-    })) };
+    })), search_permits: navpath_service::default_search_permits() };
 
     let app = build_router(state.clone());
 
@@ -150,7 +140,6 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
     let snap_path = make_snapshot_file(3);
     let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
     let (neighbors, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
-    let coord_index = Some(Arc::new(build_coord_index(&opened)));
     let snapshot = Some(Arc::new(opened));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
@@ -160,10 +149,9 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
         macro_lookup: Arc::new(macro_lookup),
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
-        coord_index,
         fairy_rings: Arc::new(Vec::new()),
         node_to_fairy_ring: Arc::new(HashMap::new()),
-    })) };
+    })), search_permits: navpath_service::default_search_permits() };
 
     let app = build_router(state.clone());
 
