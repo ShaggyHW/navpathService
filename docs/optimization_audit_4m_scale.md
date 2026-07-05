@@ -249,6 +249,70 @@ bidirectional ALT (§1.11) → canonical A\*/JPS on the mask grid (§1.11) → L
 
 ---
 
+## Implementation log
+
+### Phases 0–1 — DONE (2026-07-05)
+
+Everything in Phase 0 and Phase 1 is implemented and measured (criterion corpus in `rust/navpath-core/benches/astar.rs`, diagnostics in `examples/probe.rs`; snapshots rebuilt with `--landmarks 24`):
+
+| Metric | Baseline | After Phase 1 |
+|---|---|---|
+| Short routes (~150 tiles) | 109–492 ms | **8.8–21 µs** (~12,000–23,500×) |
+| Teleport-entry long routes | 641–664 ms | **230 µs–4.6 ms** (140–2,800×) |
+| Teleport-entry medium routes | 62–120 ms | 9–17.6 ms (6–7×) |
+| Statically-unreachable query | 8.8 ms full flood | **~100 ns, 0 pops** |
+| Unbudgeted flood (no goal-side landmark) | 946 ms | 318 ms (and budget-capped to ≤500k pops in the service) |
+| ALT build stage | 10.6 s | 2.06 s |
+| Snapshot | 684 MB | 325 MB |
+| Tile DB | 58 MB | 39.4 MB |
+| `select_active` | 214 ns | 97 ns |
+
+Deviations from the plan, discovered by measurement (§1.4's cap evolved):
+1. **The injected-edge heuristic cap is NOT implemented as a runtime cap.** Capping h by `min(w_t + h(dst_t))` over global teleports flattens the heuristic to a near-constant (globals are start-seeded only, so the cap was pure loss — measured 2× slower mediums). Instead the **builder bakes the fairy-ring clique and quick-tele-floored lodestone weights into the ALT graph** (`main.rs`, `landmarks.rs`), restoring the invariant "tables cover a superset of mid-search edges" with zero hot-loop cost. Snapshots older than this change are mildly inadmissible around fairy rings — rebuild.
+2. **`select_active` filters landmarks by finite GOAL entries only** (`heuristics.rs`). A node's own INF entry then yields h=+INF, which is *proof* the node cannot reach the goal (`d(u,L) <= d(u,goal)+d(goal,L)`).
+3. **Nodes with h=+INF are never pushed** (`search.rs`). This (a) rejects statically-impossible queries in ~0 pops whenever the goal's component has a landmark — most of §1.10.2's reachability precheck for free — and (b) avoids an f=INF heap plateau where tie-breaking degrades into DFS-like mass reopenings (observed: 534M pops before this guard).
+4. `SearchResult` gained a `pops` counter (diagnostics/budget tuning) alongside `status`.
+
+Also landed: duplicate SQLite index dropped (58→39.4 MB; producer should stop creating `idx_tiles_walkable` and consider `WITHOUT ROWID` for `tiles`), `.cargo/config.toml` with `target-cpu=native`, mimalloc in both binaries, `[profile.profiling]` + `[profile.bench]`, dead `load_localized_teleports` removed, service `rusqlite`/`itertools` deps removed, builder's ignored `[profile.release]` removed.
+
+Still open from the writer findings: the snapshot writer is now the dominant build phase (~8.5 s of ~11 s) — lands with §2.2/§3 in Phase 3.
+
+### Phase 2 — DONE except §4.3/§1.9c (2026-07-05)
+
+Landed (all workspace tests green; bench deltas vs Phase 1):
+- **Multi-source virtual start** (§1.6): `EngineView::astar_multi` seeds every eligible teleport dst at `g = cost`, winning entry = `path[0]`; the up-to-124-searches loop in `run_route_with_requirements_virtual_start` is gone.
+- **AoS search state + h-cache** (§1.7/§1.8): one 16-byte `NodeState { g, h, parent, gen }` per node; the ALT heuristic is computed at most once per node per query (NAN-marked lazily). Long benches −27–36%, shorts −20%, mediums −10–25% on top of Phase 1.
+- **Sorted-merge machinery deleted** (§1.9d): `MergeNeighbors`, per-pop dst-order merging, and the per-node sort in `Adjacency::build_with_data` (~3.4M allocations per load) are gone; streams are chained. Determinism now comes from builder emission order.
+- **Global-JSON caching** (§4.1): `GlobalTeleport.meta: Arc<Value>` parsed once at load; `/route` no longer re-parses the 113KB blob, and the annotation block is skipped entirely unless actions/geometry were requested.
+- **Eligibility once + coercion fix** (§4.2): the mask (with bool/numeric-string coercion) and `quick_tele` are built once in `routes.rs` and passed through; the adapter's divergent duplicate is deleted. (Deviation: the tiny req-id→tag map stays per-request rather than in `SnapshotState` — 129 inserts, not worth the constructor churn.)
+- **Deadline + disconnect cancellation** (§1.10.3): `SearchParams.cancel: &AtomicBool` checked every 1024 pops (`SearchStatus::Cancelled`, response reason `"cancelled"`); routes set it from a drop-guard (client disconnect) and `NAVPATH_ROUTE_TIMEOUT_MS` (default 10s → 504).
+- **Concurrency semaphore** (§1.10.4/§4.4): `AppState.search_permits` from `NAVPATH_MAX_CONCURRENT_SEARCHES` (default = cores); overload returns 503 instead of piling blocking threads. (Contexts remain thread-local but concurrency-bounded; a checkout pool can follow.)
+- **Streaming snapshot writer** (§2.2, pulled forward from Phase 3 — no format change): sections stream through a BufWriter + incremental blake3 tee, zero-copy on LE. Builder peak RSS **1,525 → 743 MB**; encode CPU eliminated (remaining write phase is disk-bound).
+- **Atomic snapshot writes** (new finding): the writer previously truncated the output in place — a process (service after `/admin/reload`, or a running bench) still mmap-ing the old file SIGBUSes on its next page touch. Now writes `<path>.tmp` + `rename`. This was observed live (bench crashed with SIGBUS during a concurrent rebuild).
+- `SearchResult.pops` diagnostics; probe example `examples/probe.rs`.
+
+~~Remaining from Phase 2: §4.3 typed response building inside the blocking closure and the §1.9c macro-eligibility bitset.~~ Both landed after Phase 2 (see below).
+
+### Phase 2 leftovers — DONE (2026-07-05)
+- **§1.9c `MacroFilter`**: per-request allow-bitset + effective weights folded once (also folds the quick-tele lodestone override); `SearchParams` carries `macro_filter` instead of `mask`+`quick_tele`; the relax loop does one bool index per macro edge.
+- **§4.3**: all action/geometry construction moved into the `spawn_blocking` closure (`build_route_payload`) — the reactor never builds JSON for 1000-step paths; on-path macro metadata parsed once (`macro_edge_meta_if_allowed`); `res.path` no longer cloned; `only_actions` responses omit the duplicate `path` array (verified live: `path` absent, actions intact).
+
+### Phase 3 — snapshot v8 — DONE (2026-07-06)
+
+One format bump (`SNAPSHOT_VERSION = 8`), everything from §3 except Hilbert ordering (§3.6, still benchmark-gated future work):
+- **u16 quantized interleaved ALT table** (`lm_tab`, `[node][landmark][fw,bw]`, **64 ms** quanta, floor-stored, one quantum subtracted on read; `0xFFFF` unreachable / `0xFFFE` saturated). Two saturation rules are load-bearing: a saturated forward entry is never used (understating `d(L,u)` overstates the bound), and **landmarks with a saturated goal entry are dropped for the query** — a 16 ms quantum experiment (range 1.05M ms < real cross-map distances) surfaced this as a live suboptimal-route bug (44909 vs the true 41649 on the reference route) before the filter existed. 64 ms gives a 4.19M ms range (~14k walk tiles), so saturation is a safety net, not a working state; the 16 ms trial also proved the plateau, not quantization slack, drives the short-route pop count (2273 vs 2352 pops).
+- **CSR-native walk graph**: `walk_offsets + walk_dst + diagonal bitmap`; `walk_w`/`walk_src` gone — weights derived (300 / 300·√2, bit-exact with the old stored values). The engine's `WalkGraph::Csr` borrows the mmap zero-copy; only the 957 macro edges are heap-built at load.
+- **Packed coords** (`plane<<30|y<<15|x`, one u32/node) replacing `nodes_ids/x/y/plane`; since node ids follow (plane,y,x) order, **coordinate→id lookup is a binary search over the mmap** — `build_coord_index` and the 1.12M-entry HashMap are deleted.
+- **Walk-component ids** (u16/node, 490 components — matching the audit's count) stored for future exact reachability prechecks (the eligibility-aware condensed BFS of §1.10.2 remains unimplemented; h=∞ pruning already covers every goal with a landmark in its component).
+- **64-byte section alignment + zero-copy typed slices** (`LeSlice*` wrappers deleted; per-element bounds-checked byteorder decoding gone from all hot paths).
+- **madvise**: `Advice::Random` on open (+ `NAVPATH_MMAP_POPULATE=1` for pre-faulting).
+
+**Measured:** snapshot **684 MB (v7 baseline) → 325 MB (24 landmarks) → 150.9 MB (v8)**; at 4M tiles projected ~540 MB. Service **startup 211 ms**, **`/admin/reload` 20 ms** (was seconds — no CSR/coord-index rebuild). Builder 6.6 s wall / 731 MB peak RSS. Flood −22%, `select_active` −36%. Route costs bit-identical (verified live: same 41648.527 on the reference route).
+
+**Known trade-off (documented, accepted):** quantized ALT loses exact-tie discrimination on the equal-cost plateau — nodes on alternative optimal paths drop ε below the goal's f and pop first. Short routes: 138 pops/12 µs (Phase 2, f32 tables) → ~2.3k pops/~150–370 µs (v8); longs ~0.5–1 ms; mediums/flood unchanged or better. Absolute latencies remain far under target; if the last 20× on short routes ever matters, options are an ε-weighted tie-break (bounded 0.01% suboptimality) or an optional f32 residual side-table.
+
+**Remaining (Phase 4, benchmark-gated):** bidirectional ALT, canonical A*/mask-driven JPS, LRU response cache, Hilbert node ordering A/B, PGO/BOLT, region-blob DB ingest format, HPA* overlay only if 4M worst-case targets are missed.
+
 ## Appendix A — cross-cutting correctness issues found during the audit
 
 These affect result *quality* today and should ride along with the perf work:
