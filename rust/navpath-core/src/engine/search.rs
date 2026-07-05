@@ -158,11 +158,37 @@ mod tests {
     }
 }
 
+/// Extra edges injected into the search beyond the static walk/macro graph.
+///
+/// Split into two parts so the hot path avoids per-node allocation:
+/// - `global` edges are available from *every* node (e.g. global teleports). They are
+///   pre-sorted once (by dst id, then weight) and shared as a borrowed slice across all
+///   node expansions — no per-pop clone or sort.
+/// - `per_node` edges are location-specific (e.g. fairy-ring hops) and exist for only a
+///   handful of nodes. The closure returns just those edges (an empty `Vec`, which does
+///   not allocate, for nodes with none); the search merges them with `global` on demand.
+#[derive(Default)]
+pub struct ExtraEdges {
+    pub global: Vec<(u32, f32)>,
+    pub per_node: Option<Box<dyn Fn(u32) -> Vec<(u32, f32)>>>,
+}
+
+/// Concatenate global and per-node extra edges and sort by (dst id, then weight) to
+/// match the ordering the search's merge with the main neighbor stream expects.
+fn combine_sorted_extra(global: &[(u32, f32)], mut extra: Vec<(u32, f32)>) -> Vec<(u32, f32)> {
+    extra.reserve(global.len());
+    extra.extend_from_slice(global);
+    extra.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+    });
+    extra
+}
+
 pub struct EngineView<'a> {
     pub nodes: usize,
     pub neighbors: Arc<NeighborProvider>,
     pub lm: LandmarkHeuristic<'a>,
-    pub extra: Option<Box<dyn Fn(u32) -> Vec<(u32, f32)>>>,
+    pub extra: ExtraEdges,
 }
 
 impl<'a> EngineView<'a> {
@@ -180,13 +206,13 @@ impl<'a> EngineView<'a> {
             &macro_src, &macro_dst, &macro_w,
         );
         let lm = LandmarkHeuristic { nodes, landmarks: s.counts().landmarks as usize, lm_fw: s.lm_fw(), lm_bw: s.lm_bw() };
-        EngineView { nodes, neighbors: Arc::new(neighbors), lm, extra: None }
+        EngineView { nodes, neighbors: Arc::new(neighbors), lm, extra: ExtraEdges::default() }
     }
 
     pub fn from_parts(nodes: usize, walk_src: &'a [u32], walk_dst: &'a [u32], walk_w: &'a [f32], macro_src: &'a [u32], macro_dst: &'a [u32], macro_w: &'a [f32], lm_fw: crate::snapshot::LeSliceF32<'a>, lm_bw: crate::snapshot::LeSliceF32<'a>, landmarks: usize) -> Self {
         let neighbors = NeighborProvider::new(nodes, walk_src, walk_dst, walk_w, macro_src, macro_dst, macro_w);
         let lm = LandmarkHeuristic { nodes, landmarks, lm_fw, lm_bw };
-        EngineView { nodes, neighbors: Arc::new(neighbors), lm, extra: None }
+        EngineView { nodes, neighbors: Arc::new(neighbors), lm, extra: ExtraEdges::default() }
     }
 
     pub fn astar<C: OctileCoords>(&self, params: SearchParams<C>, ctx: &mut SearchContext) -> SearchResult {
@@ -209,15 +235,24 @@ impl<'a> EngineView<'a> {
             let mut main_iter = self.neighbors.all_neighbors(id, params.mask, params.quick_tele);
             let mut next_main = main_iter.next();
             
-            let extra_vec = if let Some(cb) = &self.extra {
-                let mut ex = cb(id);
-                ex.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)));
-                Some(ex)
-            } else {
-                None
+            // Extra edges for this node. Global edges are shared and pre-sorted, so the
+            // common case borrows a slice with no per-pop allocation or sorting. Per-node
+            // edges (fairy rings) exist for only a few nodes and are merged in on demand.
+            let extra_owned: Vec<(u32, f32)>;
+            let extra_slice: &[(u32, f32)] = match &self.extra.per_node {
+                None => &self.extra.global,
+                Some(f) => {
+                    let pn = f(id);
+                    if pn.is_empty() {
+                        &self.extra.global
+                    } else {
+                        extra_owned = combine_sorted_extra(&self.extra.global, pn);
+                        &extra_owned
+                    }
+                }
             };
-            let mut extra_iter = extra_vec.as_ref().map(|v| v.iter());
-            let mut next_extra = extra_iter.as_mut().and_then(|i| i.next());
+            let mut extra_iter = extra_slice.iter();
+            let mut next_extra = extra_iter.next();
 
             loop {
                 let (v_id, w) = match (next_main, next_extra) {
@@ -226,7 +261,7 @@ impl<'a> EngineView<'a> {
                             next_main = main_iter.next();
                             m
                         } else {
-                            next_extra = extra_iter.as_mut().unwrap().next();
+                            next_extra = extra_iter.next();
                             *e
                         }
                     }
@@ -235,7 +270,7 @@ impl<'a> EngineView<'a> {
                         m
                     }
                     (None, Some(e)) => {
-                        next_extra = extra_iter.as_mut().unwrap().next();
+                        next_extra = extra_iter.next();
                         *e
                     }
                     (None, None) => break,

@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use navpath_core::{EngineView, SearchParams, SearchResult, Snapshot, NeighborProvider};
-use navpath_core::engine::search::SearchContext;
+use navpath_core::engine::search::{ExtraEdges, SearchContext};
 use serde_json::Value as JsonValue;
 use navpath_core::eligibility::{build_mask_from_u32, fnv1a32, ClientValue};
 use navpath_core::engine::heuristics::{LandmarkHeuristic, OctileCoords};
@@ -65,6 +65,15 @@ pub struct FairyRing {
     pub code: String,
     pub action: Option<String>,
     pub req_tag_idxs: Vec<usize>, // usize::MAX for fail-closed unknown requirements
+}
+
+/// Sort extra edges by (dst id, then weight) — the ordering the search engine relies on
+/// when merging these edges with the static neighbor stream.
+fn sort_extra_edges(edges: &mut [(u32, f32)]) {
+    edges.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
 }
 
 fn kind_code(kind: &str) -> u32 {
@@ -325,7 +334,9 @@ pub fn run_route_with_requirements_and_fairy_rings(
     client_reqs: &[(String, serde_json::Value)],
     seed: Option<u64>,
     fairy_rings: &[FairyRing],
-    node_to_fairy_ring: &HashMap<u32, usize>,
+    // Kept for API symmetry with the caller; eligible fairy sources/dests are derived
+    // from `fairy_rings` directly, so the node->ring map is not needed here.
+    _node_to_fairy_ring: &HashMap<u32, usize>,
 ) -> SearchResult {
     // Build eligibility mask from snapshot req tags
     let req_words: Vec<u32> = snapshot.req_tags().iter().collect();
@@ -426,23 +437,29 @@ pub fn run_route_with_requirements_and_fairy_rings(
         nodes,
         neighbors,
         lm,
-        extra: None,
+        extra: ExtraEdges::default(),
     };
 
-    // Combine globals and fairy ring expansion in the extra function
-    let node_to_fairy_ring = node_to_fairy_ring.clone();
-    if !eligible_globals.is_empty() || !eligible_fairy_dests.is_empty() {
-        view.extra = Some(Box::new(move |u: u32| -> Vec<(u32, f32)> {
-            let mut result = eligible_globals.clone();
-            // If u is an eligible fairy ring source, add edges to all other eligible fairy rings
+    // Global teleports are available from every node; pre-sort them once so the search
+    // shares a single slice across all node expansions instead of cloning and re-sorting
+    // on every pop.
+    sort_extra_edges(&mut eligible_globals);
+    view.extra.global = eligible_globals;
+
+    // Fairy-ring hops are location-specific: only ring source nodes have them. The
+    // per-node closure returns just the fairy edges (an empty, non-allocating Vec for
+    // every other node); the search merges them with the shared global edges on demand.
+    if !eligible_fairy_dests.is_empty() {
+        view.extra.per_node = Some(Box::new(move |u: u32| -> Vec<(u32, f32)> {
             if eligible_fairy_sources.contains(&u) {
-                for &(dst_node, cost) in &eligible_fairy_dests {
-                    if dst_node != u {
-                        result.push((dst_node, cost));
-                    }
-                }
+                eligible_fairy_dests
+                    .iter()
+                    .filter(|&&(dst_node, _)| dst_node != u)
+                    .copied()
+                    .collect()
+            } else {
+                Vec::new()
             }
-            result
         }));
     }
 
@@ -520,13 +537,13 @@ pub fn run_route_with_requirements_virtual_start(
         nodes,
         neighbors,
         lm,
-        extra: None,
+        extra: ExtraEdges::default(),
     };
 
-    if !eligible_globals.is_empty() {
-        let eligible_globals_for_extra = eligible_globals.clone();
-        view.extra = Some(Box::new(move |_u: u32| -> Vec<(u32, f32)> { eligible_globals_for_extra.clone() }));
-    }
+    // Global teleports apply to every node; pre-sort once and share as a slice. The
+    // candidate loop below still iterates `eligible_globals` to pick entry teleports.
+    sort_extra_edges(&mut eligible_globals);
+    view.extra.global = eligible_globals.clone();
 
     let coords = SnapshotCoords {
         x: snapshot.nodes_x(),
