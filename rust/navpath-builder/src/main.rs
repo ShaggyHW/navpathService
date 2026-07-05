@@ -13,7 +13,7 @@ use navpath_core::snapshot::write_snapshot;
 
 mod build;
 use build::graph::compile_walk_edges;
-use build::load_sqlite::load_all_tiles;
+use build::load_sqlite::{load_all_tiles, load_fairy_rings};
 use build::chains::{flatten_chains, flatten_global_chains};
 use build::requirements::compile_requirement_tags;
 use build::landmarks::compute_alt_tables;
@@ -50,7 +50,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                         location_closed_x, location_closed_y, location_closed_plane,
                         real_id_open, real_id_closed,
                         open_action,
-                        cost, next_node_type, next_node_id, requirement_id
+                        cost, next_node_type, next_node_id, requirements
                  FROM teleports_door_nodes WHERE id = ?1"
             ) {
                 let row: std::result::Result<serde_json::Value, _> = st.query_row([id], |r: &rusqlite::Row| {
@@ -61,7 +61,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                     let lcx: Option<i64> = r.get(10)?; let lcy: Option<i64> = r.get(11)?; let lcp: Option<i64> = r.get(12)?;
                     let rid_open: Option<i64> = r.get(13)?; let rid_closed: Option<i64> = r.get(14)?;
                     let open_action: Option<String> = r.get(15)?;
-                    let cost: Option<f64> = r.get(16)?; let next_t: Option<String> = r.get(17)?; let next_id: Option<i64> = r.get(18)?; let req: Option<i64> = r.get(19)?;
+                    let cost: Option<f64> = r.get(16)?; let next_t: Option<String> = r.get(17)?; let next_id: Option<i64> = r.get(18)?; let req: Option<String> = r.get(19)?;
                     let mut obj = serde_json::Map::new();
                     obj.insert("direction".to_string(), dir.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("tile_inside".to_string(), match (inx,iny,inp) { (Some(x),Some(y),Some(p)) => serde_json::json!([x as i32,y as i32,p as i32]), _ => serde_json::Value::Null });
@@ -74,7 +74,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                     obj.insert("open_action".to_string(), open_action.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_type".to_string(), next_t.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_id".to_string(), next_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
-                    obj.insert("requirement_id".to_string(), req.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("requirements".to_string(), req.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     Ok(serde_json::Value::Object(obj))
                 });
                 return row.ok();
@@ -83,20 +83,20 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
         }
         "lodestone" => {
             if let Ok(mut st) = conn.prepare(
-                "SELECT lodestone, dest_x, dest_y, dest_plane, cost, next_node_type, next_node_id, requirement_id
+                "SELECT lodestone, dest_x, dest_y, dest_plane, cost, next_node_type, next_node_id, requirements
                  FROM teleports_lodestone_nodes WHERE id = ?1"
             ) {
                 let row: std::result::Result<serde_json::Value, _> = st.query_row([id], |r: &rusqlite::Row| {
                     let name: Option<String> = r.get(0)?;
                     let dx: Option<i64> = r.get(1)?; let dy: Option<i64> = r.get(2)?; let dp: Option<i64> = r.get(3)?;
-                    let cost: Option<f64> = r.get(4)?; let next_t: Option<String> = r.get(5)?; let next_id: Option<i64> = r.get(6)?; let req: Option<i64> = r.get(7)?;
+                    let cost: Option<f64> = r.get(4)?; let next_t: Option<String> = r.get(5)?; let next_id: Option<i64> = r.get(6)?; let req: Option<String> = r.get(7)?;
                     let mut obj = serde_json::Map::new();
                     if let Some(s) = name { obj.insert("lodestone".to_string(), serde_json::Value::String(s)); }
                     obj.insert("dest".to_string(), match (dx,dy,dp) { (Some(x),Some(y),Some(p)) => serde_json::json!([x as i32,y as i32,p as i32]), _ => serde_json::Value::Null });
                     obj.insert("cost".to_string(), cost.map(|c| serde_json::Value::from(c as f32)).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_type".to_string(), next_t.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_id".to_string(), next_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
-                    obj.insert("requirement_id".to_string(), req.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("requirements".to_string(), req.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     Ok(serde_json::Value::Object(obj))
                 });
                 return row.ok();
@@ -109,7 +109,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                         dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
                         orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane,
                         search_radius,
-                        cost, next_node_type, next_node_id, requirement_id
+                        cost, next_node_type, next_node_id, requirements
                  FROM teleports_object_nodes WHERE id = ?1"
             ) {
                 let row: std::result::Result<serde_json::Value, _> = st.query_row([id], |r: &rusqlite::Row| {
@@ -117,7 +117,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                     let dminx: Option<i64> = r.get(4)?; let dmaxx: Option<i64> = r.get(5)?; let dminy: Option<i64> = r.get(6)?; let dmaxy: Option<i64> = r.get(7)?; let dp: Option<i64> = r.get(8)?;
                     let ominx: Option<i64> = r.get(9)?; let omaxx: Option<i64> = r.get(10)?; let ominy: Option<i64> = r.get(11)?; let omaxy: Option<i64> = r.get(12)?; let op: Option<i64> = r.get(13)?;
                     let sr: Option<i64> = r.get(14)?;
-                    let cost: Option<f64> = r.get(15)?; let next_t: Option<String> = r.get(16)?; let next_id: Option<i64> = r.get(17)?; let req: Option<i64> = r.get(18)?;
+                    let cost: Option<f64> = r.get(15)?; let next_t: Option<String> = r.get(16)?; let next_id: Option<i64> = r.get(17)?; let req: Option<String> = r.get(18)?;
                     let mut obj = serde_json::Map::new();
                     obj.insert("match_type".to_string(), mt.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("object_id".to_string(), oid.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
@@ -137,7 +137,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                     obj.insert("cost".to_string(), cost.map(|c| serde_json::Value::from(c as f32)).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_type".to_string(), next_t.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_id".to_string(), next_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
-                    obj.insert("requirement_id".to_string(), req.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("requirements".to_string(), req.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     Ok(serde_json::Value::Object(obj))
                 });
                 return row.ok();
@@ -150,7 +150,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                         dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
                         orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane,
                         search_radius,
-                        cost, next_node_type, next_node_id, requirement_id
+                        cost, next_node_type, next_node_id, requirements
                  FROM teleports_npc_nodes WHERE id = ?1"
             ) {
                 let row: std::result::Result<serde_json::Value, _> = st.query_row([id], |r: &rusqlite::Row| {
@@ -158,7 +158,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                     let dminx: Option<i64> = r.get(4)?; let dmaxx: Option<i64> = r.get(5)?; let dminy: Option<i64> = r.get(6)?; let dmaxy: Option<i64> = r.get(7)?; let dp: Option<i64> = r.get(8)?;
                     let ominx: Option<i64> = r.get(9)?; let omaxx: Option<i64> = r.get(10)?; let ominy: Option<i64> = r.get(11)?; let omaxy: Option<i64> = r.get(12)?; let op: Option<i64> = r.get(13)?;
                     let sr: Option<i64> = r.get(14)?;
-                    let cost: Option<f64> = r.get(15)?; let next_t: Option<String> = r.get(16)?; let next_id: Option<i64> = r.get(17)?; let req: Option<i64> = r.get(18)?;
+                    let cost: Option<f64> = r.get(15)?; let next_t: Option<String> = r.get(16)?; let next_id: Option<i64> = r.get(17)?; let req: Option<String> = r.get(18)?;
                     let mut obj = serde_json::Map::new();
                     obj.insert("match_type".to_string(), mt.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("npc_id".to_string(), nid.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
@@ -178,7 +178,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                     obj.insert("cost".to_string(), cost.map(|c| serde_json::Value::from(c as f32)).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_type".to_string(), next_t.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_id".to_string(), next_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
-                    obj.insert("requirement_id".to_string(), req.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("requirements".to_string(), req.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     Ok(serde_json::Value::Object(obj))
                 });
                 return row.ok();
@@ -187,16 +187,21 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
         }
         "item" => {
             if let Ok(mut st) = conn.prepare(
-                "SELECT item_id, action,
+                "SELECT match_type, name, item_id, action,
                         dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
-                        cost, next_node_type, next_node_id, requirement_id
+                        cost, next_node_type, next_node_id, requirements
                  FROM teleports_item_nodes WHERE id = ?1"
             ) {
                 let row: std::result::Result<serde_json::Value, _> = st.query_row([id], |r: &rusqlite::Row| {
-                    let iid: Option<i64> = r.get(0)?; let action: Option<String> = r.get(1)?;
-                    let dminx: Option<i64> = r.get(2)?; let dmaxx: Option<i64> = r.get(3)?; let dminy: Option<i64> = r.get(4)?; let dmaxy: Option<i64> = r.get(5)?; let dp: Option<i64> = r.get(6)?;
-                    let cost: Option<f64> = r.get(7)?; let next_t: Option<String> = r.get(8)?; let next_id: Option<i64> = r.get(9)?; let req: Option<i64> = r.get(10)?;
+                    let mt: Option<String> = r.get(0)?;
+                    let name: Option<String> = r.get(1)?;
+                    let iid: Option<i64> = r.get(2)?;
+                    let action: Option<String> = r.get(3)?;
+                    let dminx: Option<i64> = r.get(4)?; let dmaxx: Option<i64> = r.get(5)?; let dminy: Option<i64> = r.get(6)?; let dmaxy: Option<i64> = r.get(7)?; let dp: Option<i64> = r.get(8)?;
+                    let cost: Option<f64> = r.get(9)?; let next_t: Option<String> = r.get(10)?; let next_id: Option<i64> = r.get(11)?; let req: Option<String> = r.get(12)?;
                     let mut obj = serde_json::Map::new();
+                    obj.insert("match_type".to_string(), mt.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+                    obj.insert("name".to_string(), name.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("item_id".to_string(), iid.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
                     obj.insert("action".to_string(), action.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("dest_min_x".to_string(), dminx.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
@@ -207,7 +212,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                     obj.insert("cost".to_string(), cost.map(|c| serde_json::Value::from(c as f32)).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_type".to_string(), next_t.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_id".to_string(), next_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
-                    obj.insert("requirement_id".to_string(), req.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("requirements".to_string(), req.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     Ok(serde_json::Value::Object(obj))
                 });
                 return row.ok();
@@ -218,13 +223,13 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
             if let Ok(mut st) = conn.prepare(
                 "SELECT interface_id, component_id, slot_id, click_id,
                         dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
-                        cost, next_node_type, next_node_id, requirement_id
+                        cost, next_node_type, next_node_id, requirements
                  FROM teleports_ifslot_nodes WHERE id = ?1"
             ) {
                 let row: std::result::Result<serde_json::Value, _> = st.query_row([id], |r: &rusqlite::Row| {
                     let iface: Option<i64> = r.get(0)?; let comp: Option<i64> = r.get(1)?; let slot: Option<i64> = r.get(2)?; let click: Option<i64> = r.get(3)?;
                     let dminx: Option<i64> = r.get(4)?; let dmaxx: Option<i64> = r.get(5)?; let dminy: Option<i64> = r.get(6)?; let dmaxy: Option<i64> = r.get(7)?; let dp: Option<i64> = r.get(8)?;
-                    let cost: Option<f64> = r.get(9)?; let next_t: Option<String> = r.get(10)?; let next_id: Option<i64> = r.get(11)?; let req: Option<i64> = r.get(12)?;
+                    let cost: Option<f64> = r.get(9)?; let next_t: Option<String> = r.get(10)?; let next_id: Option<i64> = r.get(11)?; let req: Option<String> = r.get(12)?;
                     let mut obj = serde_json::Map::new();
                     obj.insert("interface_id".to_string(), iface.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
                     obj.insert("component_id".to_string(), comp.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
@@ -238,7 +243,7 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
                     obj.insert("cost".to_string(), cost.map(|c| serde_json::Value::from(c as f32)).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_type".to_string(), next_t.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("next_node_id".to_string(), next_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
-                    obj.insert("requirement_id".to_string(), req.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("requirements".to_string(), req.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     Ok(serde_json::Value::Object(obj))
                 });
                 return row.ok();
@@ -467,6 +472,45 @@ fn main() -> Result<()> {
         )
     } else { (Vec::new(), Vec::new()) };
 
+    // Load Fairy Rings
+    let fairy_ring_rows = load_fairy_rings(&conn, &node_id_of).unwrap_or_else(|e| {
+        // Fail-soft: log warning and proceed with empty list if table doesn't exist
+        tracing::warn!(error = ?e, "failed to load fairy rings (table may not exist); proceeding with empty list");
+        Vec::new()
+    });
+    info!(count = fairy_ring_rows.len(), "loaded fairy rings from SQLite");
+
+    // Encode Fairy Rings into snapshot sections
+    let mut fairy_nodes: Vec<u32> = Vec::with_capacity(fairy_ring_rows.len());
+    let mut fairy_cost_ms: Vec<f32> = Vec::with_capacity(fairy_ring_rows.len());
+    let mut fairy_meta_offs: Vec<u32> = Vec::with_capacity(fairy_ring_rows.len());
+    let mut fairy_meta_lens: Vec<u32> = Vec::with_capacity(fairy_ring_rows.len());
+    let mut fairy_meta_blob: Vec<u8> = Vec::new();
+
+    for ring in &fairy_ring_rows {
+        fairy_nodes.push(ring.node_id);
+        fairy_cost_ms.push(ring.cost);
+
+        // Build per-ring JSON metadata
+        let mut meta_obj = serde_json::Map::new();
+        meta_obj.insert("object_id".to_string(), serde_json::Value::from(ring.object_id));
+        meta_obj.insert("x".to_string(), serde_json::Value::from(ring.x));
+        meta_obj.insert("y".to_string(), serde_json::Value::from(ring.y));
+        meta_obj.insert("plane".to_string(), serde_json::Value::from(ring.plane));
+        meta_obj.insert("code".to_string(), serde_json::Value::String(ring.code.clone()));
+        meta_obj.insert("action".to_string(), ring.action.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+        meta_obj.insert("requirements".to_string(), serde_json::Value::from(ring.requirements.clone()));
+        meta_obj.insert("next_node_type".to_string(), ring.next_node_type.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+        meta_obj.insert("next_node_id".to_string(), ring.next_node_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+
+        let meta = serde_json::Value::Object(meta_obj);
+        let bytes = serde_json::to_vec(&meta).unwrap_or_else(|_| b"{}".to_vec());
+        let off = fairy_meta_blob.len() as u32;
+        fairy_meta_offs.push(off);
+        fairy_meta_lens.push(bytes.len() as u32);
+        fairy_meta_blob.extend_from_slice(&bytes);
+    }
+
     // Write snapshot
     let res = write_snapshot(
         &args.out_snapshot,
@@ -489,6 +533,11 @@ fn main() -> Result<()> {
         &landmarks,
         &lm_fw,
         &lm_bw,
+        &fairy_nodes,
+        &fairy_cost_ms,
+        &fairy_meta_offs,
+        &fairy_meta_lens,
+        &fairy_meta_blob,
     );
 
     match res {

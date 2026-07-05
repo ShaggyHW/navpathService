@@ -1,10 +1,10 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
-use rustc_hash::FxHashMap;
 
 use arc_swap::ArcSwap;
 use axum::{routing::{get, post}, Router};
 use navpath_core::{Snapshot, NeighborProvider};
-use crate::engine_adapter::MacroEdgeMeta;
+
+use crate::engine_adapter::{GlobalTeleport, FairyRing};
 
 pub mod routes;
 pub mod engine_adapter;
@@ -14,13 +14,14 @@ pub struct SnapshotState {
     pub path: PathBuf,
     pub snapshot: Option<Arc<Snapshot>>, // None when not loaded
     pub neighbors: Option<Arc<NeighborProvider>>,
-    pub globals: Arc<Vec<(u32, f32, Vec<usize>)>>, // dst, cost, reqs (indices)
-    pub macro_lookup: Arc<HashMap<(u32, u32), u32>>,
-    pub req_words: Arc<Vec<u32>>, // Pre-computed requirement words
-    pub macro_meta: Arc<Vec<Option<MacroEdgeMeta>>>, // Pre-parsed macro metadata
+    pub globals: Arc<Vec<GlobalTeleport>>, // dst, cost, reqs (indices)
+    pub macro_lookup: Arc<HashMap<(u32, u32), Vec<u32>>>,
     pub loaded_at_unix: u64,
     pub snapshot_hash_hex: Option<String>,
-    pub coord_index: Option<Arc<FxHashMap<(i32,i32,i32), u32>>>,
+    pub coord_index: Option<Arc<HashMap<(i32,i32,i32), u32>>>,
+    // Fairy Ring data
+    pub fairy_rings: Arc<Vec<FairyRing>>,
+    pub node_to_fairy_ring: Arc<HashMap<u32, usize>>,
 }
 
 #[derive(Clone)]
@@ -53,13 +54,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(routes::health))
         .route("/healthz", get(routes::health))
         .route("/route", post(routes::route))
+        .route("/tile/exists", get(routes::tile_exists))
         .route("/admin/reload", post(routes::reload))
         .with_state(state)
 }
 
-pub fn build_coord_index(s: &Snapshot) -> FxHashMap<(i32, i32, i32), u32> {
+pub fn build_coord_index(s: &Snapshot) -> HashMap<(i32, i32, i32), u32> {
     let n = s.counts().nodes as usize;
-    let mut map = FxHashMap::default();
+    let mut map = HashMap::with_capacity(n);
     let xs = s.nodes_x();
     let ys = s.nodes_y();
     let ps = s.nodes_plane();

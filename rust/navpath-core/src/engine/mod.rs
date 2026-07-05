@@ -6,4 +6,4 @@ pub mod search;
 pub use bucket_queue::BucketQueue;
 pub use heuristics::{LandmarkHeuristic, OctileCoords};
 pub use neighbors::{Adjacency, NeighborProvider};
-pub use search::{EngineView, SearchParams, SearchResult};
+pub use search::{EngineView, ExtraEdges, SearchParams, SearchResult};

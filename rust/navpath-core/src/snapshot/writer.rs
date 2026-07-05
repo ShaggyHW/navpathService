@@ -40,6 +40,12 @@ pub fn write_snapshot(
     landmarks: &[u32],
     lm_fw: &[f32],
     lm_bw: &[f32],
+    // Fairy Ring sections
+    fairy_nodes: &[u32],
+    fairy_cost_ms: &[f32],
+    fairy_meta_offs: &[u32],
+    fairy_meta_lens: &[u32],
+    fairy_meta_blob: &[u8],
 ) -> Result<WriteResult, WriterError> {
     if walk_src.len() != walk_dst.len() || walk_src.len() != walk_w.len() {
         return Err(WriterError::LengthMismatch("walk arrays"));
@@ -56,6 +62,13 @@ pub fn write_snapshot(
     if macro_src.len() != macro_meta_offs.len() || macro_src.len() != macro_meta_lens.len() {
         return Err(WriterError::LengthMismatch("macro meta arrays"));
     }
+    // Fairy ring validation
+    if fairy_nodes.len() != fairy_cost_ms.len() {
+        return Err(WriterError::LengthMismatch("fairy ring arrays"));
+    }
+    if fairy_nodes.len() != fairy_meta_offs.len() || fairy_nodes.len() != fairy_meta_lens.len() {
+        return Err(WriterError::LengthMismatch("fairy meta arrays"));
+    }
 
     let counts = SnapshotCounts {
         nodes: nodes_ids.len() as u32,
@@ -63,6 +76,7 @@ pub fn write_snapshot(
         macro_edges: macro_src.len() as u32,
         req_tags: req_tags.len() as u32,
         landmarks: landmarks.len() as u32,
+        fairy_rings: fairy_nodes.len() as u32,
     };
     // Validate ALT tables sizes if landmarks present
     if counts.landmarks > 0 {
@@ -100,6 +114,12 @@ pub fn write_snapshot(
         .saturating_mul(4);
     let off_lm_fw = off_landmarks + (counts.landmarks as u64) * 4;
     let off_lm_bw = off_lm_fw + alt_table_bytes;
+    // Fairy ring offsets
+    let off_fairy_nodes = off_lm_bw + alt_table_bytes;
+    let off_fairy_cost_ms = off_fairy_nodes + (counts.fairy_rings as u64) * 4;
+    let off_fairy_meta_offs = off_fairy_cost_ms + (counts.fairy_rings as u64) * 4;
+    let off_fairy_meta_lens = off_fairy_meta_offs + (counts.fairy_rings as u64) * 4;
+    let off_fairy_meta_blob = off_fairy_meta_lens + (counts.fairy_rings as u64) * 4;
 
     let manifest = Manifest {
         version: SNAPSHOT_VERSION,
@@ -123,6 +143,11 @@ pub fn write_snapshot(
         off_landmarks,
         off_lm_fw,
         off_lm_bw,
+        off_fairy_nodes,
+        off_fairy_cost_ms,
+        off_fairy_meta_offs,
+        off_fairy_meta_lens,
+        off_fairy_meta_blob,
     };
 
     // Build header bytes
@@ -135,7 +160,8 @@ pub fn write_snapshot(
     LittleEndian::write_u32(&mut header[c0 + 8..c0 + 12], counts.macro_edges);
     LittleEndian::write_u32(&mut header[c0 + 12..c0 + 16], counts.req_tags);
     LittleEndian::write_u32(&mut header[c0 + 16..c0 + 20], counts.landmarks);
-    let o0 = c0 + 20;
+    LittleEndian::write_u32(&mut header[c0 + 20..c0 + 24], counts.fairy_rings);
+    let o0 = c0 + 24;
     LittleEndian::write_u64(&mut header[o0..o0 + 8], off_nodes_ids);
     LittleEndian::write_u64(&mut header[o0 + 8..o0 + 16], off_nodes_x);
     LittleEndian::write_u64(&mut header[o0 + 16..o0 + 24], off_nodes_y);
@@ -155,6 +181,11 @@ pub fn write_snapshot(
     LittleEndian::write_u64(&mut header[o0 + 128..o0 + 136], off_landmarks);
     LittleEndian::write_u64(&mut header[o0 + 136..o0 + 144], off_lm_fw);
     LittleEndian::write_u64(&mut header[o0 + 144..o0 + 152], off_lm_bw);
+    LittleEndian::write_u64(&mut header[o0 + 152..o0 + 160], off_fairy_nodes);
+    LittleEndian::write_u64(&mut header[o0 + 160..o0 + 168], off_fairy_cost_ms);
+    LittleEndian::write_u64(&mut header[o0 + 168..o0 + 176], off_fairy_meta_offs);
+    LittleEndian::write_u64(&mut header[o0 + 176..o0 + 184], off_fairy_meta_lens);
+    LittleEndian::write_u64(&mut header[o0 + 184..o0 + 192], off_fairy_meta_blob);
 
     // Build data bytes
     let mut data: Vec<u8> = Vec::with_capacity(
@@ -278,6 +309,32 @@ pub fn write_snapshot(
         LittleEndian::write_f32(&mut b, v);
         data.extend_from_slice(&b);
     }
+    // fairy_nodes (u32)
+    for &v in fairy_nodes {
+        let mut b = [0u8; 4];
+        LittleEndian::write_u32(&mut b, v);
+        data.extend_from_slice(&b);
+    }
+    // fairy_cost_ms (f32)
+    for &v in fairy_cost_ms {
+        let mut b = [0u8; 4];
+        LittleEndian::write_f32(&mut b, v);
+        data.extend_from_slice(&b);
+    }
+    // fairy_meta_offs (u32)
+    for &v in fairy_meta_offs {
+        let mut b = [0u8; 4];
+        LittleEndian::write_u32(&mut b, v);
+        data.extend_from_slice(&b);
+    }
+    // fairy_meta_lens (u32)
+    for &v in fairy_meta_lens {
+        let mut b = [0u8; 4];
+        LittleEndian::write_u32(&mut b, v);
+        data.extend_from_slice(&b);
+    }
+    // fairy_meta_blob (raw bytes)
+    data.extend_from_slice(fairy_meta_blob);
 
     // Compute hash over header + data and write file: [header][data][hash32]
     let mut hasher = blake3::Hasher::new();
@@ -334,6 +391,12 @@ mod tests {
         let meta_offs = [0u32];
         let meta_lens = [2u32];
         let meta_blob = b"{}".to_vec();
+        // v6 fairy ring data: one fairy ring
+        let fairy_nodes = [0u32]; // node index 0
+        let fairy_cost_ms = [600.0f32];
+        let fairy_meta_offs = [0u32];
+        let fairy_meta_blob = br#"{"code":"ALS","action":null}"#.to_vec();
+        let fairy_meta_lens = [fairy_meta_blob.len() as u32];
         let res = write_snapshot(
             &path, &nodes, &xs, &ys, &ps,
             &wsrc, &wdst, &ww,
@@ -341,6 +404,7 @@ mod tests {
             &mk, &mi,
             &meta_offs, &meta_lens, &meta_blob,
             &req, &lm, &lm_fw, &lm_bw,
+            &fairy_nodes, &fairy_cost_ms, &fairy_meta_offs, &fairy_meta_lens, &fairy_meta_blob,
         ).expect("write snapshot");
 
         // Reader can open and validate counts and arrays
@@ -379,6 +443,15 @@ mod tests {
         let bw: Vec<f32> = snap.lm_bw().iter().collect();
         assert_eq!(fw, lm_fw);
         assert_eq!(bw, lm_bw);
+
+        // Validate fairy ring data
+        assert_eq!(c.fairy_rings, 1);
+        let v_fairy_nodes: Vec<u32> = snap.fairy_nodes().iter().collect();
+        assert_eq!(v_fairy_nodes, fairy_nodes);
+        let v_fairy_cost: Vec<f32> = snap.fairy_cost_ms().iter().collect();
+        assert!((v_fairy_cost[0] - fairy_cost_ms[0]).abs() < 1e-6);
+        let meta = snap.fairy_meta_at(0).expect("fairy meta exists");
+        assert_eq!(meta, &fairy_meta_blob[..]);
 
         // Validate appended hash equals returned hash
         let mut f = File::open(&path).unwrap();
