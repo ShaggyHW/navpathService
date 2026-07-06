@@ -933,15 +933,45 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         }),
     );
     
+    // Route results are pure functions of (snapshot, endpoints, eligibility, seed);
+    // repeated requests hit the per-snapshot LRU and skip the search entirely (payload
+    // is still rebuilt per request so one entry serves every options combination).
+    let cache_key = crate::RouteCacheKey {
+        virtual_start: used_virtual_start,
+        sid: if used_virtual_start { 0 } else { sid },
+        gid,
+        mask_hash: {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            mask.satisfied.hash(&mut h);
+            h.finish()
+        },
+        quick_tele,
+        seed: req.seed,
+    };
+    let cached: Option<crate::RouteCacheEntry> = cur
+        .route_cache
+        .as_ref()
+        .and_then(|c| c.lock().ok().and_then(|mut c| c.get(&cache_key).cloned()));
+
     // Offload search to a blocking thread, bounded by the search semaphore so a burst of
     // slow queries cannot pin hundreds of blocking-pool threads (each holding a
-    // node-sized SearchContext). Overload fails fast instead of queueing floods.
-    let Ok(_permit) = state.search_permits.clone().try_acquire_owned() else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "search capacity exhausted; retry".into()));
+    // node-sized SearchContext). Overload fails fast instead of queueing floods. Cache
+    // hits skip the search and need no permit.
+    let _permit = if cached.is_none() {
+        match state.search_permits.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "search capacity exhausted; retry".into()));
+            }
+        }
+    } else {
+        None
     };
 
     let snap_arc = snap.clone();
     let neighbors_arc = neighbors.clone();
+    let neighbors_rev_arc = cur.neighbors_rev.clone();
     let globals_arc = globals.clone();
     let fairy_rings_arc = cur.fairy_rings.clone();
     let node_to_fairy_ring_arc = cur.node_to_fairy_ring.clone();
@@ -973,10 +1003,13 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     } else {
         None
     };
+    let cached_for_task = cached.clone();
     let join = tokio::task::spawn_blocking(move || {
         let cancel_ref = Some(cancel_for_search.as_ref());
         let (snap2, neighbors2, globals2) = (snap_arc.clone(), neighbors_arc.clone(), globals_arc.clone());
-        let (res, virtual_entry) = if used_virtual_start_for_search {
+        let (res, virtual_entry) = if let Some(hit) = cached_for_task {
+            (hit.0.clone(), hit.1)
+        } else if used_virtual_start_for_search {
             engine_adapter::run_route_with_requirements_virtual_start(
                 snap_arc,
                 neighbors_arc,
@@ -989,7 +1022,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
             )
         } else {
             (engine_adapter::run_route_with_requirements_and_fairy_rings(
-                snap_arc, neighbors_arc, globals_arc, sid, gid, &mask_for_search, quick_tele, seed,
+                snap_arc, neighbors_arc, neighbors_rev_arc, globals_arc, sid, gid, &mask_for_search, quick_tele, seed,
                 cancel_ref,
                 &fairy_rings_arc, &node_to_fairy_ring_arc,
             ), None)
@@ -1024,7 +1057,19 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     // Search finished; disarm the disconnect guard so late drops don't poison anything.
     disconnect_guard.1 = true;
 
-    let (mut res, _virtual_entry, actions, geometry) = out;
+    let (mut res, virtual_entry_out, actions, geometry) = out;
+
+    // Populate the cache on fresh, stable outcomes (Found / genuine NotFound only —
+    // budget or cancellation truncations are transient and must not stick).
+    if cached.is_none() {
+        if matches!(res.status, navpath_core::SearchStatus::Found | navpath_core::SearchStatus::NotFound) {
+            if let Some(c) = cur.route_cache.as_ref() {
+                if let Ok(mut c) = c.lock() {
+                    c.put(cache_key, Arc::new((res.clone(), virtual_entry_out)));
+                }
+            }
+        }
+    }
 
     let duration_ms = start.elapsed().as_millis();
     let length_tiles = res.path.len();
@@ -1073,17 +1118,19 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
         Ok(new_snap) => {
             let new_hash = crate::read_tail_hash_hex(&path);
             // Pre-compute neighbors and globals
-            let (neighbors, globals, macro_lookup) = crate::engine_adapter::build_neighbor_provider(&new_snap);
+            let (neighbors, neighbors_rev, globals, macro_lookup) = crate::engine_adapter::build_neighbor_provider(&new_snap);
             // Pre-compute fairy rings
             let (fairy_rings, node_to_fairy_ring) = crate::engine_adapter::build_fairy_rings(&new_snap);
             let new_state = SnapshotState {
                 path: path.clone(),
                 snapshot: Some(Arc::new(new_snap)),
                 neighbors: Some(Arc::new(neighbors)),
+                neighbors_rev: Some(Arc::new(neighbors_rev)),
                 globals: Arc::new(globals),
                 macro_lookup: Arc::new(macro_lookup),
                 loaded_at_unix: crate::now_unix(),
                 snapshot_hash_hex: new_hash.clone(),
+                route_cache: crate::new_route_cache(),
                 fairy_rings: Arc::new(fairy_rings),
                 node_to_fairy_ring: Arc::new(node_to_fairy_ring),
             };

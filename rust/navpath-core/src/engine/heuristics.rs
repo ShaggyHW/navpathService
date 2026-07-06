@@ -1,11 +1,23 @@
 use crate::snapshot::{ALT_QUANTUM_MS, ALT_SATURATED, ALT_UNREACHABLE};
 
-/// Number of landmarks evaluated per heuristic call. At the start of each query the best
-/// `ACTIVE_LANDMARKS` landmarks for the (start, goal) pair are selected and only those are
-/// evaluated during the search. The max over a subset of admissible, consistent landmark
-/// lower bounds is still admissible and consistent, so optimal path cost is preserved;
-/// the heuristic is only marginally weaker, in exchange for far cheaper per-node cost.
+/// Default number of landmarks evaluated per heuristic call. At the start of each query
+/// the best landmarks for the (start, goal) pair are selected and only those are
+/// evaluated during the search. The max over a subset of admissible landmark lower
+/// bounds is still admissible, so optimal path cost is preserved; fewer active landmarks
+/// are cheaper per node but can be much weaker off the direct start-goal axis (e.g.
+/// along teleport-seeded corridors). Override with NAVPATH_ACTIVE_LANDMARKS.
 pub const ACTIVE_LANDMARKS: usize = 8;
+
+/// Active-landmark count from `NAVPATH_ACTIVE_LANDMARKS` (default [`ACTIVE_LANDMARKS`]).
+pub fn active_landmarks() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("NAVPATH_ACTIVE_LANDMARKS").ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(ACTIVE_LANDMARKS)
+    })
+}
 
 /// Landmark (ALT) heuristic backed by the memory-mapped quantized distance table.
 ///
@@ -17,6 +29,9 @@ pub struct LandmarkHeuristic<'a> {
     pub nodes: usize,
     pub landmarks: usize,
     pub tab: &'a [u16],
+    /// Quantum (ms) the table was built with — from the snapshot header, NOT the
+    /// compiled constant (a stale binary must still read new snapshots correctly).
+    pub quantum: f32,
 }
 
 /// Per-query landmark selection produced by [`LandmarkHeuristic::select_active`].
@@ -130,7 +145,138 @@ impl<'a> LandmarkHeuristic<'a> {
                 if a > best { best = a; }
             }
         }
-        ((best - 1).max(0) as f32) * ALT_QUANTUM_MS
+        ((best - 1).max(0) as f32) * self.quantum
+    }
+}
+
+
+/// Per-query landmark selection for the BACKWARD side of a bidirectional search: lower
+/// bounds on d(anchor_set, v) where the anchor set is the forward search's origins
+/// (start at g=0 plus every seeded global teleport at g=cost).
+///
+/// Per selected landmark the anchors are pre-aggregated:
+///   bound_a(v) = fw_v*Q + c1        c1 = min over anchors (g0 - fw_a*Q)
+///   bound_b(v) = c2 - bw_v*Q        c2 = min over anchors (g0 + bw_a*Q)
+/// Validity requires EVERY anchor's per-anchor bound to be valid (any anchor could be
+/// the true minimizer):
+///   a-side: all fw_a < SATURATED (a saturated fw_a understates d(L,a) and would
+///           overstate the bound);
+///   b-side: all bw_a != UNREACHABLE (floor/saturation only understate, which is safe
+///           on the minuend side).
+/// The v-side rules mirror the forward heuristic: a saturated bw_v disables the b term
+/// for that node; fw_v == UNREACHABLE proves d(anchors, v) = infinity when every
+/// anchor's fw entry is not UNREACHABLE (L reaches every anchor, so any anchor->v path
+/// would make v reachable from L).
+#[derive(Default)]
+pub struct ActiveLandmarksRev {
+    pub landmarks: usize,
+    pub indices: Vec<usize>,
+    /// ms aggregate for the a-side; NAN when the a-side is unusable for this landmark.
+    pub c1: Vec<f32>,
+    /// ms aggregate for the b-side; NAN when the b-side is unusable for this landmark.
+    pub c2: Vec<f32>,
+    /// Whether fw_v == UNREACHABLE proves unreachability from all anchors.
+    pub inf_ok: Vec<bool>,
+}
+
+impl<'a> LandmarkHeuristic<'a> {
+    /// Select landmarks for the backward bound, scored by the bound they yield at the
+    /// goal (the node where the backward search starts and bounds matter most early).
+    pub fn select_active_rev(&self, anchors: &[(u32, f32)], goal: u32, k: usize) -> ActiveLandmarksRev {
+        let l = self.landmarks;
+        if l == 0 || self.nodes == 0 || self.tab.is_empty() || anchors.is_empty() {
+            return ActiveLandmarksRev::default();
+        }
+        let stride = 2 * l;
+        let gb = goal as usize * stride;
+
+        struct Cand { li: usize, c1: f32, c2: f32, inf_ok: bool, score: f32 }
+        let mut cands: Vec<Cand> = Vec::with_capacity(l);
+        for li in 0..l {
+            let mut c1 = f32::INFINITY;
+            let mut c2 = f32::INFINITY;
+            let mut a_ok = true;
+            let mut b_ok = true;
+            let mut inf_ok = true;
+            for &(a, g0) in anchors {
+                let fa = self.tab[a as usize * stride + 2 * li];
+                let ba = self.tab[a as usize * stride + 2 * li + 1];
+                if fa >= ALT_SATURATED { a_ok = false; }
+                if fa == ALT_UNREACHABLE { inf_ok = false; }
+                if ba == ALT_UNREACHABLE { b_ok = false; }
+                if a_ok {
+                    let t = g0 - fa as f32 * self.quantum;
+                    if t < c1 { c1 = t; }
+                }
+                if b_ok {
+                    let t = g0 + ba as f32 * self.quantum;
+                    if t < c2 { c2 = t; }
+                }
+            }
+            if !a_ok && !b_ok {
+                continue;
+            }
+            let c1 = if a_ok { c1 } else { f32::NAN };
+            let c2 = if b_ok { c2 } else { f32::NAN };
+            // Score: bound at the goal node.
+            let gfw = self.tab[gb + 2 * li];
+            let gbw = self.tab[gb + 2 * li + 1];
+            let mut score = 0.0f32;
+            if a_ok && gfw < ALT_SATURATED {
+                let v = gfw as f32 * self.quantum + c1;
+                if v > score { score = v; }
+            }
+            if b_ok && gbw < ALT_SATURATED {
+                let v = c2 - gbw as f32 * self.quantum;
+                if v > score { score = v; }
+            }
+            cands.push(Cand { li, c1, c2, inf_ok, score });
+        }
+        cands.sort_unstable_by(|x, y| {
+            y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| x.li.cmp(&y.li))
+        });
+        cands.truncate(k);
+
+        let mut out = ActiveLandmarksRev { landmarks: l, ..Default::default() };
+        for c in cands {
+            out.indices.push(c.li);
+            out.c1.push(c.c1);
+            out.c2.push(c.c2);
+            out.inf_ok.push(c.inf_ok);
+        }
+        out
+    }
+
+    /// Lower bound (ms) on d(anchor_set, v); INFINITY when v is provably unreachable
+    /// from every anchor. Mirrors `h_active`'s quantization slack handling.
+    #[inline]
+    pub fn h_active_rev(&self, v: u32, active: &ActiveLandmarksRev) -> f32 {
+        if active.indices.is_empty() {
+            return 0.0;
+        }
+        let stride = 2 * active.landmarks;
+        let vb = v as usize * stride;
+        let row = &self.tab[vb..vb + stride];
+        let mut best = 0.0f32;
+        for i in 0..active.indices.len() {
+            let li = active.indices[i];
+            let fv = row[2 * li];
+            let bv = row[2 * li + 1];
+            if fv == ALT_UNREACHABLE {
+                if active.inf_ok[i] {
+                    return f32::INFINITY;
+                }
+            } else if fv < ALT_SATURATED && !active.c1[i].is_nan() {
+                let a = fv as f32 * self.quantum + active.c1[i];
+                if a > best { best = a; }
+            }
+            if bv < ALT_SATURATED && !active.c2[i].is_nan() {
+                let b = active.c2[i] - bv as f32 * self.quantum;
+                if b > best { best = b; }
+            }
+        }
+        (best - self.quantum).max(0.0)
     }
 }
 
@@ -168,7 +314,7 @@ mod tests {
             0, 0,      // node 0 (== landmark)
             100, 100,  // node 1 (goal)
         ];
-        let lm = LandmarkHeuristic { nodes: 2, landmarks: 1, tab: &tab };
+        let lm = LandmarkHeuristic { nodes: 2, landmarks: 1, tab: &tab, quantum: ALT_QUANTUM_MS };
         let active = lm.select_active(0, 1, 8);
         assert_eq!(active.indices, vec![0]);
         let h = lm.h_active(0, &active);
@@ -185,7 +331,7 @@ mod tests {
             0, 0,
             ALT_SATURATED, ALT_SATURATED,
         ];
-        let lm = LandmarkHeuristic { nodes: 2, landmarks: 1, tab: &tab };
+        let lm = LandmarkHeuristic { nodes: 2, landmarks: 1, tab: &tab, quantum: ALT_QUANTUM_MS };
         let active = lm.select_active(0, 1, 8);
         assert!(active.indices.is_empty());
     }
@@ -198,7 +344,7 @@ mod tests {
             100, 100,
             ALT_UNREACHABLE, ALT_UNREACHABLE,
         ];
-        let lm = LandmarkHeuristic { nodes: 3, landmarks: 1, tab: &tab };
+        let lm = LandmarkHeuristic { nodes: 3, landmarks: 1, tab: &tab, quantum: ALT_QUANTUM_MS };
         let active = lm.select_active(0, 1, 8);
         assert!(lm.h_active(2, &active).is_infinite());
     }

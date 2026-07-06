@@ -565,6 +565,30 @@ fn main() -> Result<()> {
         cur[walk_src[i] as usize] += 1;
     }
 
+    // Bidirectional search reuses the forward walk CSR as its reverse graph, which is
+    // only sound if every walk edge has its mirror. The current rules guarantee it for
+    // cardinals and it holds empirically for diagonals; assert so future map data can't
+    // silently break search correctness.
+    {
+        let mut asym = 0usize;
+        for u in 0..node_count {
+            let (s, e) = (walk_offsets[u] as usize, walk_offsets[u + 1] as usize);
+            'edge: for slot in s..e {
+                let v = walk_csr_dst[slot] as usize;
+                let (vs, ve) = (walk_offsets[v] as usize, walk_offsets[v + 1] as usize);
+                for vslot in vs..ve {
+                    if walk_csr_dst[vslot] as usize == u {
+                        continue 'edge;
+                    }
+                }
+                asym += 1;
+            }
+        }
+        if asym > 0 {
+            anyhow::bail!("walk graph is not symmetric: {asym} edges lack a mirror; bidirectional search would be unsound");
+        }
+    }
+
     let (comp_ids, walk_components) = walk_component_ids(node_count, &walk_src, &walk_dst);
     info!(walk_components, "computed walk components");
 

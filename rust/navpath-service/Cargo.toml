@@ -14,6 +14,7 @@ thiserror = "1"
 anyhow = "1"
 navpath-core = { path = "../navpath-core" }
 arc-swap = "1"
+lru = "0.12"
 mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]

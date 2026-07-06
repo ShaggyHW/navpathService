@@ -73,10 +73,15 @@ pub struct SnapshotCounts {
     pub walk_components: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Manifest {
     pub version: u32,
     pub counts: SnapshotCounts,
+    /// ALT table quantum in ms, stamped by the builder. Readers MUST use this instead of
+    /// the compiled constant: a binary/snapshot quantum mismatch silently mis-scales
+    /// every heuristic value (observed in production as weak-h budget exhaustion).
+    /// 0.0 in legacy v8 files (header padding) decodes as 64.0.
+    pub alt_quantum_ms: f32,
     pub off_coords: u64,
     pub off_walk_offsets: u64,
     pub off_walk_dst: u64,
@@ -153,9 +158,12 @@ impl Manifest {
         for (i, o) in offs.iter_mut().enumerate() {
             *o = LittleEndian::read_u64(&header[o0 + i * 8..o0 + i * 8 + 8]);
         }
+        let q = LittleEndian::read_f32(&header[o0 + MANIFEST_OFFSET_COUNT * 8..o0 + MANIFEST_OFFSET_COUNT * 8 + 4]);
+        let alt_quantum_ms = if q > 0.0 && q.is_finite() { q } else { ALT_QUANTUM_MS };
         Ok(Manifest {
             version,
             counts,
+            alt_quantum_ms,
             off_coords: offs[0],
             off_walk_offsets: offs[1],
             off_walk_dst: offs[2],
@@ -196,6 +204,7 @@ impl Manifest {
         for (i, o) in self.offsets().iter().enumerate() {
             LittleEndian::write_u64(&mut header[o0 + i * 8..o0 + i * 8 + 8], *o);
         }
+        LittleEndian::write_f32(&mut header[o0 + MANIFEST_OFFSET_COUNT * 8..o0 + MANIFEST_OFFSET_COUNT * 8 + 4], self.alt_quantum_ms);
         header
     }
 

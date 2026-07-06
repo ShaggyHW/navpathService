@@ -28,7 +28,52 @@ pub struct FairyRingRow {
     pub requirements: Vec<i64>,
 }
 
+/// Fast path: one row per (region, plane) with a presence bitmap + walk_mask blob
+/// (see migrate_tiles_regions.py). ~2.8k rows and memcpy-speed decode instead of
+/// millions of per-row varint decodes; essential at 4M tiles.
+fn load_tiles_from_regions(conn: &Connection) -> Result<Option<Vec<Tile>>> {
+    let has: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tiles_regions'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has == 0 {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT plane, base_x, base_y, blob FROM tiles_regions")?;
+    let rows = stmt.query_map([], |row: &Row| {
+        let plane: i32 = row.get(0)?;
+        let base_x: i32 = row.get(1)?;
+        let base_y: i32 = row.get(2)?;
+        let blob: Vec<u8> = row.get(3)?;
+        Ok((plane, base_x, base_y, blob))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (plane, base_x, base_y, blob) = r?;
+        if blob.len() != 512 + 4096 {
+            anyhow::bail!("tiles_regions blob has unexpected length {}", blob.len());
+        }
+        let (presence, masks) = blob.split_at(512);
+        for i in 0..4096usize {
+            if presence[i / 8] & (1 << (i % 8)) != 0 {
+                out.push(Tile {
+                    x: base_x + (i % 64) as i32,
+                    y: base_y + (i / 64) as i32,
+                    plane,
+                    walk_mask: masks[i] as u32,
+                });
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
 pub fn load_all_tiles(conn: &Connection) -> Result<Vec<Tile>> {
+    if let Some(mut tiles) = load_tiles_from_regions(conn)? {
+        tiles.sort_unstable_by_key(|t| (t.plane, t.y, t.x));
+        return Ok(tiles);
+    }
     // No SQL ORDER BY: the tiles PK is (x,y,plane), so ordering by (plane,y,x) forces a
     // TEMP B-TREE sort over every row (~15x slower scan). Load in table order and sort
     // in Rust below — node-id assignment stays byte-identical.

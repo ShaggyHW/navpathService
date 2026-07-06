@@ -214,6 +214,7 @@ fn bench_astar(c: &mut Criterion) {
         nodes: view.nodes,
         landmarks: counts.landmarks as usize,
         tab: snap.lm_tab(),
+        quantum: snap.manifest().alt_quantum_ms,
     };
     if let Some(&(_, a, b)) = corpus.last() {
         let mut group = c.benchmark_group("heuristic");

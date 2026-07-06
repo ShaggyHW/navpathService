@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use navpath_core::{EngineView, SearchParams, SearchResult, SearchStatus, Snapshot, NeighborProvider};
 use navpath_core::engine::search::{ExtraEdges, SearchContext};
 use navpath_core::engine::neighbors::WalkGraph;
+use navpath_core::engine::search::BidirParams;
 
 /// Empty "no path" result for early-exit paths in this module.
 fn not_found_result() -> SearchResult {
@@ -18,6 +19,16 @@ use tracing::{info, warn};
 
 thread_local! {
     static SEARCH_CONTEXT: RefCell<SearchContext> = RefCell::new(SearchContext::new(0));
+    static SEARCH_CONTEXT_B: RefCell<SearchContext> = RefCell::new(SearchContext::new(0));
+}
+
+/// Whether normal routes use the bidirectional search (NAVPATH_BIDIR, default on;
+/// set 0 to fall back to unidirectional).
+fn bidir_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(std::env::var("NAVPATH_BIDIR").ok().as_deref().map(str::trim), Some("0") | Some("false"))
+    })
 }
 
 /// Whether per-request requirement diagnostics are enabled, controlled by the
@@ -34,15 +45,19 @@ fn req_debug_enabled() -> bool {
 }
 
 /// Pop budget for a single search, from `NAVPATH_MAX_POPS` (0 disables). Defaults to
-/// 500k pops — enough for any legitimate route, while capping unreachable-goal floods.
-/// Cached once so the hot path never performs an env lookup.
+/// 1.5M pops: hard requests (gated profiles + quantization plateau + seed jitter, which
+/// disables exact-tie collapse) measured up to ~600k legitimate pops on the 1.1M-node
+/// map, and a 500k budget rejected real routes in production. 1.5M still caps
+/// unreachable-goal floods at a few hundred ms; the request deadline and the search
+/// semaphore bound the aggregate damage. Cached once so the hot path never performs an
+/// env lookup.
 fn default_max_pops() -> Option<u32> {
     static MAX_POPS: OnceLock<Option<u32>> = OnceLock::new();
     *MAX_POPS.get_or_init(|| {
         match std::env::var("NAVPATH_MAX_POPS").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
             Some(0) => None,
             Some(n) => Some(n),
-            None => Some(500_000),
+            None => Some(1_500_000),
         }
     })
 }
@@ -93,7 +108,7 @@ fn kind_code(kind: &str) -> u32 {
     }
 }
 
-pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<GlobalTeleport>, HashMap<(u32, u32), Vec<u32>>) {
+pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, NeighborProvider, Vec<GlobalTeleport>, HashMap<(u32, u32), Vec<u32>>) {
     // 1. Build map of req_id -> tag_index
     let req_words: &[u32] = snapshot.req_tags();
     let mut id_to_idx = std::collections::HashMap::new();
@@ -197,8 +212,16 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Vec<Gl
         mkind_vec,
         &macro_reqs,
     );
+    // Reversed macro adjacency for the backward half of bidirectional searches (same
+    // per-edge requirement data, src/dst swapped).
+    let provider_rev = NeighborProvider::new_with_reqs(
+        nodes,
+        mdst_vec, msrc_vec, mw_vec,
+        mkind_vec,
+        &macro_reqs,
+    );
 
-    (provider, globals, macro_lookup)
+    (provider, provider_rev, globals, macro_lookup)
 }
 
 /// Build fairy ring runtime data from snapshot.
@@ -287,6 +310,7 @@ pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, HashMap<u32, u
 pub fn run_route_with_requirements_and_fairy_rings(
     snapshot: Arc<Snapshot>,
     neighbors: Arc<NeighborProvider>,
+    neighbors_rev: Option<Arc<NeighborProvider>>,
     globals: Arc<Vec<GlobalTeleport>>,
     start_id: u32,
     goal_id: u32,
@@ -365,6 +389,7 @@ pub fn run_route_with_requirements_and_fairy_rings(
         nodes,
         landmarks: snap_ref.counts().landmarks as usize,
         tab: snap_ref.lm_tab(),
+        quantum: snap_ref.manifest().alt_quantum_ms,
     };
 
     let mut view = EngineView {
@@ -383,6 +408,25 @@ pub fn run_route_with_requirements_and_fairy_rings(
     view.extra.fairy_dests = eligible_fairy_dests;
 
     let macro_filter = view.macros.macro_filter(mask, quick_tele);
+
+    if bidir_enabled() {
+        if let Some(rev) = neighbors_rev.as_ref() {
+            let macro_filter_rev = rev.macro_filter(mask, quick_tele);
+            let bp = BidirParams { macros_rev: rev, macro_filter_rev: Some(&macro_filter_rev) };
+            return SEARCH_CONTEXT.with(|cf| {
+                SEARCH_CONTEXT_B.with(|cb| {
+                    let mut ctx_f = cf.borrow_mut();
+                    let mut ctx_b = cb.borrow_mut();
+                    view.astar_bidir(
+                        &bp,
+                        SearchParams { start: start_id, goal: goal_id, macro_filter: Some(&macro_filter), seed, max_pops: default_max_pops(), cancel },
+                        &mut ctx_f,
+                        &mut ctx_b,
+                    )
+                })
+            });
+        }
+    }
 
     SEARCH_CONTEXT.with(|ctx_cell| {
         let mut ctx = ctx_cell.borrow_mut();
@@ -424,6 +468,7 @@ pub fn run_route_with_requirements_virtual_start(
         nodes,
         landmarks: snap_ref.counts().landmarks as usize,
         tab: snap_ref.lm_tab(),
+        quantum: snap_ref.manifest().alt_quantum_ms,
     };
     let view = EngineView {
         nodes,

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
 
 use arc_swap::ArcSwap;
 use axum::{routing::{get, post}, Router};
@@ -9,15 +9,46 @@ use crate::engine_adapter::{GlobalTeleport, FairyRing};
 pub mod routes;
 pub mod engine_adapter;
 
+/// Cache key for a route search. Everything the search result depends on is in here;
+/// snapshot identity is implicit (the cache lives inside SnapshotState, so a snapshot
+/// swap drops it wholesale).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct RouteCacheKey {
+    pub virtual_start: bool,
+    pub sid: u32,
+    pub gid: u32,
+    pub mask_hash: u64,
+    pub quick_tele: bool,
+    pub seed: Option<u64>,
+}
+
+/// Cached search outcome: the raw result plus the winning virtual-entry teleport.
+/// Response payloads (actions/geometry) are rebuilt per request so one entry serves
+/// every options combination.
+pub type RouteCacheEntry = Arc<(navpath_core::SearchResult, Option<u32>)>;
+pub type RouteCache = Mutex<lru::LruCache<RouteCacheKey, RouteCacheEntry>>;
+
+/// Route cache sized from `NAVPATH_ROUTE_CACHE` (entries; default 2048, 0 disables).
+pub fn new_route_cache() -> Option<Arc<RouteCache>> {
+    let n = std::env::var("NAVPATH_ROUTE_CACHE").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2048);
+    NonZeroUsize::new(n).map(|cap| Arc::new(Mutex::new(lru::LruCache::new(cap))))
+}
+
 #[derive(Clone)]
 pub struct SnapshotState {
     pub path: PathBuf,
     pub snapshot: Option<Arc<Snapshot>>, // None when not loaded
     pub neighbors: Option<Arc<NeighborProvider>>,
+    /// Reversed macro adjacency for bidirectional searches.
+    pub neighbors_rev: Option<Arc<NeighborProvider>>,
     pub globals: Arc<Vec<GlobalTeleport>>, // dst, cost, reqs (indices)
     pub macro_lookup: Arc<HashMap<(u32, u32), Vec<u32>>>,
     pub loaded_at_unix: u64,
     pub snapshot_hash_hex: Option<String>,
+    /// Per-snapshot route result cache (None = disabled). Dropped on snapshot swap.
+    pub route_cache: Option<Arc<RouteCache>>,
     // Fairy Ring data
     pub fairy_rings: Arc<Vec<FairyRing>>,
     pub node_to_fairy_ring: Arc<HashMap<u32, usize>>,

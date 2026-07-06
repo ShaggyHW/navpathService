@@ -3,7 +3,7 @@ use std::{fs::File, io::{BufWriter, Write}, path::Path};
 #[cfg(not(target_endian = "little"))]
 use byteorder::{ByteOrder, LittleEndian};
 
-use super::manifest::{align_up, Manifest, SnapshotCounts, MANIFEST_OFFSET_COUNT, SNAPSHOT_VERSION};
+use super::manifest::{align_up, Manifest, SnapshotCounts, ALT_QUANTUM_MS, MANIFEST_OFFSET_COUNT, SNAPSHOT_VERSION};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriterError {
@@ -215,6 +215,7 @@ pub fn write_snapshot_v8(path: impl AsRef<Path>, s: &SnapshotSections) -> Result
     let manifest = Manifest {
         version: SNAPSHOT_VERSION,
         counts,
+        alt_quantum_ms: ALT_QUANTUM_MS,
         off_coords: offs[0],
         off_walk_offsets: offs[1],
         off_walk_dst: offs[2],

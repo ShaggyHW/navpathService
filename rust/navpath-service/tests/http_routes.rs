@@ -16,9 +16,10 @@ fn make_snapshot_file(nodes: usize) -> tempfile::TempPath {
     assert_eq!(nodes, 3, "fixture is a 3-node chain");
     // Nodes at (3200..3202, 3200, plane 0); packed keys ascend with x.
     let coords_packed: Vec<u32> = (0..nodes as i32).map(|i| pack_coord(3200 + i, 3200, 0)).collect();
-    // simple chain 0->1->2 (cardinal edges)
-    let walk_offsets = vec![0u32, 1, 2, 2];
-    let walk_dst = vec![1u32, 2u32];
+    // simple symmetric chain 0<->1<->2 (cardinal edges) — the real walk graph is
+    // symmetric and the builder asserts it; bidirectional search relies on it.
+    let walk_offsets = vec![0u32, 1, 3, 4];
+    let walk_dst = vec![1u32, 0, 2, 1];
     let walk_diag = vec![0u8];
     let comp = vec![0u16, 0, 0];
 
@@ -85,16 +86,18 @@ async fn health_and_route_and_reload() {
     // Build initial snapshot
     let snap_path = make_snapshot_file(3);
     let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
-    let (neighbors, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
+    let (neighbors, neighbors_rev, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
     let snapshot = Some(Arc::new(opened));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
         snapshot,
         neighbors: Some(Arc::new(neighbors)),
+        neighbors_rev: Some(Arc::new(neighbors_rev)),
         globals: Arc::new(globals),
         macro_lookup: Arc::new(macro_lookup),
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
+        route_cache: navpath_service::new_route_cache(),
         fairy_rings: Arc::new(Vec::new()),
         node_to_fairy_ring: Arc::new(HashMap::new()),
     })), search_permits: navpath_service::default_search_permits() };
@@ -139,16 +142,18 @@ async fn health_and_route_and_reload() {
 async fn missing_start_coordinate_forces_global_teleport_entry() {
     let snap_path = make_snapshot_file(3);
     let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
-    let (neighbors, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
+    let (neighbors, neighbors_rev, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
     let snapshot = Some(Arc::new(opened));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
         snapshot,
         neighbors: Some(Arc::new(neighbors)),
+        neighbors_rev: Some(Arc::new(neighbors_rev)),
         globals: Arc::new(globals),
         macro_lookup: Arc::new(macro_lookup),
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
+        route_cache: navpath_service::new_route_cache(),
         fairy_rings: Arc::new(Vec::new()),
         node_to_fairy_ring: Arc::new(HashMap::new()),
     })), search_permits: navpath_service::default_search_permits() };
