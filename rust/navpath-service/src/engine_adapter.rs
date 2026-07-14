@@ -62,6 +62,54 @@ fn default_max_pops() -> Option<u32> {
     })
 }
 
+/// Pop budget for the single retry a `BudgetExceeded` result earns, from
+/// `NAVPATH_RETRY_MAX_POPS` (0 disables the retry). Defaults to 4x `default_max_pops`.
+fn retry_max_pops() -> Option<u32> {
+    static RETRY_POPS: OnceLock<Option<u32>> = OnceLock::new();
+    *RETRY_POPS.get_or_init(|| {
+        match std::env::var("NAVPATH_RETRY_MAX_POPS").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => default_max_pops().map(|p| p.saturating_mul(4)),
+        }
+    })
+}
+
+/// Budget for retrying a search that gave up, or `None` to keep the result as-is.
+///
+/// `BudgetExceeded` means "gave up", NOT "no path" — the goal simply was not settled in
+/// time — so answering `found=false` to a request whose route exists is a lie the caller
+/// cannot distinguish from a genuine dead end. The retry drops the request `seed` and
+/// raises the cap, which attacks both known causes: jitter breaks exact f-value ties and
+/// so disables the high-g collapse of the ALT quantization plateau (measured: seeds alone
+/// pushed a real route from ~400k pops to over budget), and heavily gated profiles leave
+/// the ALT bound loose enough that the frontier balloons. Jitter only exists to vary
+/// otherwise-equal paths, so trading that variety for an actual route is the right call.
+///
+/// Retrying is skipped when it could not search any further than the attempt that just
+/// failed, and when the request is already dead (deadline fired or client gone) — the
+/// deadline, not the pop count, remains the real ceiling on both attempts.
+fn budget_retry_pops(
+    res: &SearchResult,
+    seed: Option<u64>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<u32> {
+    if !matches!(res.status, SearchStatus::BudgetExceeded) {
+        return None;
+    }
+    if let Some(c) = cancel {
+        if c.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+    }
+    let retry = retry_max_pops()?;
+    // An unseeded search that already had at least this budget would repeat itself.
+    if seed.is_none() && retry <= default_max_pops().unwrap_or(u32::MAX) {
+        return None;
+    }
+    Some(retry)
+}
+
 #[derive(Clone, Debug)]
 pub struct GlobalTeleport {
     pub dst: u32,
@@ -409,29 +457,43 @@ pub fn run_route_with_requirements_and_fairy_rings(
 
     let macro_filter = view.macros.macro_filter(mask, quick_tele);
 
-    if bidir_enabled() {
-        if let Some(rev) = neighbors_rev.as_ref() {
-            let macro_filter_rev = rev.macro_filter(mask, quick_tele);
-            let bp = BidirParams { macros_rev: rev, macro_filter_rev: Some(&macro_filter_rev) };
+    // Reversed adjacency + its per-request filter, built once so the budget retry below
+    // re-runs only the search, not the setup.
+    let bidir = if bidir_enabled() {
+        neighbors_rev.as_ref().map(|rev| (rev.clone(), rev.macro_filter(mask, quick_tele)))
+    } else {
+        None
+    };
+
+    let search = |seed: Option<u64>, max_pops: Option<u32>| -> SearchResult {
+        let params = SearchParams { start: start_id, goal: goal_id, macro_filter: Some(&macro_filter), seed, max_pops, cancel };
+        if let Some((rev, macro_filter_rev)) = bidir.as_ref() {
+            let bp = BidirParams { macros_rev: rev, macro_filter_rev: Some(macro_filter_rev) };
             return SEARCH_CONTEXT.with(|cf| {
                 SEARCH_CONTEXT_B.with(|cb| {
                     let mut ctx_f = cf.borrow_mut();
                     let mut ctx_b = cb.borrow_mut();
-                    view.astar_bidir(
-                        &bp,
-                        SearchParams { start: start_id, goal: goal_id, macro_filter: Some(&macro_filter), seed, max_pops: default_max_pops(), cancel },
-                        &mut ctx_f,
-                        &mut ctx_b,
-                    )
+                    view.astar_bidir(&bp, params, &mut ctx_f, &mut ctx_b)
                 })
             });
         }
-    }
+        SEARCH_CONTEXT.with(|ctx_cell| {
+            let mut ctx = ctx_cell.borrow_mut();
+            view.astar(params, &mut ctx)
+        })
+    };
 
-    SEARCH_CONTEXT.with(|ctx_cell| {
-        let mut ctx = ctx_cell.borrow_mut();
-        view.astar(SearchParams { start: start_id, goal: goal_id, macro_filter: Some(&macro_filter), seed, max_pops: default_max_pops(), cancel }, &mut ctx)
-    })
+    let res = search(seed, default_max_pops());
+    match budget_retry_pops(&res, seed, cancel) {
+        Some(retry_pops) => {
+            warn!(
+                start = start_id, goal = goal_id, pops = res.pops, retry_pops,
+                "search exhausted its pop budget; retrying unseeded with an escalated budget"
+            );
+            search(None, Some(retry_pops))
+        }
+        None => res,
+    }
 }
 
 pub fn run_route_with_requirements_virtual_start(
@@ -489,18 +551,30 @@ pub fn run_route_with_requirements_virtual_start(
     // leaves `extra.global` unused in multi-source mode, and this out-of-graph start has
     // no mid-route teleports by construction (a second teleport at any node u would cost
     // g(u) + c >= c, dominated by seeding it directly).
-    SEARCH_CONTEXT.with(|ctx_cell| {
-        let mut ctx = ctx_cell.borrow_mut();
-        let res = view.astar_multi(
-            &eligible_globals,
-            SearchParams { start: goal_id, goal: goal_id, macro_filter: Some(&macro_filter), seed, max_pops: default_max_pops(), cancel },
-            &mut ctx,
+    let search = |seed: Option<u64>, max_pops: Option<u32>| -> SearchResult {
+        SEARCH_CONTEXT.with(|ctx_cell| {
+            let mut ctx = ctx_cell.borrow_mut();
+            view.astar_multi(
+                &eligible_globals,
+                SearchParams { start: goal_id, goal: goal_id, macro_filter: Some(&macro_filter), seed, max_pops, cancel },
+                &mut ctx,
+            )
+        })
+    };
+
+    let mut res = search(seed, default_max_pops());
+    if let Some(retry_pops) = budget_retry_pops(&res, seed, cancel) {
+        warn!(
+            goal = goal_id, pops = res.pops, retry_pops,
+            "virtual-start search exhausted its pop budget; retrying unseeded with an escalated budget"
         );
-        if res.found {
-            let entry = res.path.first().copied();
-            (res, entry)
-        } else {
-            (res, None)
-        }
-    })
+        res = search(None, Some(retry_pops));
+    }
+
+    if res.found {
+        let entry = res.path.first().copied();
+        (res, entry)
+    } else {
+        (res, None)
+    }
 }

@@ -504,6 +504,21 @@ impl<'a> EngineView<'a> {
                 break;
             }
 
+            let forward = tf <= tb;
+            let Some(Key { f: _, g: gcur, id }) =
+                (if forward { ctx_f.open.pop() } else { ctx_b.open.pop() })
+            else {
+                break;
+            };
+            let u = id as usize;
+            // Lazy-deletion: an entry superseded by a better g is not an expansion, so it
+            // must be skipped BEFORE the budget is charged — exactly as the unidirectional
+            // loop does. Charging stale entries makes the effective budget shrink with heap
+            // churn (which seed jitter inflates), so a reachable goal can hit
+            // BudgetExceeded well under `max_pops` real expansions.
+            let g_side = if forward { ctx_f.get_g(u) } else { ctx_b.get_g(u) };
+            if gcur > g_side { continue; }
+
             pops += 1;
             if let Some(max) = params.max_pops {
                 if pops > max { ended = Some(SearchStatus::BudgetExceeded); break; }
@@ -517,12 +532,8 @@ impl<'a> EngineView<'a> {
                 }
             }
 
-            if tf <= tb {
+            if forward {
                 // ---- expand forward ----
-                let Key { f: _, g: gcur, id } = ctx_f.open.pop().unwrap();
-                let u = id as usize;
-                if gcur > ctx_f.get_g(u) { continue; }
-
                 let fairy_slice: &[(u32, f32)] =
                     if !self.extra.fairy_sources.is_empty()
                         && self.extra.fairy_sources.binary_search(&id).is_ok()
@@ -563,10 +574,6 @@ impl<'a> EngineView<'a> {
                 }
             } else {
                 // ---- expand backward (over reversed edges) ----
-                let Key { f: _, g: gcur, id } = ctx_b.open.pop().unwrap();
-                let u = id as usize;
-                if gcur > ctx_b.get_g(u) { continue; }
-
                 // Backward fairy: predecessors of ring x are all other rings, each via
                 // the forward edge y->x whose weight is cost(x).
                 let fairy_pred_w: Option<f32> =
@@ -649,6 +656,9 @@ impl<'a> EngineView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Distinct expansions `bidir_budget_charges_expansions_not_stale_pops` performs.
+    const EXPECTED_BIDIR_POPS: u32 = 20;
 
     fn line_view<'a>(
         walk_src: &'a [u32], walk_dst: &'a [u32], walk_w: &'a [f32],
@@ -797,6 +807,50 @@ mod tests {
         let bi = bidir_of(&view, 0, 3, 4);
         assert!((bi.cost - 1.25).abs() < 1e-4, "cost {}", bi.cost);
         assert_eq!(bi.path, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn bidir_budget_charges_expansions_not_stale_pops() {
+        // Node 2 is first reached at g=5 (direct 0-2 edge), then improved to g=2 (via 1),
+        // leaving a stale heap entry at g=5 (pr=10). The 2..20 tail keeps the meeting cost
+        // mu (=20) above that pr, so MM really does pop the stale entry. A stale pop is a
+        // skip, not an expansion, and must not be charged against the budget: charging it
+        // shrinks the effective budget by however much heap churn a query happens to
+        // produce (seed jitter multiplies exactly that), which is how a reachable goal
+        // ends up reported as BudgetExceeded.
+        let mut edges: Vec<(u32, u32, f32)> = vec![(0, 1, 1.0), (1, 2, 1.0), (0, 2, 5.0)];
+        for a in 2..20u32 {
+            edges.push((a, a + 1, 1.0));
+        }
+        let (mut ws, mut wd, mut ww) = (Vec::new(), Vec::new(), Vec::new());
+        for (a, b, w) in edges {
+            ws.push(a); wd.push(b); ww.push(w);
+            ws.push(b); wd.push(a); ww.push(w);
+        }
+        let view = line_view(&ws, &wd, &ww, &[], &[], &[], 21);
+
+        let res = bidir_of(&view, 0, 20, 21);
+        assert!(res.found);
+        assert!((res.cost - 20.0).abs() < 1e-4, "cost {}", res.cost);
+        // Every node is expanded at most once per side here (h=0 is consistent), so the
+        // charge is bounded by the distinct expansions the run performs. Measured on the
+        // stale-free accounting; the pre-fix loop charged the stale pops on top.
+        assert_eq!(res.pops, EXPECTED_BIDIR_POPS);
+
+        // A budget of exactly that many expansions is therefore enough to find the route
+        // and prove it optimal — no BudgetExceeded, no truncated path.
+        let macros_rev = NeighborProvider::new(21, &[], &[], &[]);
+        let bp = BidirParams { macros_rev: &macros_rev, macro_filter_rev: None };
+        let mut cf = SearchContext::new(21);
+        let mut cb = SearchContext::new(21);
+        let budgeted = view.astar_bidir(
+            &bp,
+            SearchParams { start: 0, goal: 20, macro_filter: None, seed: None, max_pops: Some(EXPECTED_BIDIR_POPS), cancel: None },
+            &mut cf,
+            &mut cb,
+        );
+        assert_eq!(budgeted.status, SearchStatus::Found);
+        assert!((budgeted.cost - 20.0).abs() < 1e-4, "cost {}", budgeted.cost);
     }
 
     #[test]

@@ -332,6 +332,17 @@ A real request ((2887,3535,0)→(3563,3408,0), quick-tele profile with most item
 4. **Hardening from the same investigation:** `ALT_QUANTUM_MS` is now **stamped into the snapshot header** and the reader uses the stored value (0 in legacy files decodes as 64 ms) — a binary/snapshot quantum mismatch previously mis-scaled every heuristic silently.
 5. Client-side note (their repo): `ResultsParser.kt` throws on any response without an `actions` array — but `found=false` is a legitimate outcome (genuinely unreachable goals). Their parser should handle `{"found": false, "reason": ...}` gracefully.
 
+### Follow-up 2026-07-14 — `budget_exceeded` on reachable routes, structural fix
+
+Raising the cap to 1.5M moved the cliff without removing it: reports of intermittent `budget_exceeded` on valid routes continued (same pair passing or failing depending on the seed, and clustering on heavily gated profiles). Two changes:
+
+1. **Bidir budget accounting bug** (`search.rs`): `astar_bidir` charged `pops += 1` *before* popping and before the lazy-deletion check, so every superseded heap entry burned budget — while `astar` skips stale entries first and only charges real expansions. The effective bidir budget therefore shrank with heap churn, which is exactly what seed jitter inflates. Fixed by popping, skipping stale, then charging. Regression test `bidir_budget_charges_expansions_not_stale_pops` pins the count on a fixture where MM provably pops a stale entry (20 expansions; the old loop charged 21).
+2. **Budget-exceeded retry** (`engine_adapter.rs`): `BudgetExceeded` means "gave up", not "no path" — answering `found=false` is indistinguishable, to the caller, from a genuine dead end. A search that exhausts its budget now gets one retry, unseeded (jitter only exists to vary otherwise-equal paths — a real route is worth more than that variety) and with an escalated cap (`NAVPATH_RETRY_MAX_POPS`, default 4x = 6M, `0` disables). Skipped when the request is already dead (deadline fired / client gone) or when the retry could not search further than the attempt that failed. Both attempts share the request deadline + cancel flag, which remain the real ceiling. Setup (eligibility filtering, ALT view, macro filters) is built once and reused, so the retry re-runs only the search. Covers the virtual-start multi-source path too.
+
+Note this does **not** re-open the unreachable-goal flood: the mega-component is ~1.09M nodes, so a genuinely unreachable goal exhausts its heap *under* the 1.5M cap and returns `NotFound`, which never triggers a retry.
+
+Live verification (real 1.12M-node snapshot, `NAVPATH_MAX_POPS=5000` to force the first attempt to give up on an ordinary route): Lumbridge→Varrock seeded returns `found=false, reason=budget_exceeded` with the retry disabled, and `found=true, cost=75376.44` — identical to the unseeded optimum — with it enabled. All 35 tests green.
+
 ## Appendix A — cross-cutting correctness issues found during the audit
 
 These affect result *quality* today and should ride along with the perf work:
