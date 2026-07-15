@@ -1,12 +1,17 @@
 use crate::snapshot::{ALT_QUANTUM_MS, ALT_SATURATED, ALT_UNREACHABLE};
 
-/// Default number of landmarks evaluated per heuristic call. At the start of each query
-/// the best landmarks for the (start, goal) pair are selected and only those are
-/// evaluated during the search. The max over a subset of admissible landmark lower
-/// bounds is still admissible, so optimal path cost is preserved; fewer active landmarks
-/// are cheaper per node but can be much weaker off the direct start-goal axis (e.g.
-/// along teleport-seeded corridors). Override with NAVPATH_ACTIVE_LANDMARKS.
-pub const ACTIVE_LANDMARKS: usize = 8;
+/// Default number of landmarks evaluated per heuristic call: ALL of them.
+///
+/// The max over any subset of admissible landmark bounds is admissible, so this only
+/// tightens the heuristic. Historically 8 were selected per (start, goal) pair to save
+/// compute, but a node's interleaved row is 4 cache lines and 8 scattered pairs already
+/// touch ~3.6 of them — full-width evaluation is nearly memory-free, and MEASURED
+/// (2026-07-14, deployed 64-landmark snapshot): 53-67% fewer pops on the incident-class
+/// long/gated routes and ~60% lower wall time on the differential corpus, because every
+/// avoided pop was itself a DRAM row gather. Point selection is also provably degenerate
+/// for multi-source virtual starts (all scores tie at 0); full width has no selection
+/// step to degenerate. Override with NAVPATH_ACTIVE_LANDMARKS for A/B runs.
+pub const ACTIVE_LANDMARKS: usize = usize::MAX;
 
 /// Active-landmark count from `NAVPATH_ACTIVE_LANDMARKS` (default [`ACTIVE_LANDMARKS`]).
 pub fn active_landmarks() -> usize {
@@ -49,6 +54,31 @@ pub struct ActiveLandmarks {
     pub goal_fw: Vec<u16>,
     /// `bw[goal, li]` quanta for each selected landmark (parallel to `indices`).
     pub goal_bw: Vec<u16>,
+    /// Full-width branchless operands, present when every valid landmark is selected
+    /// (the default since roadmap 3.1). See [`FullRowOperands`].
+    pub full: Option<FullRowOperands>,
+}
+
+/// Precomputed per-query operand lanes for the branchless full-row heuristic. Lane
+/// layout mirrors the interleaved table row `[fw(l0), bw(l0), fw(l1), bw(l1), …]`:
+///
+/// - `ga`: even lanes hold `goal_fw` for VALID landmarks (0 otherwise/odd) — so
+///   `ga.saturating_sub(row)` yields `max(0, gfw − fu)` on even lanes, with the
+///   forward saturation rule free of charge (`fu >= SATURATED` saturates to 0, and
+///   invalid landmarks contribute the max-neutral 0).
+/// - `gb`: odd lanes hold `goal_bw` for valid landmarks (0xFFFF otherwise/even) — so
+///   `row.saturating_sub(gb)` yields `max(0, bu − gbw)` on odd lanes (a SATURATED
+///   `bu` still gives the valid understated bound, exactly like the scalar rule).
+/// - `inf_odd`: 0xFFFF on valid odd lanes — `row == 0xFFFF` there proves the node
+///   cannot reach the goal (the scalar early-INF return).
+///
+/// The lane-wise max over `ga⊖row` and `row⊖gb` equals the scalar loop's `best`
+/// integer exactly, so results are bit-identical; the whole pass is fixed-trip
+/// u16 saturating arithmetic that LLVM autovectorizes under target-cpu=native.
+pub struct FullRowOperands {
+    ga: Vec<u16>,
+    gb: Vec<u16>,
+    inf_odd: Vec<u16>,
 }
 
 impl<'a> LandmarkHeuristic<'a> {
@@ -92,20 +122,45 @@ impl<'a> LandmarkHeuristic<'a> {
             let v = a.max(b).max(0);
             scored.push((v, li));
         }
-        // Descending by bound, then ascending by index for a deterministic selection.
-        scored.sort_unstable_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
-
         let k = k.min(scored.len());
+        // Chosen landmarks are STORED index-ascending so h_active walks each node's
+        // interleaved row monotonically (max over the same set — bit-exact). Subset
+        // selection ranks by bound strength first (descending score, index tie-break
+        // for determinism); full-width selection (the default) skips ranking entirely —
+        // the fill loop already produced ascending indices.
+        let full_width = k >= scored.len();
+        let chosen: Vec<usize> = if !full_width {
+            scored.sort_unstable_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+            let mut c: Vec<usize> = scored.iter().take(k).map(|&(_, li)| li).collect();
+            c.sort_unstable();
+            c
+        } else {
+            scored.iter().map(|&(_, li)| li).collect()
+        };
         let mut active = ActiveLandmarks {
             landmarks: l,
             indices: Vec::with_capacity(k),
             goal_fw: Vec::with_capacity(k),
             goal_bw: Vec::with_capacity(k),
+            full: None,
         };
-        for &(_, li) in scored.iter().take(k) {
+        for &li in &chosen {
             active.indices.push(li);
             active.goal_fw.push(self.tab[gb + 2 * li]);
             active.goal_bw.push(self.tab[gb + 2 * li + 1]);
+        }
+        if full_width {
+            // Neutral lanes: ga=0 (⊖row saturates to 0), gb=0xFFFF (row⊖ saturates to
+            // 0), inf_odd=0 (never matches). Valid landmarks overwrite their lanes.
+            let mut ga = vec![0u16; stride];
+            let mut gb_ops = vec![0xFFFFu16; stride];
+            let mut inf_odd = vec![0u16; stride];
+            for (i, &li) in active.indices.iter().enumerate() {
+                ga[2 * li] = active.goal_fw[i];
+                gb_ops[2 * li + 1] = active.goal_bw[i];
+                inf_odd[2 * li + 1] = 0xFFFF;
+            }
+            active.full = Some(FullRowOperands { ga, gb: gb_ops, inf_odd });
         }
         active
     }
@@ -124,6 +179,36 @@ impl<'a> LandmarkHeuristic<'a> {
         let stride = 2 * active.landmarks;
         let ub = u as usize * stride;
         let row = &self.tab[ub..ub + stride];
+
+        // Full-width fast path (the default): one branchless fixed-trip pass over the
+        // whole interleaved row — LLVM autovectorizes the u16 saturating ops. Values
+        // are bit-identical to the scalar subset loop below (see [`FullRowOperands`]).
+        if let Some(full) = &active.full {
+            // Equal-length slice bindings so LLVM can hoist the bounds checks and
+            // vectorize the fixed-trip u16 loop (psubusw/pmaxuw/pcmpeqw); indexing the
+            // four Vecs directly defeated autovectorization (measured 3.4x slower).
+            let ga = &full.ga[..stride];
+            let gbv = &full.gb[..stride];
+            let io = &full.inf_odd[..stride];
+            let row = &row[..stride];
+            let mut best: u16 = 0;
+            let mut inf: u16 = 0;
+            for i in 0..stride {
+                let r = row[i];
+                let a = ga[i].saturating_sub(r);
+                let b = r.saturating_sub(gbv[i]);
+                best = best.max(a.max(b));
+                // Branchless: 0xFFFF where r == UNREACHABLE, masked to valid odd lanes.
+                let m = ((r == ALT_UNREACHABLE) as u16).wrapping_neg();
+                inf |= m & io[i];
+            }
+            if inf != 0 {
+                // u cannot reach a landmark the goal reaches → u cannot reach the goal.
+                return f32::INFINITY;
+            }
+            return ((best as i64 - 1).max(0) as f32) * self.quantum;
+        }
+
         let mut best: i64 = 0;
         for i in 0..active.indices.len() {
             let li = active.indices[i];
@@ -232,11 +317,15 @@ impl<'a> LandmarkHeuristic<'a> {
             }
             cands.push(Cand { li, c1, c2, inf_ok, score });
         }
-        cands.sort_unstable_by(|x, y| {
-            y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| x.li.cmp(&y.li))
-        });
-        cands.truncate(k);
+        if k < cands.len() {
+            cands.sort_unstable_by(|x, y| {
+                y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| x.li.cmp(&y.li))
+            });
+            cands.truncate(k);
+            // Same monotone-row-order storage as select_active (max over the same set).
+            cands.sort_unstable_by_key(|c| c.li);
+        }
 
         let mut out = ActiveLandmarksRev { landmarks: l, ..Default::default() };
         for c in cands {

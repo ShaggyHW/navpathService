@@ -87,6 +87,70 @@ impl<'a> WalkGraph<'a> {
         WalkGraph::Owned(Adjacency::build(nodes, src, dst, w))
     }
 
+    /// The node's neighbor-id slice (no weights). Exposed so the search can issue
+    /// software prefetches for the per-node state of upcoming relaxations before the
+    /// branchy relax loop serializes the loads.
+    #[inline(always)]
+    pub fn neighbor_ids(&self, u: u32) -> &[u32] {
+        match self {
+            WalkGraph::Csr { offsets, dst, .. } => {
+                let ui = u as usize;
+                if ui + 1 >= offsets.len() {
+                    return &[];
+                }
+                &dst[offsets[ui] as usize..offsets[ui + 1] as usize]
+            }
+            WalkGraph::Owned(adj) => adj.neighbors(u).0,
+        }
+    }
+
+    /// Internal iteration over (dst, weight): resolves the enum once per node, loads
+    /// the node's <=2 diagonal-bitmap bytes once into a shift window, and selects the
+    /// weight from a two-entry table — instead of a per-edge enum dispatch, per-edge
+    /// bounds-checked bitmap byte load, and per-edge branch (the highest-frequency
+    /// instruction stream in the engine). Weights are the identical constants, so
+    /// results are bit-exact.
+    #[inline]
+    pub fn for_each_neighbor(&self, u: u32, mut f: impl FnMut(u32, f32)) {
+        match self {
+            WalkGraph::Csr { offsets, dst, diag } => {
+                let ui = u as usize;
+                if ui + 1 >= offsets.len() {
+                    return;
+                }
+                let (s, e) = (offsets[ui] as usize, offsets[ui + 1] as usize);
+                if s == e {
+                    return;
+                }
+                let dsts = &dst[s..e];
+                let w_table = [WALK_CARDINAL_MS, walk_diagonal_ms()];
+                if dsts.len() <= 8 {
+                    // <=8 slots starting at bit (s & 7) span at most two bitmap bytes.
+                    let b0 = diag[s >> 3] as u16;
+                    let b1 = diag.get((s >> 3) + 1).copied().unwrap_or(0) as u16;
+                    let mut bits = (b0 | (b1 << 8)) >> (s & 7);
+                    for &d in dsts {
+                        f(d, w_table[(bits & 1) as usize]);
+                        bits >>= 1;
+                    }
+                } else {
+                    // Defensive fallback for non-grid CSR data (degree > 8).
+                    for (i, &d) in dsts.iter().enumerate() {
+                        let slot = s + i;
+                        let is_diag = diag[slot / 8] & (1 << (slot % 8)) != 0;
+                        f(d, w_table[is_diag as usize]);
+                    }
+                }
+            }
+            WalkGraph::Owned(adj) => {
+                let (d, w) = adj.neighbors(u);
+                for i in 0..d.len() {
+                    f(d[i], w[i]);
+                }
+            }
+        }
+    }
+
     #[inline]
     pub fn neighbors(&self, u: u32) -> WalkIter<'_> {
         match self {
@@ -140,12 +204,28 @@ impl Iterator for WalkIter<'_> {
 pub struct NeighborProvider {
     pub macro_edges: Adjacency,
     pub macro_data: Vec<MacroEdgeData>,
+    /// One bit per node: does it have any outgoing macro edge? Only ~0.08% of nodes
+    /// do, yet the search probes macro adjacency on every expansion — this bitmap
+    /// (140 KB at 1.1M nodes, L2-resident) replaces a guaranteed random access into
+    /// the multi-MB offsets array with one bit test.
+    has_src: Vec<u64>,
+}
+
+fn build_has_src(nodes: usize, src: &[u32]) -> Vec<u64> {
+    let mut bm = vec![0u64; nodes.div_ceil(64)];
+    for &s in src {
+        let i = s as usize;
+        if i < nodes {
+            bm[i >> 6] |= 1 << (i & 63);
+        }
+    }
+    bm
 }
 
 impl NeighborProvider {
     pub fn new(nodes: usize, macro_src: &[u32], macro_dst: &[u32], macro_w: &[f32]) -> Self {
         let (macro_edges, _) = Adjacency::build_with_data::<()>(nodes, macro_src, macro_dst, macro_w, None);
-        NeighborProvider { macro_edges, macro_data: Vec::new() }
+        NeighborProvider { macro_edges, macro_data: Vec::new(), has_src: build_has_src(nodes, macro_src) }
     }
 
     pub fn new_with_reqs(nodes: usize, macro_src: &[u32], macro_dst: &[u32], macro_w: &[f32], macro_kind_first: &[u32], macro_reqs: &[Vec<usize>]) -> Self {
@@ -155,7 +235,17 @@ impl NeighborProvider {
             .map(|(r, &k)| MacroEdgeData { reqs: r.clone(), kind_first: k })
             .collect();
         let (macro_edges, sorted_data) = Adjacency::build_with_data(nodes, macro_src, macro_dst, macro_w, Some(&data));
-        NeighborProvider { macro_edges, macro_data: sorted_data }
+        NeighborProvider { macro_edges, macro_data: sorted_data, has_src: build_has_src(nodes, macro_src) }
+    }
+
+    /// One-bit test for "does this node have any outgoing macro edge". The search
+    /// guards its macro loop with this so >=99.9% of expansions skip the adjacency
+    /// probe (and the iterator construction) entirely. Skipping empty ranges is
+    /// relaxation-set-neutral, hence bit-exact.
+    #[inline(always)]
+    pub fn has_macro(&self, u: u32) -> bool {
+        let i = u as usize;
+        (self.has_src.get(i >> 6).copied().unwrap_or(0) >> (i & 63)) & 1 != 0
     }
 
     /// Fold the request's eligibility mask and quick-tele flag into per-slot allow flags

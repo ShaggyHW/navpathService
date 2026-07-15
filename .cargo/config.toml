@@ -2,3 +2,6 @@
 # shipped to other machines, relax this to -C target-cpu=x86-64-v3.
 [build]
 rustflags = ["-C", "target-cpu=native"]
+# rustdoc compiles doctests without [build].rustflags; keep its codegen consistent so
+# the target-cpu compile guard in navpath-core sees the same target features.
+rustdocflags = ["-C", "target-cpu=native"]

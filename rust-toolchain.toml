@@ -1,0 +1,7 @@
+# Pin the toolchain so codegen and bench baselines stop drifting on rustup updates.
+# This freezes the nightly the current deployed binaries were built with (no nightly
+# features are actually required — migrating to a pinned stable >= 1.90 is fine once a
+# bench-parity run confirms it; see docs/optimization_roadmap_v2.md §9.6).
+[toolchain]
+channel = "nightly-2025-10-13"
+components = ["rustfmt", "clippy"]

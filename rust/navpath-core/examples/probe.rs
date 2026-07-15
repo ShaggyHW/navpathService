@@ -23,12 +23,13 @@ fn main() {
         vec![(923, 1957), (392, 74053), (392, 74489), (392, 923), (392, 1310)]
     };
 
+    let mut admissibility_violations = 0usize;
     for (s, g) in pairs {
         let active = view.lm.select_active(s, g, ACTIVE_LANDMARKS);
         let h0 = view.lm.h_active(s, &active);
         let t = std::time::Instant::now();
         let res = view.astar(
-            SearchParams { start: s, goal: g, macro_filter: None, seed: None, max_pops: None, cancel: None },
+            SearchParams { start: s, goal: g, macro_filter: None, seed: None, max_pops: None, cancel: None, bucket_ms: 0.0 },
             &mut ctx,
         );
         let el = t.elapsed();
@@ -42,5 +43,15 @@ fn main() {
             if res.cost > 0.0 { h0 / res.cost } else { 0.0 },
             res.pops, res.path.len(), el, active.indices
         );
+        // Admissibility oracle, not just a printout: h overstating the true cost is the
+        // historically worst bug class here (silent suboptimal routes that look fast).
+        if res.found && h0 > res.cost + 1e-3 {
+            eprintln!("ADMISSIBILITY VIOLATION: h0={h0} > cost={} for {s}->{g}", res.cost);
+            admissibility_violations += 1;
+        }
+    }
+    if admissibility_violations > 0 {
+        eprintln!("{admissibility_violations} admissibility violation(s)");
+        std::process::exit(1);
     }
 }

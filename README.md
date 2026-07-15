@@ -27,6 +27,34 @@ export RUST_LOG=info
 cargo run -p navpath-service --release
 ```
 
+## Validation & perf tooling
+
+Run these before landing any engine, heuristic, or snapshot-format change
+(details in `docs/optimization_roadmap_v2.md` §9):
+
+```sh
+# Golden replay comparator: uni + bidir + virtual-start x seeds [none,1,12345]
+# against tools/golden_corpus.json (costs, path re-costing, admissibility, pops).
+cargo run --release -p navpath-service --example replay
+# ... after an INTENDED cost/pops change, re-bless the expectations:
+cargo run --release -p navpath-service --example replay -- --regen
+
+# Cross-snapshot invariance: costs must be identical across landmark counts (24/64)
+# and NAVPATH_ACTIVE_LANDMARKS (4/8). Builds fresh snapshots from the tile DB.
+tools/invariance_check.sh
+
+# Perf gate: criterion corpus vs blessed medians in docs/perf-baselines/
+# (keyed on snapshot hash + rustc). Fails on >10% median regression.
+scripts/perf-gate.sh check          # bench + compare
+scripts/perf-gate.sh bless          # bench + save as the new baseline
+scripts/perf-gate.sh bless --reuse  # re-bless the last run without re-benching
+scripts/perf-gate.sh install-hook   # optional git pre-push hook (PERF_GATE_SKIP=1 to skip)
+```
+
+The DB producer must ship the `tiles_regions` table (run `migrate_tiles_regions.py`
+after any tiles change) — the builder falls back to a ~10x slower row-per-tile scan
+and warns loudly when it is missing.
+
 ## API Endpoints
 
 ### Check if a tile exists

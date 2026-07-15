@@ -1,10 +1,58 @@
-use std::collections::HashMap;
+use navpath_core::snapshot::pack_coord;
 
 use super::load_sqlite::Tile;
 
+/// Sorted packed-coordinate index — the same binary search the snapshot reader uses —
+/// replacing the SipHash `HashMap<(x,y,plane), u32>` node map (roadmap 7.4: ~36 MB +
+/// ~9M hash probes at 1.1M tiles, ~142 MB live through the ALT peak at 4M). Resolution
+/// results are exact-match identical, so builder output stays byte-for-byte the same.
+pub struct NodeIndex<'a> {
+    packed: std::borrow::Cow<'a, [u32]>,
+    /// Explicit ids parallel to `packed` (test fixtures with sparse ids); `None` means
+    /// the id IS the array position — the production invariant (node ids are assigned
+    /// in packed-key order, which is also what the snapshot's binary search relies on).
+    ids: Option<Vec<u32>>,
+}
+
+impl<'a> NodeIndex<'a> {
+    /// `packed` must be strictly ascending packed (plane,y,x) keys in node-id order —
+    /// exactly the `coords_packed` section the builder just constructed.
+    pub fn new(packed: &'a [u32]) -> Self {
+        Self { packed: std::borrow::Cow::Borrowed(packed), ids: None }
+    }
+
+    /// Owned index with explicit (coord, id) pairs — for tests and callers without the
+    /// position-is-id invariant.
+    pub fn from_coords(pairs: &[((i32, i32, i32), u32)]) -> NodeIndex<'static> {
+        let mut entries: Vec<(u32, u32)> = pairs
+            .iter()
+            .map(|&((x, y, p), id)| (pack_coord(x, y, p), id))
+            .collect();
+        entries.sort_unstable_by_key(|&(k, _)| k);
+        NodeIndex {
+            packed: std::borrow::Cow::Owned(entries.iter().map(|&(k, _)| k).collect()),
+            ids: Some(entries.iter().map(|&(_, id)| id).collect()),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, x: i32, y: i32, plane: i32) -> Option<u32> {
+        // pack_coord only debug-asserts its ranges; check for real so malformed DB
+        // coordinates miss instead of aliasing another tile's key in release builds.
+        if !(0..32768).contains(&x) || !(0..32768).contains(&y) || !(0..4).contains(&plane) {
+            return None;
+        }
+        let key = pack_coord(x, y, plane);
+        self.packed.binary_search(&key).ok().map(|i| match &self.ids {
+            Some(ids) => ids[i],
+            None => i as u32,
+        })
+    }
+}
+
 pub fn compile_walk_edges(
     tiles: &[Tile],
-    node_id_of: &HashMap<(i32, i32, i32), u32>,
+    node_id_of: &NodeIndex,
 ) -> (Vec<u32>, Vec<u32>, Vec<f32>) {
     let mut src: Vec<u32> = Vec::new();
     let mut dst: Vec<u32> = Vec::new();
@@ -53,7 +101,7 @@ pub fn compile_walk_edges(
             let nx = t.x + dx;
             let ny = t.y + dy;
             let np = t.plane;
-            if let Some(&did) = node_id_of.get(&(nx, ny, np)) {
+            if let Some(did) = node_id_of.get(nx, ny, np) {
                 // Reciprocity for cardinals: neighbor must allow opposite move
                 let neighbor_mask = tiles[did as usize].walk_mask;
                 let reciprocal_ok = match bit {

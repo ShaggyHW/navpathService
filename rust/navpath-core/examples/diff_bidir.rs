@@ -1,10 +1,14 @@
-//! Differential verification: bidirectional A* must return exactly the same cost as
-//! unidirectional A* for every (start, goal) pair. Run against the real snapshot:
+//! Differential verification: bidirectional A* must return the same cost as
+//! unidirectional A* for every (start, goal) pair — under every seed. Run against the
+//! real snapshot:
 //!
 //!   cargo run --release -p navpath-core --example diff_bidir -- 500
 //!
 //! Pairs are LCG-deterministic; the eligible-global set is the full parsed global list
 //! (the service's per-request masks only shrink it, which both searches see equally).
+//! Each pair runs under seeds [None, 1, 0x5EED]: production traffic is nearly always
+//! seeded, and the bidir backward relaxation's forward-edge jitter identity
+//! (edge_jitter(seed, y, id)) is only exercised by seeded runs.
 
 use navpath_core::engine::neighbors::NeighborProvider;
 use navpath_core::engine::search::{BidirParams, SearchContext, SearchParams};
@@ -71,6 +75,8 @@ fn main() {
         ((state >> 33) as usize % m) as u32
     };
 
+    const SEEDS: [Option<u64>; 3] = [None, Some(1), Some(0x5EED)];
+
     let mut checked = 0usize;
     let mut found_ct = 0usize;
     let mut mismatches = 0usize;
@@ -81,27 +87,30 @@ fn main() {
         let s = next(nodes);
         let g = next(nodes);
         if s == g { continue; }
-        let params = || SearchParams { start: s, goal: g, macro_filter: None, seed: None, max_pops: Some(2_000_000), cancel: None };
-        let uni = view.astar(params(), &mut ctx);
-        let bi = view.astar_bidir(&bp, params(), &mut cf, &mut cb);
         checked += 1;
-        uni_pops += uni.pops as u64;
-        bi_pops += bi.pops as u64;
-        if uni.found != bi.found
-            || (uni.found && (uni.cost - bi.cost).abs() > 1e-3 * uni.cost.max(1.0))
-        {
-            mismatches += 1;
-            println!(
-                "MISMATCH {s}->{g}: uni found={} cost={} pops={} | bidir found={} cost={} pops={}",
-                uni.found, uni.cost, uni.pops, bi.found, bi.cost, bi.pops
-            );
-        }
-        if uni.found {
-            found_ct += 1;
+        for seed in SEEDS {
+            let params = || SearchParams { start: s, goal: g, macro_filter: None, seed, max_pops: Some(2_000_000), cancel: None, bucket_ms: 0.0 };
+            let uni = view.astar(params(), &mut ctx);
+            let bi = view.astar_bidir(&bp, params(), &mut cf, &mut cb);
+            uni_pops += uni.pops as u64;
+            bi_pops += bi.pops as u64;
+            if uni.found != bi.found
+                || (uni.found && (uni.cost - bi.cost).abs() > 1e-3 * uni.cost.max(1.0))
+            {
+                mismatches += 1;
+                println!(
+                    "MISMATCH {s}->{g} seed={seed:?}: uni found={} cost={} pops={} | bidir found={} cost={} pops={}",
+                    uni.found, uni.cost, uni.pops, bi.found, bi.cost, bi.pops
+                );
+            }
+            if seed.is_none() && uni.found {
+                found_ct += 1;
+            }
         }
     }
     println!(
-        "checked {checked} pairs ({found_ct} found) in {:?}: {mismatches} mismatches; pops uni={uni_pops} bidir={bi_pops} ({:.2}x)",
+        "checked {checked} pairs x {} seeds ({found_ct} found) in {:?}: {mismatches} mismatches; pops uni={uni_pops} bidir={bi_pops} ({:.2}x)",
+        SEEDS.len(),
         t0.elapsed(),
         uni_pops as f64 / bi_pops.max(1) as f64
     );

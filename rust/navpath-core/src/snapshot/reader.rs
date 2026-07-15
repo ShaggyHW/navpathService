@@ -20,6 +20,13 @@ pub enum SnapshotError {
 pub struct Snapshot {
     mmap: Mmap,
     manifest: Manifest,
+    /// `NAVPATH_ALT_HEAP=1`: an anonymous, huge-page-advised copy of the ALT table.
+    /// File-backed mappings never get transparent huge pages automatically, so the
+    /// 256 B random row gathers pay an L2-dTLB miss on most touches; an anon copy gets
+    /// fault-time THP under `enabled=[always]`, shrinking the table to a few hundred
+    /// 2 MiB pages (fully TLB-resident on Zen 4) for +table-size RSS and ~0.1 s of
+    /// one-time copy.
+    alt_heap: Option<Mmap>,
 }
 
 impl Snapshot {
@@ -32,14 +39,55 @@ impl Snapshot {
         let header = &mmap[0..Manifest::SIZE];
         let manifest = Manifest::parse(header)?;
         manifest.validate_layout(mmap.len())?;
-        // The ALT table is randomly accessed in ~100-byte rows; default readahead would
-        // fault in wasted pages around every touch. Optionally pre-populate everything
-        // (NAVPATH_MMAP_POPULATE=1) when RAM comfortably fits the snapshot.
+
+        // Per-section paging policy instead of one blanket Advice::Random:
+        //  - the ALT table (>=84% of the file) is random 256 B row gathers — readahead
+        //    is pure waste, so it keeps Random, plus a huge-page request (harmless
+        //    no-op where unsupported);
+        //  - everything else (coords, walk CSR, macro/fairy/meta, req tags — hot on
+        //    every request) gets WillNeed so post-load/reload traffic takes async
+        //    readahead instead of scattered major faults.
+        // NAVPATH_MMAP_POPULATE=1 still pre-faults the whole file.
+        let lm_off = manifest.off_lm_tab as usize;
+        let lm_len = (manifest.counts.nodes as usize)
+            .saturating_mul(manifest.counts.landmarks as usize)
+            .saturating_mul(4);
         let _ = mmap.advise(memmap2::Advice::Random);
+        if lm_len > 0 && lm_off.checked_add(lm_len).is_some_and(|end| end <= mmap.len()) {
+            if lm_off > 0 {
+                let _ = mmap.advise_range(memmap2::Advice::WillNeed, 0, lm_off);
+            }
+            let tail = lm_off + lm_len;
+            if tail < mmap.len() {
+                let _ = mmap.advise_range(memmap2::Advice::WillNeed, tail, mmap.len() - tail);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = mmap.advise_range(memmap2::Advice::HugePage, lm_off, lm_len);
+            }
+        } else {
+            let _ = mmap.advise(memmap2::Advice::WillNeed);
+        }
         if std::env::var("NAVPATH_MMAP_POPULATE").ok().as_deref() == Some("1") {
             let _ = mmap.advise(memmap2::Advice::WillNeed);
         }
-        Ok(Snapshot { mmap, manifest })
+
+        let alt_heap = if std::env::var("NAVPATH_ALT_HEAP").ok().as_deref() == Some("1")
+            && lm_len > 0
+            && lm_off + lm_len <= mmap.len()
+        {
+            let mut anon = memmap2::MmapMut::map_anon(lm_len)?;
+            #[cfg(target_os = "linux")]
+            {
+                let _ = anon.advise(memmap2::Advice::HugePage);
+            }
+            anon.copy_from_slice(&mmap[lm_off..lm_off + lm_len]);
+            Some(anon.make_read_only()?)
+        } else {
+            None
+        };
+
+        Ok(Snapshot { mmap, manifest, alt_heap })
     }
 
     pub fn manifest(&self) -> &Manifest { &self.manifest }
@@ -118,12 +166,17 @@ impl Snapshot {
     pub fn landmarks(&self) -> &[u32] {
         self.section(self.manifest.off_landmarks, self.manifest.counts.landmarks as usize)
     }
-    /// Interleaved quantized ALT table: `[node][landmark][fw, bw]` u16 quanta.
+    /// Interleaved quantized ALT table: `[node][landmark][fw, bw]` u16 quanta. Served
+    /// from the huge-page anon copy when `NAVPATH_ALT_HEAP=1` (see [`Snapshot`]).
     #[inline]
     pub fn lm_tab(&self) -> &[u16] {
         let n = (self.manifest.counts.nodes as usize)
             .saturating_mul(self.manifest.counts.landmarks as usize)
             .saturating_mul(2);
+        if let Some(heap) = &self.alt_heap {
+            // Anonymous mappings are page-aligned, comfortably satisfying u16.
+            return unsafe { std::slice::from_raw_parts(heap.as_ptr() as *const u16, n) };
+        }
         self.section(self.manifest.off_lm_tab, n)
     }
 

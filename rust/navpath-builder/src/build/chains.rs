@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+use super::graph::NodeIndex;
 
 use anyhow::Result;
 use rusqlite::{params, Connection, Row, OptionalExtension};
@@ -368,7 +370,7 @@ fn enumerate_chain_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64, (i32,
 pub fn flatten_chains(
     conn: &Connection,
     _tiles: &[Tile],
-    node_id_of: &HashMap<(i32, i32, i32), u32>,
+    node_id_of: &NodeIndex,
 ) -> Result<Vec<MacroEdgeMeta>> {
     let mut result: Vec<MacroEdgeMeta> = Vec::new();
 
@@ -376,7 +378,7 @@ pub fn flatten_chains(
 
     for (start_kind, start_id, (sx, sy, sp)) in starts {
         // Map source tile to node id; skip if not present
-        let Some(&src_node) = node_id_of.get(&(sx, sy, sp)) else { continue; };
+        let Some(src_node) = node_id_of.get(sx, sy, sp) else { continue; };
 
         let mut visited: HashSet<(NodeKind, i64)> = HashSet::new();
         let mut steps: Vec<ChainStepMeta> = Vec::new();
@@ -417,7 +419,7 @@ pub fn flatten_chains(
 
         // Require a concrete destination discovered at some point in the chain
         let Some((dx, dy, dp)) = last_dest else { continue; };
-        let Some(&dst_node) = node_id_of.get(&(dx, dy, dp)) else { continue; };
+        let Some(dst_node) = node_id_of.get(dx, dy, dp) else { continue; };
 
         // Dedup and sort req ids deterministically
         requirement_ids.sort_unstable();
@@ -434,7 +436,7 @@ pub fn flatten_chains(
         // Doors are bidirectional: add a reverse edge consisting solely of the first door step
         if start_kind == NodeKind::Door {
             if let Some((ix, iy, ip)) = first_door_dest {
-                if let Some(&inside_node) = node_id_of.get(&(ix, iy, ip)) {
+                if let Some(inside_node) = node_id_of.get(ix, iy, ip) {
                     let rev_reqs: Vec<i64> = first_door_reqs.clone();
                     let door_id = first_door_id.unwrap_or(0);
                     result.push(MacroEdgeMeta {
@@ -512,7 +514,7 @@ fn enumerate_global_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64)>> {
 
 pub fn flatten_global_chains(
     conn: &Connection,
-    node_id_of: &HashMap<(i32, i32, i32), u32>,
+    node_id_of: &NodeIndex,
 ) -> Result<Vec<GlobalChainMeta>> {
     let mut result: Vec<GlobalChainMeta> = Vec::new();
     let starts = enumerate_global_starts(conn)?;
@@ -542,7 +544,7 @@ pub fn flatten_global_chains(
         }
         if cycle { continue; }
         let Some((dx, dy, dp)) = last_dest else { continue; };
-        let Some(&dst_node) = node_id_of.get(&(dx, dy, dp)) else { continue; };
+        let Some(dst_node) = node_id_of.get(dx, dy, dp) else { continue; };
 
         requirement_ids.sort_unstable();
         requirement_ids.dedup();

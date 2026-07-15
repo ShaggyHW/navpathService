@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use navpath_builder::build::chains::flatten_chains;
+use navpath_builder::build::graph::NodeIndex;
 use navpath_builder::build::load_sqlite::{Tile, load_fairy_rings};
 use rusqlite::{Connection, OpenFlags};
 
@@ -86,9 +85,7 @@ fn two_step_door_to_lodestone() {
     .unwrap();
 
     let tiles: Vec<Tile> = vec![]; // not used by flatten_chains
-    let mut node_id_of: HashMap<(i32, i32, i32), u32> = HashMap::new();
-    node_id_of.insert((0, 0, 0), 0);
-    node_id_of.insert((10, 10, 0), 1);
+    let node_id_of = NodeIndex::from_coords(&[((0, 0, 0), 0), ((10, 10, 0), 1)]);
 
     let metas = flatten_chains(&conn, &tiles, &node_id_of).unwrap();
     assert_eq!(metas.len(), 1);
@@ -132,9 +129,7 @@ fn four_step_chain_door_npc_object_lodestone() {
     .unwrap();
 
     let tiles: Vec<Tile> = vec![];
-    let mut node_id_of: HashMap<(i32, i32, i32), u32> = HashMap::new();
-    node_id_of.insert((5, 5, 0), 0);
-    node_id_of.insert((100, 200, 0), 77);
+    let node_id_of = NodeIndex::from_coords(&[((5, 5, 0), 0), ((100, 200, 0), 77)]);
 
     let metas = flatten_chains(&conn, &tiles, &node_id_of).unwrap();
     assert_eq!(metas.len(), 1);
@@ -162,8 +157,7 @@ fn cycle_is_dropped() {
     .unwrap();
 
     let tiles: Vec<Tile> = vec![];
-    let mut node_id_of: HashMap<(i32, i32, i32), u32> = HashMap::new();
-    node_id_of.insert((9, 9, 0), 9);
+    let node_id_of = NodeIndex::from_coords(&[((9, 9, 0), 9)]);
 
     let metas = flatten_chains(&conn, &tiles, &node_id_of).unwrap();
     assert!(metas.is_empty());
@@ -186,9 +180,7 @@ fn load_fairy_rings_basic() {
         [],
     ).unwrap();
 
-    let mut node_id_of: HashMap<(i32, i32, i32), u32> = HashMap::new();
-    node_id_of.insert((3200, 3200, 0), 100);
-    node_id_of.insert((3250, 3250, 0), 101);
+    let node_id_of = NodeIndex::from_coords(&[((3200, 3200, 0), 100), ((3250, 3250, 0), 101)]);
 
     let rings = load_fairy_rings(&conn, &node_id_of).unwrap();
     assert_eq!(rings.len(), 2);
@@ -231,9 +223,8 @@ fn load_fairy_rings_skips_missing_tiles() {
         [],
     ).unwrap();
 
-    let mut node_id_of: HashMap<(i32, i32, i32), u32> = HashMap::new();
-    node_id_of.insert((1000, 1000, 0), 200);
-    // (9999, 9999, 0) not in map
+    let node_id_of = NodeIndex::from_coords(&[((1000, 1000, 0), 200)]);
+    // (9999, 9999, 0) not in the index
 
     let rings = load_fairy_rings(&conn, &node_id_of).unwrap();
     assert_eq!(rings.len(), 1);

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-
 use anyhow::Result;
 use rusqlite::{Connection, Row};
+
+use super::graph::NodeIndex;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tile {
@@ -70,10 +70,18 @@ fn load_tiles_from_regions(conn: &Connection) -> Result<Option<Vec<Tile>>> {
 }
 
 pub fn load_all_tiles(conn: &Connection) -> Result<Vec<Tile>> {
+    use rayon::prelude::*;
     if let Some(mut tiles) = load_tiles_from_regions(conn)? {
-        tiles.sort_unstable_by_key(|t| (t.plane, t.y, t.x));
+        tiles.par_sort_unstable_by_key(|t| (t.plane, t.y, t.x));
         return Ok(tiles);
     }
+    // Loud, not silent: this fallback costs ~10x the region path (and ~200+ MB of DB
+    // at 4M tiles). A DB without tiles_regions is a producer regression — re-run
+    // migrate_tiles_regions.py (see docs/optimization_roadmap_v2.md §1.4).
+    tracing::warn!(
+        "tiles_regions table missing; falling back to the slow row-per-tile scan — \
+         re-run migrate_tiles_regions.py against this DB"
+    );
     // No SQL ORDER BY: the tiles PK is (x,y,plane), so ordering by (plane,y,x) forces a
     // TEMP B-TREE sort over every row (~15x slower scan). Load in table order and sort
     // in Rust below — node-id assignment stays byte-identical.
@@ -97,7 +105,8 @@ pub fn load_all_tiles(conn: &Connection) -> Result<Vec<Tile>> {
     for r in rows {
         out.push(r?);
     }
-    out.sort_unstable_by_key(|t| (t.plane, t.y, t.x));
+    // Deterministic despite parallelism: (plane, y, x) keys are unique per tile.
+    out.par_sort_unstable_by_key(|t| (t.plane, t.y, t.x));
     Ok(out)
 }
 
@@ -119,7 +128,7 @@ fn parse_requirements(reqs: Option<String>) -> Vec<i64> {
 /// Skips rows whose coordinates are not present in the tiles table (fail-soft).
 pub fn load_fairy_rings(
     conn: &Connection,
-    node_id_of: &HashMap<(i32, i32, i32), u32>,
+    node_id_of: &NodeIndex,
 ) -> Result<Vec<FairyRingRow>> {
     let mut stmt = conn.prepare(
         r#"
@@ -148,7 +157,7 @@ pub fn load_fairy_rings(
     for r in rows {
         let (id, object_id, x, y, plane, cost, code, action, next_node_type, next_node_id, requirements_str) = r?;
         // Skip if coordinate not in tiles (fail-soft)
-        let Some(&node_id) = node_id_of.get(&(x, y, plane)) else {
+        let Some(node_id) = node_id_of.get(x, y, plane) else {
             continue;
         };
         // Skip invalid costs

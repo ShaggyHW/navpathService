@@ -5,10 +5,8 @@
 
 # Cargo package metadata
 **/*.rs.bk
-Cargo.lock
-# (Optional: keep Cargo.lock for binaries, ignore for libraries)
-# Uncomment the next line if your project is a library crate:
-# Cargo.lock
+# Cargo.lock is committed: this is a binary workspace, and reproducible builds need
+# the locked dependency graph (see docs/optimization_roadmap_v2.md §9.6).
 
 # Build scripts & temporary files
 *.log

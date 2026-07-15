@@ -17,6 +17,9 @@ serde_json = "1"
 [features]
 default = []
 builder = ["blake3"]
+# Escape hatch for deliberately portable (baseline x86-64) builds; without it, building
+# on x86_64 without -C target-cpu=native/x86-64-v3 is a compile error (see src/lib.rs).
+allow-baseline-cpu = []
 
 [[bench]]
 name = "astar"

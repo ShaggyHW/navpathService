@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -10,7 +9,6 @@ use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 
 use navpath_core::snapshot::{pack_coord, write_snapshot_v8, SnapshotSections};
-use navpath_core::engine::heuristics::quantize_alt_ms;
 
 mod build;
 use build::graph::compile_walk_edges;
@@ -295,12 +293,6 @@ fn main() -> Result<()> {
         anyhow::bail!("no tiles found in DB");
     }
 
-    // Map (x,y,plane) -> node id (u32)
-    let mut node_id_of: HashMap<(i32, i32, i32), u32> = HashMap::with_capacity(tiles.len());
-    for (i, t) in tiles.iter().enumerate() {
-        node_id_of.insert((t.x, t.y, t.plane), i as u32);
-    }
-
     // Node ids are sequential 0..n-1 in tile sort order; the packed keys are therefore
     // ascending, which is what the snapshot's binary-search coordinate lookup relies on.
     let node_count = tiles.len();
@@ -314,7 +306,21 @@ fn main() -> Result<()> {
             pack_coord(t.x, t.y, t.plane)
         })
         .collect();
-    debug_assert!(coords_packed.windows(2).all(|w| w[0] < w[1]));
+    // Hard bail, not debug_assert: duplicate/overlapping tiles (e.g. malformed
+    // tiles_regions rows) would silently corrupt the snapshot's binary-search
+    // coordinate lookup in release builds, resolving requests to wrong nodes.
+    if let Some(w) = coords_packed.windows(2).find(|w| w[0] >= w[1]) {
+        anyhow::bail!(
+            "packed tile coords are not strictly ascending (…{}, {}…): duplicate or \
+             overlapping tiles in the DB (malformed tiles_regions rows?); refusing to \
+             build a snapshot whose coordinate lookup would be corrupt",
+            w[0], w[1]
+        );
+    }
+
+    // Coordinate -> node id resolution: binary search over the packed keys (identical
+    // results to the old HashMap, minus its ~36 MB and per-probe hashing).
+    let node_id_of = build::graph::NodeIndex::new(&coords_packed);
 
     // Compile walk edges with diagonal/cardinal rules
     let walk = compile_walk_edges(&tiles, &node_id_of);
@@ -497,7 +503,7 @@ fn main() -> Result<()> {
     // Landmarks: farthest-point selection over that graph, plus the ALT tables
     // (forward: LM->node, backward: node->LM via reverse graph) in one pass.
     let alt_start = std::time::Instant::now();
-    let (landmarks, lm_fw, lm_bw) = select_and_compute_alt(
+    let (landmarks, lm_tab) = select_and_compute_alt(
         node_count,
         &walk_src, &walk_dst, &walk_w,
         &alt_macro_src, &alt_macro_dst, &alt_macro_w,
@@ -570,39 +576,69 @@ fn main() -> Result<()> {
     // cardinals and it holds empirically for diagonals; assert so future map data can't
     // silently break search correctness.
     {
-        let mut asym = 0usize;
-        for u in 0..node_count {
-            let (s, e) = (walk_offsets[u] as usize, walk_offsets[u + 1] as usize);
-            'edge: for slot in s..e {
-                let v = walk_csr_dst[slot] as usize;
-                let (vs, ve) = (walk_offsets[v] as usize, walk_offsets[v + 1] as usize);
-                for vslot in vs..ve {
-                    if walk_csr_dst[vslot] as usize == u {
-                        continue 'edge;
+        use rayon::prelude::*;
+        // Read-only CSR scan; sum-reduce the asymmetry count across nodes (roadmap 7.5).
+        let asym: usize = (0..node_count)
+            .into_par_iter()
+            .map(|u| {
+                let (s, e) = (walk_offsets[u] as usize, walk_offsets[u + 1] as usize);
+                let mut bad = 0usize;
+                'edge: for slot in s..e {
+                    let v = walk_csr_dst[slot] as usize;
+                    let (vs, ve) = (walk_offsets[v] as usize, walk_offsets[v + 1] as usize);
+                    for vslot in vs..ve {
+                        if walk_csr_dst[vslot] as usize == u {
+                            continue 'edge;
+                        }
                     }
+                    bad += 1;
                 }
-                asym += 1;
-            }
-        }
+                bad
+            })
+            .sum();
         if asym > 0 {
             anyhow::bail!("walk graph is not symmetric: {asym} edges lack a mirror; bidirectional search would be unsound");
         }
     }
 
-    let (comp_ids, walk_components) = walk_component_ids(node_count, &walk_src, &walk_dst);
-    info!(walk_components, "computed walk components");
-
-    // Interleave + quantize the ALT tables: [node][landmark][fw, bw] u16 quanta.
-    let lm_count = landmarks.len();
-    let mut lm_tab = vec![0u16; node_count * lm_count * 2];
-    for nidx in 0..node_count {
-        for li in 0..lm_count {
-            lm_tab[nidx * lm_count * 2 + 2 * li] = quantize_alt_ms(lm_fw[nidx * lm_count + li]);
-            lm_tab[nidx * lm_count * 2 + 2 * li + 1] = quantize_alt_ms(lm_bw[nidx * lm_count + li]);
+    // Canonical pruning (Phase E) resolves direction -> CSR slot via
+    // popcount(mask & ((1<<d)-1)), which requires every CSR row to be emitted in
+    // ascending direction-bit order. The emission loop guarantees it today; pin it so
+    // future edge-rule changes can't silently break query-time slot addressing.
+    {
+        use rayon::prelude::*;
+        use navpath_core::snapshot::unpack_coord;
+        const DIR_DELTAS: [(i32, i32); 8] =
+            [(-1, 0), (0, -1), (1, 0), (0, 1), (-1, 1), (-1, -1), (1, -1), (1, 1)];
+        let bad: usize = (0..node_count)
+            .into_par_iter()
+            .map(|u| {
+                let (ux, uy, up) = unpack_coord(coords_packed[u]);
+                let (s, e) = (walk_offsets[u] as usize, walk_offsets[u + 1] as usize);
+                let mut prev: i32 = -1;
+                for &v in &walk_csr_dst[s..e] {
+                    let (vx, vy, vp) = unpack_coord(coords_packed[v as usize]);
+                    let d = DIR_DELTAS
+                        .iter()
+                        .position(|&(dx, dy)| vp == up && vx - ux == dx && vy - uy == dy);
+                    match d {
+                        Some(d) if (d as i32) > prev => prev = d as i32,
+                        _ => return 1usize,
+                    }
+                }
+                0
+            })
+            .sum();
+        if bad > 0 {
+            anyhow::bail!(
+                "{bad} CSR rows violate ascending direction-bit order (or contain \
+                 non-adjacent edges); canonical slot addressing would be unsound"
+            );
         }
     }
-    drop(lm_fw);
-    drop(lm_bw);
+
+    let (comp_ids, walk_components) = walk_component_ids(node_count, &walk_src, &walk_dst);
+    info!(walk_components, "computed walk components");
 
     let res = write_snapshot_v8(
         &args.out_snapshot,

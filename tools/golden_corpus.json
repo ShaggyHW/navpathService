@@ -1,0 +1,224 @@
+{
+  "snapshot_hash": "cf1be81181cd3a2890fb603703b3c27d33a085155745d475bf5e5f99765a16b1",
+  "entries": [
+    {
+      "name": "readme_route_al_kharid",
+      "start": [
+        3259,
+        3101,
+        0
+      ],
+      "goal": [
+        3425,
+        3017,
+        0
+      ],
+      "profile": "all",
+      "quick_tele": false,
+      "expect": {
+        "found": true,
+        "cost_unseeded": 3724.26416015625,
+        "pops_max": 5000
+      }
+    },
+    {
+      "name": "readme_seeded_pair",
+      "start": [
+        3296,
+        3184,
+        0
+      ],
+      "goal": [
+        3435,
+        3082,
+        0
+      ],
+      "profile": "all",
+      "quick_tele": false,
+      "expect": {
+        "found": true,
+        "cost_unseeded": 18866.009765625,
+        "pops_max": 9000
+      }
+    },
+    {
+      "name": "incident_pair_all",
+      "start": [
+        2887,
+        3535,
+        0
+      ],
+      "goal": [
+        3563,
+        3408,
+        0
+      ],
+      "profile": "all",
+      "quick_tele": false,
+      "expect": {
+        "found": true,
+        "cost_unseeded": 64652.9375,
+        "pops_max": 436000
+      }
+    },
+    {
+      "name": "incident_pair_gated_quicktele",
+      "start": [
+        2887,
+        3535,
+        0
+      ],
+      "goal": [
+        3563,
+        3408,
+        0
+      ],
+      "profile": "none",
+      "quick_tele": true,
+      "expect": {
+        "found": false,
+        "pops_max": 2364000
+      }
+    },
+    {
+      "name": "long_west_to_east",
+      "start": [
+        2994,
+        3280,
+        0
+      ],
+      "goal": [
+        3563,
+        3408,
+        0
+      ],
+      "profile": "all",
+      "quick_tele": false,
+      "expect": {
+        "found": true,
+        "cost_unseeded": 64652.9375,
+        "pops_max": 436000
+      }
+    },
+    {
+      "name": "gated_walk_only",
+      "start": [
+        3259,
+        3101,
+        0
+      ],
+      "goal": [
+        3425,
+        3017,
+        0
+      ],
+      "profile": "none",
+      "quick_tele": false,
+      "expect": {
+        "found": true,
+        "cost_unseeded": 62347.08984375,
+        "pops_max": 49000
+      }
+    },
+    {
+      "name": "quick_tele_route",
+      "start": [
+        3296,
+        3184,
+        0
+      ],
+      "goal": [
+        2994,
+        3280,
+        0
+      ],
+      "profile": "all",
+      "quick_tele": true,
+      "expect": {
+        "found": true,
+        "cost_unseeded": 23412.482421875,
+        "pops_max": 6000
+      }
+    },
+    {
+      "name": "short_lumbridge",
+      "start": [
+        3222,
+        3218,
+        0
+      ],
+      "goal": [
+        3230,
+        3220,
+        0
+      ],
+      "profile": "all",
+      "quick_tele": false,
+      "expect": {
+        "found": true,
+        "cost_unseeded": 2824.26416015625,
+        "pops_max": 5000
+      }
+    },
+    {
+      "name": "virtual_start_all",
+      "start": [
+        30000,
+        20000,
+        0
+      ],
+      "goal": [
+        3425,
+        3017,
+        0
+      ],
+      "profile": "all",
+      "quick_tele": false,
+      "expect": {
+        "found": true,
+        "cost_unseeded": 3724.26416015625,
+        "entry": 958168,
+        "pops_max": 5000
+      }
+    },
+    {
+      "name": "virtual_start_gated_quicktele",
+      "start": [
+        30000,
+        20000,
+        0
+      ],
+      "goal": [
+        3563,
+        3408,
+        0
+      ],
+      "profile": "none",
+      "quick_tele": true,
+      "expect": {
+        "found": false,
+        "pops_max": 5000
+      }
+    },
+    {
+      "name": "cross_plane_up",
+      "start": [
+        3222,
+        3218,
+        0
+      ],
+      "goal": [
+        3205,
+        3209,
+        1
+      ],
+      "profile": "all",
+      "quick_tele": false,
+      "expect": {
+        "found": true,
+        "cost_unseeded": 8048.5283203125,
+        "pops_max": 5000
+      }
+    }
+  ]
+}

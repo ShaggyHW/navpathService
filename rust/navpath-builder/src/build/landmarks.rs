@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use navpath_core::engine::heuristics::quantize_alt_ms;
 use rayon::prelude::*;
 
 /// Minimum component size (in nodes) for a component to receive landmarks. The largest
@@ -170,8 +171,11 @@ pub fn walk_component_ids(nodes: usize, walk_src: &[u32], walk_dst: &[u32]) -> (
 /// [`MIN_LANDMARK_COMPONENT`] receives a landmark before spreading continues — this
 /// replaces the old `0..N` selection whose 64 landmarks all sat in one map corner.
 ///
-/// Returns `(landmark_ids, lm_fw, lm_bw)` with tables in node-major layout
-/// (`table[node * count + landmark]`), matching the snapshot format.
+/// Returns `(landmark_ids, lm_tab)` where `lm_tab` is the snapshot's interleaved
+/// quantized layout `[node][landmark][fw, bw]` (u16 quanta), produced directly by the
+/// transpose. The full-size f32 node-major intermediates — the single largest builder
+/// allocation (2 x nodes x count x 4 B, ~2 GB at 4M/64) — and the old serial
+/// re-quantize pass in main.rs no longer exist (roadmap 7.1).
 pub fn select_and_compute_alt(
     nodes: usize,
     walk_src: &[u32],
@@ -181,9 +185,9 @@ pub fn select_and_compute_alt(
     macro_dst: &[u32],
     macro_w: &[f32],
     count: u32,
-) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+) -> (Vec<u32>, Vec<u16>) {
     if count == 0 || nodes == 0 {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new());
     }
     let edge_lists: [(&[u32], &[u32], &[f32]); 2] = [
         (walk_src, walk_dst, walk_w),
@@ -204,7 +208,7 @@ pub fn select_and_compute_alt(
     let eligible_count = eligible.iter().filter(|&&e| e).count();
     let k = (count as usize).min(eligible_count);
     if k == 0 {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new());
     }
 
     // Deterministic seed: lowest-id node of the largest component. The seed itself is not
@@ -273,30 +277,29 @@ pub fn select_and_compute_alt(
         })
         .collect();
 
-    // Blocked transpose into the node-major layout the snapshot stores. Chunking by node
-    // block keeps each output region cache-resident instead of doing one full-table
-    // strided pass per landmark.
-    let mut lm_fw = vec![f32::INFINITY; nodes * lm_count];
-    let mut lm_bw = vec![f32::INFINITY; nodes * lm_count];
+    // Blocked transpose STRAIGHT into the interleaved quantized snapshot layout.
+    // Chunking by node block keeps each output region cache-resident instead of doing
+    // one full-table strided pass per landmark; quantization happens at store time, so
+    // the values are bit-identical to the old transpose-then-quantize pipeline.
+    let mut lm_tab = vec![0u16; nodes * lm_count * 2];
     const BLOCK: usize = 8192;
-    lm_fw
-        .par_chunks_mut(BLOCK * lm_count)
-        .zip(lm_bw.par_chunks_mut(BLOCK * lm_count))
+    lm_tab
+        .par_chunks_mut(BLOCK * lm_count * 2)
         .enumerate()
-        .for_each(|(chunk_idx, (fw_chunk, bw_chunk))| {
+        .for_each(|(chunk_idx, chunk)| {
             let base = chunk_idx * BLOCK;
-            let block_nodes = fw_chunk.len() / lm_count;
+            let block_nodes = chunk.len() / (lm_count * 2);
             for li in 0..lm_count {
                 let fcol = &fwd_cols[li];
                 let bcol = &bwd_cols[li];
                 for n in 0..block_nodes {
-                    fw_chunk[n * lm_count + li] = fcol[base + n];
-                    bw_chunk[n * lm_count + li] = bcol[base + n];
+                    chunk[(n * lm_count + li) * 2] = quantize_alt_ms(fcol[base + n]);
+                    chunk[(n * lm_count + li) * 2 + 1] = quantize_alt_ms(bcol[base + n]);
                 }
             }
         });
 
-    (landmarks, lm_fw, lm_bw)
+    (landmarks, lm_tab)
 }
 
 /// Compute ALT tables for a fixed landmark set (node-major layout). Kept for callers and
@@ -390,18 +393,24 @@ mod tests {
     #[test]
     fn farthest_point_spreads_landmarks() {
         let (src, dst, w) = line_edges();
+        // Weights scaled so quantized (64 ms) values stay discriminative.
+        let w: Vec<f32> = w.iter().map(|x| x * 6400.0).collect();
         // Only the 4-node line is above the (clamped) threshold; ask for 2 landmarks.
-        let (lms, fw, bw) = select_and_compute_alt(6, &src, &dst, &w, &[], &[], &[], 2);
+        let (lms, tab) = select_and_compute_alt(6, &src, &dst, &w, &[], &[], &[], 2);
         assert_eq!(lms.len(), 2);
         // Farthest-point on a line must pick the two endpoints (0 and 3), in some order.
         let mut sorted = lms.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 3]);
-        assert_eq!(fw.len(), 6 * 2);
-        assert_eq!(bw.len(), 6 * 2);
-        // Bound check: max over landmarks of |d(L,g)-d(L,u)| equals true distance on a line.
+        // Interleaved [node][landmark][fw, bw], u16 quanta of 64 ms: one hop = 100 quanta.
+        assert_eq!(tab.len(), 6 * 2 * 2);
         let li = |lm: u32| lms.iter().position(|&x| x == lm).unwrap();
-        let d = (fw[3 * 2 + li(0)] - fw[1 * 2 + li(0)]).abs();
-        assert_eq!(d, 2.0); // dist(1,3)
+        assert_eq!(tab[(0 * 2 + li(0)) * 2], 0); // d(0,0) fw
+        assert_eq!(tab[(3 * 2 + li(0)) * 2], 300); // d(0,3) = 3 hops = 19200 ms
+        assert_eq!(tab[(1 * 2 + li(0)) * 2], 100); // d(0,1)
+        // symmetric graph: bw == fw
+        assert_eq!(tab[(3 * 2 + li(0)) * 2 + 1], 300);
+        // island unreachable
+        assert_eq!(tab[(4 * 2 + li(0)) * 2], navpath_core::snapshot::ALT_UNREACHABLE);
     }
 }

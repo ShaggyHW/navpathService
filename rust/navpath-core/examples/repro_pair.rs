@@ -67,7 +67,7 @@ fn main() {
     let mut ctx = SearchContext::new(nodes);
     let mut cf = SearchContext::new(nodes);
     let mut cb = SearchContext::new(nodes);
-    let p = |budget: Option<u32>| SearchParams { start: s, goal: g, macro_filter: None, seed: None, max_pops: budget, cancel: None };
+    let p = |budget: Option<u32>| SearchParams { start: s, goal: g, macro_filter: None, seed: None, max_pops: budget, cancel: None, bucket_ms: 0.0 };
 
     let t = std::time::Instant::now();
     let uni = view.astar(p(None), &mut ctx);

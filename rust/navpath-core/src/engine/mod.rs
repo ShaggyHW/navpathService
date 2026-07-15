@@ -1,3 +1,4 @@
+pub mod canonical;
 pub mod heuristics;
 pub mod neighbors;
 pub mod search;
