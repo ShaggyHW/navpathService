@@ -547,6 +547,7 @@ fn kind_code(kind: &str) -> u32 {
         "object" => 4,
         "item" => 5,
         "ifslot" => 6,
+        "poa_item" => 7,
         _ => 0,
     }
 }

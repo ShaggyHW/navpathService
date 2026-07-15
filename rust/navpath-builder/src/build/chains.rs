@@ -60,6 +60,7 @@ pub enum NodeKind {
     Object,
     Item,
     Ifslot,
+    Poa,
 }
 
 impl NodeKind {
@@ -71,6 +72,7 @@ impl NodeKind {
             NodeKind::Object => "object",
             NodeKind::Item => "item",
             NodeKind::Ifslot => "ifslot",
+            NodeKind::Poa => "poa_item",
         }
     }
     fn parse(s: &str) -> Option<NodeKind> {
@@ -81,6 +83,7 @@ impl NodeKind {
             "object" => Some(NodeKind::Object),
             "item" => Some(NodeKind::Item),
             "ifslot" => Some(NodeKind::Ifslot),
+            "poa_item" => Some(NodeKind::Poa),
             _ => None,
         }
     }
@@ -245,6 +248,31 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                     },
                     next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
                     next_id: nid,
+                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
+                    requirements: parse_requirements(req),
+                    lodestone: None,
+                })
+            }).optional()?;
+            Ok(row)
+        }
+        NodeKind::Poa => {
+            // POA nodes are standalone global teleports (like items): no next_node chaining.
+            let mut st = conn.prepare_cached(
+                "SELECT dest_min_x, dest_min_y, dest_plane, cost, requirements FROM teleports_POA_nodes WHERE id = ?1",
+            )?;
+            let row = st.query_row(params![id], |r: &Row| {
+                let dx: Option<i64> = r.get(0)?;
+                let dy: Option<i64> = r.get(1)?;
+                let dp: Option<i64> = r.get(2)?;
+                let cost: f64 = r.get(3)?;
+                let req: Option<String> = r.get(4)?;
+                Ok(StepRow {
+                    dest: match (dx, dy, dp) {
+                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
+                        _ => None,
+                    },
+                    next_kind: None,
+                    next_id: None,
                     cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
                     requirements: parse_requirements(req),
                     lodestone: None,
@@ -507,6 +535,18 @@ fn enumerate_global_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64)>> {
         for r in rows {
             let id = r?;
             if !incoming.contains(&(NodeKind::Ifslot, id)) { out.push((NodeKind::Ifslot, id)); }
+        }
+    }
+    // POA items (standalone global teleports)
+    {
+        let mut st = conn.prepare_cached("SELECT id FROM teleports_POA_nodes ORDER BY id")?;
+        let rows = st.query_map([], |r: &Row| {
+            let id: i64 = r.get(0)?;
+            Ok(id)
+        })?;
+        for r in rows {
+            let id = r?;
+            if !incoming.contains(&(NodeKind::Poa, id)) { out.push((NodeKind::Poa, id)); }
         }
     }
     Ok(out)
