@@ -153,7 +153,9 @@ const MIN_SURGE_TILES: usize = 5;
 const MIN_DIVE_TILES: usize = 2;
 /// Maximum tiles surge/dive can cover
 const MAX_ABILITY_TILES: usize = 10;
-/// Minimum tiles to walk in surge direction before using surge (to establish facing)
+/// Minimum tiles to walk in surge direction before using surge (to establish facing).
+/// Waived when a dive along the same heading immediately precedes the surge — the dive
+/// already leaves the character facing that way.
 const MIN_WALK_BEFORE_SURGE: usize = 3;
 
 /// Represents direction for surge (must be straight line)
@@ -438,6 +440,7 @@ fn optimize_with_surge_dive(
             };
 
             let mut dive_used = false;
+            let mut dive_dir: Option<Direction> = None;
             let mut surge_used = false;
 
             // Try dive FIRST - it has no facing requirement, can be used anytime when off cooldown
@@ -468,6 +471,7 @@ fn optimize_with_surge_dive(
                     dive_available_at = elapsed_ms + dive_config.cooldown_ms;
                     seq_idx = end_idx + 1;
                     dive_used = true;
+                    dive_dir = Direction::from_delta(end_x - current_pos.0, end_y - current_pos.1);
 
                     // Update current_pos after dive
                     current_pos = (end_x, end_y, end_p);
@@ -501,36 +505,43 @@ fn optimize_with_surge_dive(
                         }
                     }
 
-                    // Check prior moves for facing direction
-                    let mut prior_moves_in_direction = 0;
+                    // Establish facing: a dive along the same heading already turns the
+                    // character, otherwise fall back to counting prior moves.
+                    let mut facing_established = false;
                     if let Some(surge_dir) = best_surge_dir {
-                        for idx in (0..result.len()).rev() {
-                            let Action::Move(prev_move) = &result[idx] else {
-                                break;
-                            };
-                            let prev_to = prev_move.dest();
-                            if idx == 0 {
-                                break;
-                            }
-                            let prev_from = result[idx - 1].to_coords();
+                        if dive_used && dive_dir == Some(surge_dir) {
+                            facing_established = true;
+                        } else {
+                            let mut prior_moves_in_direction = 0;
+                            for idx in (0..result.len()).rev() {
+                                let Action::Move(prev_move) = &result[idx] else {
+                                    break;
+                                };
+                                let prev_to = prev_move.dest();
+                                if idx == 0 {
+                                    break;
+                                }
+                                let prev_from = result[idx - 1].to_coords();
 
-                            let dx = prev_to.0 - prev_from.0;
-                            let dy = prev_to.1 - prev_from.1;
-                            let move_dir = Direction::from_delta(dx, dy);
+                                let dx = prev_to.0 - prev_from.0;
+                                let dy = prev_to.1 - prev_from.1;
+                                let move_dir = Direction::from_delta(dx, dy);
 
-                            if move_dir == Some(surge_dir) {
-                                prior_moves_in_direction += 1;
-                            } else {
-                                break;
-                            }
+                                if move_dir == Some(surge_dir) {
+                                    prior_moves_in_direction += 1;
+                                } else {
+                                    break;
+                                }
 
-                            if prior_moves_in_direction >= MIN_WALK_BEFORE_SURGE {
-                                break;
+                                if prior_moves_in_direction >= MIN_WALK_BEFORE_SURGE {
+                                    break;
+                                }
                             }
+                            facing_established = prior_moves_in_direction >= MIN_WALK_BEFORE_SURGE;
                         }
                     }
 
-                    if best_surge_count >= MIN_SURGE_TILES && prior_moves_in_direction >= MIN_WALK_BEFORE_SURGE {
+                    if best_surge_count >= MIN_SURGE_TILES && facing_established {
                         let end_idx = seq_idx + best_surge_count - 1;
                         let (end_x, end_y, end_p) = move_sequence[end_idx].dest();
 
@@ -1397,6 +1408,63 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
         Err(e) => {
             warn!(error=?e, path=?path, "reload failed; keeping old snapshot");
             Err((StatusCode::CONFLICT, e.to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod surge_dive_tests {
+    use super::*;
+
+    fn mv(x: i32, y: i32) -> Action {
+        Action::Move(MoveAction { kind: "move", to: [x, y, 0], cost_ms: 600.0 })
+    }
+
+    fn cfgs() -> (SurgeConfig, DiveConfig) {
+        (
+            SurgeConfig { enabled: true, charges: 2, cooldown_ms: 20400.0 },
+            DiveConfig { enabled: true, available_in_ms: 0.0, cooldown_ms: 20400.0 },
+        )
+    }
+
+    fn abilities(actions: &[Action]) -> Vec<(&'static str, [i32; 3], [i32; 3])> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Ability(ab) => Some((ab.kind, ab.from, ab.to)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Dive east then surge east: the dive establishes facing, so the 3-walk rule is waived.
+    #[test]
+    fn same_direction_dive_waives_walk_requirement() {
+        let path: Vec<Action> = (1..=20).map(|x| mv(x, 0)).collect();
+        let (s, d) = cfgs();
+        let out = optimize_with_surge_dive(path, &s, &d);
+        let abs = abilities(&out);
+        println!("same-direction: {:?}", abs);
+        assert_eq!(abs.len(), 2, "expected a dive followed immediately by a surge");
+        assert_eq!(abs[0].0, "dive");
+        assert_eq!(abs[1].0, "surge");
+        // Surge must start exactly where the dive landed (no walking in between).
+        assert_eq!(abs[1].1, abs[0].2);
+    }
+
+    /// Dive north then a north-east surge: the dive leaves the wrong facing, so the
+    /// walk requirement still applies and the surge cannot fire off the dive.
+    #[test]
+    fn turning_dive_still_requires_walk() {
+        let mut path: Vec<Action> = (1..=11).map(|y| mv(0, y)).collect();
+        path.extend((1..=15).map(|x| mv(x, 11)));
+        let (s, d) = cfgs();
+        let out = optimize_with_surge_dive(path, &s, &d);
+        let abs = abilities(&out);
+        println!("turning: {:?}", abs);
+        assert_eq!(abs[0].0, "dive");
+        if let Some(surge) = abs.iter().find(|a| a.0 == "surge") {
+            assert_ne!(surge.1, abs[0].2, "surge must not fire straight off a turning dive");
         }
     }
 }

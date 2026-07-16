@@ -19,10 +19,32 @@ use navpath_service::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Parse the `--dump-result <path>` / `--dump-result=<path>` flag. When present it sets
+/// `NAVPATH_DUMP_RESULT` so the existing (env-driven, cached) dump path in `routes.rs` picks
+/// it up. The flag takes precedence over an already-set env var; absent it, the env var still
+/// works. Must run before the first `/route` request, which is where the path is read & cached.
+fn apply_dump_result_flag() {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let path = if arg == "--dump-result" {
+            args.next()
+        } else if let Some(rest) = arg.strip_prefix("--dump-result=") {
+            Some(rest.to_string())
+        } else {
+            None
+        };
+        if let Some(path) = path {
+            std::env::set_var("NAVPATH_DUMP_RESULT", path);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder().with_ansi(false).finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
+
+    apply_dump_result_flag();
 
     let host = env_var("NAVPATH_HOST", "127.0.0.1");
     let port: u16 = env_var("NAVPATH_PORT", "8080").parse().unwrap_or(8080);
@@ -54,6 +76,11 @@ async fn main() -> Result<()> {
 
     let app = build_router(state.clone());
     let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
+    if let Ok(dump) = std::env::var("NAVPATH_DUMP_RESULT") {
+        if !dump.trim().is_empty() {
+            info!(path = %dump, "result dumping enabled; each /route response overwrites this file");
+        }
+    }
     info!(%addr, path=?snapshot_path, "starting navpath-service");
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service()).await?;
