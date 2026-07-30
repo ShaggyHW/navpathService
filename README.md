@@ -18,6 +18,8 @@ Screenshot of map area:
 ```sh
 cargo run -p navpath-builder --release --   --sqlite ./worldReachableTiles.db   --out-snapshot ./graph.snapshot   --out-tiles ./tiles.bin  --landmarks 64
 
+cargo run -p navpath-builder --release --   --sqlite /home/query/Dev/rs3cache_extractor/worldReachableTiles.db   --out-snapshot ./graph.snapshot   --out-tiles ./tiles.bin  --landmarks 64
+
 UPDATE THE PATH TO YOUR ONW
 
 export SNAPSHOT_PATH=/home/query/Dev/navpathService/graph.snapshot 
