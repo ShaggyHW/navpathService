@@ -39,7 +39,23 @@ fn bidir_min_hb_ratio() -> f32 {
 const BIDIR_POLICY_MIN_H_MS: f32 = 20_000.0;
 
 /// Opt-in plateau tie-break bucket (roadmap 3.4), `NAVPATH_TIEBREAK_BUCKET_MS`
-/// (default 0 = off; 128 = 2x the ALT quantum is the recommended operating point).
+/// (default 0 = off).
+///
+/// MEASURED HARMFUL on the deployed 64-landmark snapshot (2026-07-31, golden corpus,
+/// median of 3, server-side `pops`, seeded requests — the only class it applies to by
+/// default). The roadmap's "recommended operating point" of 128 makes seeded searches
+/// 2-20x WORSE, on BOTH engines:
+///   bidir:  readme_seeded_pair 130k -> 952k pops, quick_tele_route 41k -> 231k,
+///           virtual_start_all 100k -> 305k, incident_pair_all 34k -> 68k
+///   uni:    identical regressions (so this is not the MM stop rule reading
+///           `Key::f_lower`'s bucket lower edge — that only compounds it)
+/// The only routes that improve are ones already under 100 pops (cross_plane_up 86 -> 57,
+/// short_lumbridge 30 -> 15), i.e. microseconds in absolute terms. Diving a 128 ms bucket
+/// by high g commits the frontier to whichever corridor happens to be deepest, and on
+/// full-width ALT bounds (roadmap 3.1, the current default) that guess is worse than the
+/// exact ordering it replaces — the roadmap's own note that 3.1 "already took most of the
+/// plateau" is the reason. Leave at 0; re-measure per snapshot before ever raising it.
+///
 /// Bounded-suboptimal by construction: served cost <= optimum + bucket. By default it
 /// applies to SEEDED searches only — their contract already tolerates jitter-scale
 /// cost wiggle of the same order, and seeds are what disable the exact-tie plateau

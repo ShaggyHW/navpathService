@@ -53,6 +53,54 @@ pub fn new_route_cache() -> Option<Arc<RouteCache>> {
     NonZeroUsize::new(n).map(|cap| Arc::new(Mutex::new(lru::LruCache::new(cap))))
 }
 
+/// Seed-blind shadow index over the route-cache key space: the same [`RouteCacheKey`]
+/// with `seed` cleared, holding no value. Its only job is to ATTRIBUTE misses. When an
+/// exact-key lookup misses but the seed-blind key is present, the request's seed — not
+/// its endpoints or its profile — is what caused the miss, and the log line / `/stats`
+/// say so instead of reporting a bare `cache_hit=false`.
+///
+/// This is the measurement roadmap 5.2 makes a prerequisite for the
+/// `NAVPATH_CACHE_IGNORE_SEED` policy decision: `cache_miss_seed` is exactly the number
+/// of requests that policy would convert into hits. Only seeded requests touch it (for
+/// an unseeded request the exact key IS the seed-blind key, so a miss is cold by
+/// definition), and entries are one key each.
+pub type SeedShadow = Mutex<lru::LruCache<RouteCacheKey, ()>>;
+
+/// Shadow index sized like the route cache (same `NAVPATH_ROUTE_CACHE` budget) so the
+/// attribution it reports matches what the real cache could have held.
+pub fn new_seed_shadow() -> Option<Arc<SeedShadow>> {
+    let n = std::env::var("NAVPATH_ROUTE_CACHE").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2048);
+    NonZeroUsize::new(n).map(|cap| Arc::new(Mutex::new(lru::LruCache::new(cap))))
+}
+
+/// Why a request was not served from the route cache. Logged per request as
+/// `cache=<str>`, so a zero hit rate points at its own cause.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CacheOutcome {
+    /// Served from the route cache; no search ran.
+    Hit,
+    /// The exact key missed, but the same endpoints + profile are cached under a
+    /// different seed. `NAVPATH_CACHE_IGNORE_SEED=1` would have made this a hit.
+    MissSeed,
+    /// This (endpoints, profile) combination has not been seen (or was evicted).
+    MissCold,
+    /// `NAVPATH_ROUTE_CACHE=0` — caching is switched off.
+    Disabled,
+}
+
+impl CacheOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheOutcome::Hit => "hit",
+            CacheOutcome::MissSeed => "miss_seed",
+            CacheOutcome::MissCold => "miss_cold",
+            CacheOutcome::Disabled => "off",
+        }
+    }
+}
+
 /// Key for the per-profile artifact cache (roadmap 5.4): the eligibility mask's EXACT
 /// packed bits (via [`pack_mask_bits`] — lossless, same rationale as the route-cache
 /// key) plus the quick-tele flag. Snapshot identity is implicit: the cache lives in
@@ -86,6 +134,9 @@ pub struct SnapshotState {
     pub snapshot_hash_hex: Option<String>,
     /// Per-snapshot route result cache (None = disabled). Dropped on snapshot swap.
     pub route_cache: Option<Arc<RouteCache>>,
+    /// Seed-blind miss attribution for [`route_cache`](Self::route_cache); see
+    /// [`SeedShadow`]. None whenever the route cache is disabled.
+    pub seed_shadow: Option<Arc<SeedShadow>>,
     // Fairy Ring data
     pub fairy_rings: Arc<Vec<FairyRing>>,
     pub node_to_fairy_ring: Arc<HashMap<u32, usize>>,
@@ -173,6 +224,13 @@ pub struct Metrics {
     pub requests: AtomicU64,
     pub cache_hits: AtomicU64,
     pub cache_puts: AtomicU64,
+    /// Misses caused by the request's seed alone: the same endpoints + profile were
+    /// cached under a different seed. This is exactly how many requests
+    /// `NAVPATH_CACHE_IGNORE_SEED=1` would convert into hits (roadmap 5.2).
+    pub cache_miss_seed: AtomicU64,
+    /// Misses on an (endpoints, profile) combination not currently cached — the
+    /// irreducible kind. A client that never repeats a start/goal pair sees only these.
+    pub cache_miss_cold: AtomicU64,
     pub searches: AtomicU64,
     pub retries: AtomicU64,
     pub retry_found: AtomicU64,
@@ -226,6 +284,8 @@ impl Metrics {
             "requests": c(&self.requests),
             "cache_hits": c(&self.cache_hits),
             "cache_puts": c(&self.cache_puts),
+            "cache_miss_seed": c(&self.cache_miss_seed),
+            "cache_miss_cold": c(&self.cache_miss_cold),
             "searches": c(&self.searches),
             "retries": c(&self.retries),
             "retry_found": c(&self.retry_found),

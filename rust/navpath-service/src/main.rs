@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
 
     // Provide not-ready state if snapshot failed to load
     let hash_hex = read_tail_hash_hex(&snapshot_path);
-    let init = SnapshotState { path: snapshot_path.clone(), snapshot, neighbors, neighbors_rev, globals, macro_lookup, loaded_at_unix: now_unix(), snapshot_hash_hex: hash_hex, route_cache: navpath_service::new_route_cache(), fairy_rings, node_to_fairy_ring, comp_graph, canonical_grid, profile_cache: navpath_service::new_profile_cache() };
+    let init = SnapshotState { path: snapshot_path.clone(), snapshot, neighbors, neighbors_rev, globals, macro_lookup, loaded_at_unix: now_unix(), snapshot_hash_hex: hash_hex, route_cache: navpath_service::new_route_cache(), seed_shadow: navpath_service::new_seed_shadow(), fairy_rings, node_to_fairy_ring, comp_graph, canonical_grid, profile_cache: navpath_service::new_profile_cache() };
     let state = AppState {
         current: Arc::new(ArcSwap::from_pointee(init)),
         search_permits: navpath_service::default_search_permits(),

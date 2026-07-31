@@ -55,6 +55,7 @@ async fn main() {
             loaded_at_unix: 0,
             snapshot_hash_hex: None,
             route_cache: navpath_service::new_route_cache(),
+            seed_shadow: navpath_service::new_seed_shadow(),
             fairy_rings: Arc::new(fr),
             node_to_fairy_ring: Arc::new(nfr),
             comp_graph: Some(Arc::new(cg)),

@@ -290,7 +290,7 @@ Engine bundles, each proven pop-sequence-identical on the golden corpus (costs A
 
 **Closeout perf outcome (full run vs Phase-D baselines, blessed):** the vectorized heuristic lifted nearly every group — shorts −29…40% (recovering most of Phase C's accepted short-route cost), mediums −37…42%, teleport −48…53%, virtual −35%, gated long −27%, flood −11%. Two gate entries recalibrated from measured identical-code wander: `astar_incident/` 45% (observed 4.8-6.9 ms spread) and `heuristic/select_active` 50% (a ~250 ns bench; full-width selection now also builds the SIMD operand lanes once per query — the accepted cost of the 5x per-node win).
 
-**Remaining open items, all deliberately gated:** 3.3 avoid-refinement, 7.2 mmap writer, 7.3 incremental ALT cache, 7.6 selection decoupling (all: first real 4M dataset); 4.3 NBS (gate: pops_f/pops_b production data showing a weak-backward tail that the demotion policy misses); 5.2 cache-ignore-seed default flip (gate: /stats hit-rate data + client sign-off); Phase E canonical-A*/JPS ladder (multi-session, design in §4.6); §8 CRP overlay decision (gate: 4M measurements).
+**Remaining open items, all deliberately gated:** 3.3 avoid-refinement, 7.2 mmap writer, 7.3 incremental ALT cache, 7.6 selection decoupling (all: first real 4M dataset); 4.3 NBS (gate: pops_f/pops_b production data showing a weak-backward tail that the demotion policy misses); 5.2 cache-ignore-seed default flip (gate: client sign-off only — the hit-rate data landed 2026-07-31, see the log entry); Phase E canonical-A*/JPS ladder (multi-session, design in §4.6); §8 CRP overlay decision (gate: 4M measurements).
 
 ### Phase E — Stages 1 + 2a DONE; 2b/3 designed and gated (2026-07-15)
 
@@ -302,6 +302,71 @@ Engine bundles, each proven pop-sequence-identical on the golden corpus (costs A
 - **Stage 3 (JPS jumping) — all substrate now exists** (masks, slot addressing, forced-stop inputs, differential + shadow harnesses); it inherits Stage 2b's proof obligation wherever it prunes ties, so land 2b first or jump with strict-only stopping sets. **Stage 5 remains do-not-build** per the Phase-4 analysis.
 
 **Phase E perf outcome (bench corpus now measures the production default — grid built in setup):** shorts −11…16% across engines, teleport −13%, everything else within tolerance. Two forensic notes worth keeping: (1) one full run showed a 5.9 s median on a gated bench — per-sample data revealed 2.7-39 s iterations, i.e. a transient system-load window, not the algorithm (isolated re-run: 175 ms, faster than the pre-canonical arm in-process); always check `cand/sample.json` before believing an outlier. (2) The gated flood benches drifted +20-40% in both engine ARMS after the grid allocation entered the process — the third layout-mediated drift for this class since Phase B; its gate tolerance is now 30% and the note stands that in-process A/B (`diff_canonical --gated`: canonical 1.30x FASTER over 40 pairs) is the real signal for this class. Baselines blessed.
+
+### Payload-correctness pass + cache miss attribution (2026-07-31)
+
+Triggered by a production report of a permanently zero cache hit rate (`cache_hit=false` on
+every request). The cache turned out to be working exactly as designed; two unrelated
+client-facing payload bugs were found on the way in.
+
+- **BUG (client-breaking): the leading surge/dive fired from the wrong tile and swallowed
+  the opening walk step.** Actions carry only `to`, so a move's origin is the previous
+  action's destination — and for the FIRST action there is no previous action.
+  `optimize_with_surge_dive` fell back to `move_sequence[0].dest()`, i.e. the tile *after*
+  the character. Consequences on every route that opens with walk steps (the common case;
+  virtual starts were immune because their synthetic teleport action already occupied index
+  0): the ability's `from` was reported one tile ahead, `tiles_covered` overstated the span
+  by one, the opening move vanished from the payload, and the range test ran from the wrong
+  origin — the README route emitted a dive of Euclidean span **10.77 tiles, which the client
+  cannot execute**. Fixed by threading `route_origin` (`path[0]`) into the optimizer; it also
+  lets the facing check count the very first move, which it previously always skipped.
+- **BUG (client-breaking): surge had no range check at all.** Its only test was that the
+  replaced run was near-straight (`tiles <= straight_dist + 2.0`); a run of 10 DIAGONAL
+  steps passes that while displacing 10·√2 = **14.14 tiles**. Dive was already refusing the
+  identical endpoints via `is_valid_dive_path`, so the two abilities disagreed about what was
+  reachable. Measured on the golden corpus: out-of-range surges (10.77–14.14 tiles) on **12 of
+  18 payloads**. Both abilities now share `is_valid_ability_hop`. Abilities are still emitted
+  generously afterwards (26 dives + 35 surges, 504 walk tiles skipped over 9 routes) — only
+  the unexecutable hops shrank or dropped. *Open question for the client owner: if RS3 measures
+  ability reach in Chebyshev tiles rather than Euclidean, BOTH checks are too strict for
+  diagonal runs and should be relaxed together — the code now has one place to do that.*
+- **New permanent gate: `tools/verify_actions.py`.** Walks the action list and the geometry in
+  lockstep (ability origins, ability reach, tiles consumed, terminal tile). Nothing checked
+  the payload translation before; it caught both bugs above. 13 of 18 corpus payloads failed
+  it pre-fix, 0 after. `payload_baseline.json` re-captured (48/48; the 24 diffs were the two
+  intended fixes plus pre-existing node-id drift against the current snapshot).
+- **5.1 rider — cache miss ATTRIBUTION shipped, closing 5.2's measurement gate.** `cache_hit=false`
+  was unactionable: it never said whether the seed, the endpoints, or a disabled cache caused
+  the miss. Added a seed-blind shadow index over the route-cache key space (`SeedShadow`,
+  same `NAVPATH_ROUTE_CACHE` budget, ~160 KB, touched only by seeded misses), a `cache=`
+  field on the log line (`hit` | `miss_seed` | `miss_cold` | `off`), `cache_miss_seed` /
+  `cache_miss_cold` counters, and live cache state + policy in `/stats`. **`cache_miss_seed` is
+  now exactly the number of requests `NAVPATH_CACHE_IGNORE_SEED=1` would convert into hits** —
+  the data 5.2 was blocked on. Verified end-to-end: on a repeating pair with random seeds the
+  policy took 11 of 12 requests to hits, ~118 ms → ~0.3–0.9 ms; attribution reported
+  `miss_seed=10, miss_cold=2` on the same traffic with the policy off.
+- **Measured, no code change warranted (three tuning knobs re-checked on the deployed
+  64-landmark snapshot; golden corpus, median of 3, server-side `pops`):**
+  - `NAVPATH_TIEBREAK_BUCKET_MS=128` — the 3.4 "recommended operating point" is **harmful
+    here**: seeded searches 2–20× MORE pops (readme_seeded_pair 130k → 952k, quick_tele 41k →
+    231k, virtual_start 100k → 305k), on BOTH engines, so it is not the MM stop rule reading
+    `f_lower`'s bucket edge. Only sub-100-pop routes improve. Consistent with 3.1 (full-width
+    ALT) having already taken the plateau. Comment in `engine_adapter.rs` corrected; default
+    stays 0.
+  - `NAVPATH_BIDIR_MIN_HB_RATIO=0` (always bidir) — genuinely mixed: readme_seeded_pair 2.6×
+    FEWER seeded pops, incident_pair −24%, but quick_tele_route 1.8–2.3× WORSE and
+    virtual_start +6%. The 0.5 default is the better compromise; keep it.
+  - `NAVPATH_ALT_HEAP=1` (hugepage anon copy of the ALT table) — no measurable win at 1.1M
+    nodes under `THP=[always]`, for +282 MB RSS. Re-test at 4M, not before.
+  - Seeded vs unseeded cost, corrected: **~1.0–2.8× more pops**, not the order of magnitude an
+    earlier cache-contaminated measurement suggested. The real price of a seed is the cache,
+    not the search.
+- **Not a bug, left alone:** `MoveAction.cost_ms` rounds the 424.264 ms diagonal to `424`, so
+  summing action costs undershoots `cost` by ~0.26 ms per diagonal step (−9 ms on a 51 s
+  route). Deliberate integer-ms shape for the client; changing it is a payload change with no
+  correctness benefit.
+
+---
 
 ## Appendix A — refuted / parked / do-not-build (recorded so they aren't re-proposed)
 

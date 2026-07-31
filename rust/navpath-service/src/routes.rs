@@ -377,24 +377,40 @@ fn straight_line_distance(x1: i32, y1: i32, x2: i32, y2: i32) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Check if a dive path is valid (straight-line distance within range)
-/// Dive teleports directly to target, so we only care about straight-line distance
-fn is_valid_dive_path(start: (i32, i32, i32), end: (i32, i32, i32), _tiles_walked: usize) -> bool {
+/// Range predicate shared by dive and surge: both abilities move the character directly
+/// to the target tile, so only the straight-line hop matters, not the walked path.
+///
+/// Surge used to have NO range check. Its only test was that the replaced run was roughly
+/// straight (`tiles <= straight_dist + 2.0`), which a run of 10 DIAGONAL steps passes
+/// while displacing 10*sqrt(2) = 14.14 tiles — beyond the abilities' reach, and beyond
+/// what this very predicate was already refusing for dive over the same endpoints. The two
+/// abilities disagreed about what was reachable, and the client was handed surge hops it
+/// could not perform (measured on the golden corpus: spans of 10.77 to 14.14 tiles on 12
+/// of 18 payloads).
+fn is_valid_ability_hop(start: (i32, i32, i32), end: (i32, i32, i32)) -> bool {
     if start.2 != end.2 {
         return false; // Different planes
     }
     let straight_dist = straight_line_distance(start.0, start.1, end.0, end.1);
-    // Dive can reach up to 10 tiles in a straight line regardless of walked path
     straight_dist <= (MAX_ABILITY_TILES as f64) + 0.5
 }
 
 /// Optimize actions by inserting surge and dive abilities. Consumes the action list:
 /// non-move actions are moved (never cloned) into the output, and walked tiles are
 /// `Copy` structs — no per-action JSON re-parsing or cloning (roadmap 5.3).
+///
+/// `route_origin` is the tile the character actually stands on before the first action
+/// (`path[0]`). It is REQUIRED for correctness whenever the route opens with walk steps:
+/// actions only carry their destination (`to`), so the first move's origin exists nowhere
+/// in the list. Without it the optimizer fell back to the first move's *destination*,
+/// which reported ability origins one tile ahead of the character, sized each ability
+/// against the wrong origin tile (a dive could legally span 11 tiles), and silently
+/// dropped the opening walk step from the payload.
 fn optimize_with_surge_dive(
     actions: Vec<Action>,
     surge_config: &SurgeConfig,
     dive_config: &DiveConfig,
+    route_origin: Option<(i32, i32, i32)>,
 ) -> Vec<Action> {
     // If neither ability is enabled, return as-is
     if !surge_config.enabled && !dive_config.enabled {
@@ -418,8 +434,9 @@ fn optimize_with_surge_dive(
             continue;
         };
 
-        // Get the starting position from the previous action (its destination tile).
-        let start_pos = result.last().map(Action::to_coords);
+        // Where the character stands before this move run: the previous action's
+        // destination, or — at the head of the route — the caller-supplied origin tile.
+        let start_pos = result.last().map(Action::to_coords).or(route_origin);
 
         // Collect consecutive move actions
         let mut move_sequence: Vec<MoveAction> = vec![first_move];
@@ -433,7 +450,8 @@ fn optimize_with_surge_dive(
         while seq_idx < move_sequence.len() {
             // Determine current position
             let mut current_pos = if seq_idx == 0 {
-                // fallback: use first move destination (not ideal but handles edge case)
+                // Last-resort fallback (origin unknown AND no preceding action): keeps the
+                // old behaviour rather than panicking. Callers always pass `route_origin`.
                 start_pos.unwrap_or_else(|| move_sequence[0].dest())
             } else {
                 move_sequence[seq_idx - 1].dest()
@@ -450,7 +468,7 @@ fn optimize_with_surge_dive(
 
                 for dive_count in (MIN_DIVE_TILES..=MAX_ABILITY_TILES.min(remaining_tiles)).rev() {
                     let end_pos = move_sequence[seq_idx + dive_count - 1].dest();
-                    if is_valid_dive_path(current_pos, end_pos, dive_count) {
+                    if is_valid_ability_hop(current_pos, end_pos) {
                         best_dive_count = dive_count;
                         break;
                     }
@@ -488,12 +506,16 @@ fn optimize_with_surge_dive(
                     for tiles in (MIN_SURGE_TILES..=MAX_ABILITY_TILES.min(remaining_tiles)).rev() {
                         let (end_x, end_y, end_p) = move_sequence[seq_idx + tiles - 1].dest();
 
-                        if end_p != current_pos.2 {
+                        // Same plane AND within the ability's reach — the check surge was
+                        // missing (see `is_valid_ability_hop`).
+                        if !is_valid_ability_hop(current_pos, (end_x, end_y, end_p)) {
                             continue;
                         }
 
                         let straight_dist = straight_line_distance(current_pos.0, current_pos.1, end_x, end_y);
 
+                        // ...and the replaced run must be near-straight, or surging it
+                        // would cut a corner the walk deliberately took.
                         if (tiles as f64) <= straight_dist + 2.0 {
                             let dx = end_x - current_pos.0;
                             let dy = end_y - current_pos.1;
@@ -518,10 +540,15 @@ fn optimize_with_surge_dive(
                                     break;
                                 };
                                 let prev_to = prev_move.dest();
-                                if idx == 0 {
-                                    break;
-                                }
-                                let prev_from = result[idx - 1].to_coords();
+                                // The action list stores destinations only, so a move's
+                                // origin is the previous action's destination — and for
+                                // the very first action, the route origin.
+                                let prev_from = if idx == 0 {
+                                    let Some(o) = route_origin else { break };
+                                    o
+                                } else {
+                                    result[idx - 1].to_coords()
+                                };
 
                                 let dx = prev_to.0 - prev_from.0;
                                 let dy = prev_to.1 - prev_from.1;
@@ -956,8 +983,13 @@ fn build_route_payload(
         acts.insert(0, Action::VirtualStart(Box::new(virtual_action)));
     }
 
+    // The tile the character stands on before the first action. For a virtual start the
+    // synthetic teleport action already occupies index 0 and carries it, but on the normal
+    // path nothing in `acts` records it — see `optimize_with_surge_dive`.
+    let route_origin = res.path.first().map(|&id| coord(id));
+
     // Apply surge/dive optimization to the actions
-    (Some(optimize_with_surge_dive(acts, surge, dive)), geometry)
+    (Some(optimize_with_surge_dive(acts, surge, dive, route_origin)), geometry)
 }
 
 /// Everything the blocking task computes for one request; carried back to the handler
@@ -974,9 +1006,35 @@ struct RouteTaskOut {
     payload_ms: u64,
 }
 
-/// Process-lifetime service counters (see [`crate::Metrics`]).
+/// Process-lifetime service counters (see [`crate::Metrics`]) plus the live route-cache
+/// state and the policy in force — so a zero hit rate can be diagnosed from one call:
+/// `cache_miss_seed` is how many requests `NAVPATH_CACHE_IGNORE_SEED=1` would convert
+/// into hits, `cache_miss_cold` is how many no cache policy can help.
 pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(state.metrics.snapshot_json())
+    let cur = state.current.load();
+    let mut out = state.metrics.snapshot_json();
+    let entries = cur
+        .route_cache
+        .as_ref()
+        .and_then(|c| c.lock().ok().map(|c| c.len()))
+        .unwrap_or(0);
+    let capacity = cur
+        .route_cache
+        .as_ref()
+        .and_then(|c| c.lock().ok().map(|c| c.cap().get()))
+        .unwrap_or(0);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "route_cache".to_string(),
+            serde_json::json!({
+                "enabled": cur.route_cache.is_some(),
+                "entries": entries,
+                "capacity": capacity,
+                "ignore_seed": cache_ignore_seed(),
+            }),
+        );
+    }
+    Json(out)
 }
 
 /// Opt-in cache policy (`NAVPATH_CACHE_IGNORE_SEED=1`, default off): drop the seed
@@ -1076,6 +1134,35 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         .route_cache
         .as_ref()
         .and_then(|c| c.lock().ok().and_then(|mut c| c.get(&cache_key).cloned()));
+
+    // Attribute the miss (see crate::SeedShadow). A seeded request whose seed-blind key
+    // is already known missed *because of the seed*; anything else is a genuinely new
+    // (endpoints, profile) pair. The key is rebuilt only where it is used (a seeded miss,
+    // or a cache put) so hits and unseeded traffic never pay for the clone.
+    let seed_blind_key = || crate::RouteCacheKey { seed: None, ..cache_key.clone() };
+    let cache_outcome = if cur.route_cache.is_none() {
+        crate::CacheOutcome::Disabled
+    } else if cached.is_some() {
+        crate::CacheOutcome::Hit
+    } else if cache_key.seed.is_some()
+        && cur
+            .seed_shadow
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|mut s| s.get(&seed_blind_key()).is_some()))
+            .unwrap_or(false)
+    {
+        crate::CacheOutcome::MissSeed
+    } else {
+        crate::CacheOutcome::MissCold
+    };
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        match cache_outcome {
+            crate::CacheOutcome::MissSeed => { metrics.cache_miss_seed.fetch_add(1, Relaxed); }
+            crate::CacheOutcome::MissCold => { metrics.cache_miss_cold.fetch_add(1, Relaxed); }
+            _ => {}
+        }
+    }
 
     // Exact reachability precheck (roadmap 4.1): eligibility never gates walk edges,
     // so "can this goal be reached at all under this profile" is decided on the
@@ -1283,9 +1370,18 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     if cached.is_none() {
         if matches!(res.status, navpath_core::SearchStatus::Found | navpath_core::SearchStatus::NotFound) {
             if let Some(c) = cur.route_cache.as_ref() {
+                // Built before the key is moved into the cache. Keeping the attribution
+                // index in step with what the cache actually holds is what stops
+                // `miss_seed` from claiming a hit the policy could not have delivered.
+                let shadow = seed_blind_key();
                 if let Ok(mut c) = c.lock() {
                     c.put(cache_key, Arc::new((res.clone(), virtual_entry, seed_dropped)));
                     metrics.cache_puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(s) = cur.seed_shadow.as_ref() {
+                    if let Ok(mut s) = s.lock() {
+                        s.put(shadow, ());
+                    }
                 }
             }
         }
@@ -1359,6 +1455,8 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         retry_unseeded_pops = attempts_pops[2],
         seed_dropped = seed_dropped,
         cache_hit = cached.is_some(),
+        // Why the cache did/didn't serve this: hit | miss_seed | miss_cold | off.
+        cache = cache_outcome.as_str(),
         "route request completed"
     );
     Ok(Json(resp))
@@ -1390,6 +1488,7 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
                 loaded_at_unix: crate::now_unix(),
                 snapshot_hash_hex: new_hash.clone(),
                 route_cache: crate::new_route_cache(),
+                seed_shadow: crate::new_seed_shadow(),
                 fairy_rings: Arc::new(fairy_rings),
                 node_to_fairy_ring: Arc::new(node_to_fairy_ring),
                 comp_graph: Some(Arc::new(comp_graph)),
@@ -1437,12 +1536,27 @@ mod surge_dive_tests {
             .collect()
     }
 
+    /// Every tile the input walked must still be reachable from the output: abilities
+    /// replace a run of moves, so walking each ability's `from -> to` plus every emitted
+    /// move must land on exactly the final input tile, having covered every input tile.
+    fn covered_tiles(out: &[Action], origin: (i32, i32, i32)) -> Vec<[i32; 3]> {
+        let mut seen = vec![[origin.0, origin.1, origin.2]];
+        for a in out {
+            if let Action::Ability(ab) = a {
+                assert_eq!(ab.from, *seen.last().unwrap(), "ability starts where the character is");
+            }
+            let (x, y, p) = a.to_coords();
+            seen.push([x, y, p]);
+        }
+        seen
+    }
+
     /// Dive east then surge east: the dive establishes facing, so the 3-walk rule is waived.
     #[test]
     fn same_direction_dive_waives_walk_requirement() {
         let path: Vec<Action> = (1..=20).map(|x| mv(x, 0)).collect();
         let (s, d) = cfgs();
-        let out = optimize_with_surge_dive(path, &s, &d);
+        let out = optimize_with_surge_dive(path, &s, &d, Some((0, 0, 0)));
         let abs = abilities(&out);
         println!("same-direction: {:?}", abs);
         assert_eq!(abs.len(), 2, "expected a dive followed immediately by a surge");
@@ -1459,12 +1573,89 @@ mod surge_dive_tests {
         let mut path: Vec<Action> = (1..=11).map(|y| mv(0, y)).collect();
         path.extend((1..=15).map(|x| mv(x, 11)));
         let (s, d) = cfgs();
-        let out = optimize_with_surge_dive(path, &s, &d);
+        let out = optimize_with_surge_dive(path, &s, &d, Some((0, 0, 0)));
         let abs = abilities(&out);
         println!("turning: {:?}", abs);
         assert_eq!(abs[0].0, "dive");
         if let Some(surge) = abs.iter().find(|a| a.0 == "surge") {
             assert_ne!(surge.1, abs[0].2, "surge must not fire straight off a turning dive");
         }
+    }
+
+    /// Regression: the leading ability must fire from the character's ACTUAL tile and
+    /// must not swallow the opening walk step. Before the origin was threaded through,
+    /// the dive reported `from = (1,0)` (the first move's destination), covered only 9
+    /// tiles while claiming 10, and the step (0,0)->(1,0) vanished from the payload.
+    #[test]
+    fn leading_ability_starts_at_the_route_origin() {
+        let path: Vec<Action> = (1..=20).map(|x| mv(x, 0)).collect();
+        let (s, d) = cfgs();
+        let out = optimize_with_surge_dive(path, &s, &d, Some((0, 0, 0)));
+        let abs = abilities(&out);
+        assert_eq!(abs[0].1, [0, 0, 0], "dive must start on the character's tile");
+        // 10 tiles covered from (0,0) lands on (10,0) — the reported span and the
+        // advertised tile count now agree.
+        assert_eq!(abs[0].2, [10, 0, 0]);
+        let Action::Ability(ab) = &out[0] else { panic!("first action is the dive") };
+        assert_eq!(ab.tiles_covered, 10);
+        // No tile is lost: the walk ends where the last input move ended.
+        let seen = covered_tiles(&out, (0, 0, 0));
+        assert_eq!(*seen.last().unwrap(), [20, 0, 0]);
+    }
+
+    /// Every emitted ability must be within reach. Sizing the leading one from the wrong
+    /// origin let an 11-tile hop through, and surge had no range check at all.
+    fn assert_all_abilities_in_range(out: &[Action]) {
+        for a in out {
+            if let Action::Ability(ab) = a {
+                let dist = straight_line_distance(ab.from[0], ab.from[1], ab.to[0], ab.to[1]);
+                assert!(
+                    dist <= MAX_ABILITY_TILES as f64 + 0.5,
+                    "{} spans {dist} tiles from {:?} to {:?}",
+                    ab.kind, ab.from, ab.to
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leading_dive_respects_the_ten_tile_range() {
+        let path: Vec<Action> = (1..=20).map(|x| mv(x, 0)).collect();
+        let (s, d) = cfgs();
+        assert_all_abilities_in_range(&optimize_with_surge_dive(path, &s, &d, Some((0, 0, 0))));
+    }
+
+    /// Regression: a run of DIAGONAL steps. Ten diagonal moves displace 10*sqrt(2) =
+    /// 14.14 tiles, which surge used to accept (it only tested straightness) while dive
+    /// refused the identical endpoints.
+    #[test]
+    fn diagonal_run_never_emits_an_out_of_range_surge() {
+        let path: Vec<Action> = (1..=20).map(|i| mv(i, i)).collect();
+        let (s, d) = cfgs();
+        let out = optimize_with_surge_dive(path, &s, &d, Some((0, 0, 0)));
+        assert_all_abilities_in_range(&out);
+        // The route must still be walked in full, ability or not.
+        let seen = covered_tiles(&out, (0, 0, 0));
+        assert_eq!(*seen.last().unwrap(), [20, 20, 0]);
+    }
+
+    /// A virtual start already carries the origin in its synthetic action, so the
+    /// fallback path must not double-count or shift it.
+    #[test]
+    fn virtual_start_action_supplies_the_origin() {
+        let mut path: Vec<Action> = vec![Action::VirtualStart(Box::new(VirtualStartAction {
+            kind: "lodestone".to_string(),
+            from: MinMax::point(-1, -1, 0),
+            to: MinMax::point(0, 0, 0),
+            cost_ms: serde_json::Number::from(0),
+            metadata: serde_json::json!({}),
+        }))];
+        path.extend((1..=20).map(|x| mv(x, 0)));
+        let (s, d) = cfgs();
+        let out = optimize_with_surge_dive(path, &s, &d, Some((0, 0, 0)));
+        let abs = abilities(&out);
+        assert_eq!(abs[0].1, [0, 0, 0], "dive starts where the teleport landed");
+        let seen = covered_tiles(&out, (-1, -1, 0));
+        assert_eq!(*seen.last().unwrap(), [20, 0, 0]);
     }
 }
