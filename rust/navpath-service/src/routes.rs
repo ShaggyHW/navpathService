@@ -236,7 +236,7 @@ pub struct AbilityAction {
     pub tiles_covered: usize,
 }
 
-/// A macro edge step (door/lodestone/npc/object/item/ifslot/teleport).
+/// A macro edge step (door/lodestone/npc/object/item/ifslot/use_on/teleport).
 #[derive(Debug, Serialize)]
 pub struct MacroAction {
     #[serde(rename = "type")]
@@ -852,6 +852,8 @@ fn build_route_payload(
                 4 => "object",
                 5 => "item",
                 6 => "ifslot",
+                7 => "poa_item",
+                8 => "use_on",
                 _ => "teleport",
             };
             if quick_tele && kstr == "lodestone" {

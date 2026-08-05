@@ -61,6 +61,7 @@ pub enum NodeKind {
     Item,
     Ifslot,
     Poa,
+    UseOn,
 }
 
 impl NodeKind {
@@ -73,10 +74,13 @@ impl NodeKind {
             NodeKind::Item => "item",
             NodeKind::Ifslot => "ifslot",
             NodeKind::Poa => "poa_item",
+            NodeKind::UseOn => "use_on",
         }
     }
     fn parse(s: &str) -> Option<NodeKind> {
-        match s {
+        // Case/spelling tolerant: the useOn table is named `teleports_useOn_nodes`, so
+        // producers may write "useOn" or "use_on" in a next_node_type column.
+        match s.trim().to_ascii_lowercase().as_str() {
             "door" => Some(NodeKind::Door),
             "lodestone" => Some(NodeKind::Lodestone),
             "npc" => Some(NodeKind::Npc),
@@ -84,9 +88,21 @@ impl NodeKind {
             "item" => Some(NodeKind::Item),
             "ifslot" => Some(NodeKind::Ifslot),
             "poa_item" => Some(NodeKind::Poa),
+            "use_on" | "useon" => Some(NodeKind::UseOn),
             _ => None,
         }
     }
+}
+
+/// True if `name` exists as a table in this DB. The useOn table postdates older
+/// snapshots' DBs, so its queries are skipped rather than failing the whole build.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND lower(name) = lower(?1)",
+        params![name],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +296,34 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
             }).optional()?;
             Ok(row)
         }
+        NodeKind::UseOn => {
+            // "Use item X on object Y" at a fixed spot: positional source (orig_*) like
+            // objects/npcs, so it flattens into a macro edge, and it can chain onwards.
+            let mut st = conn.prepare_cached(
+                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_useOn_nodes WHERE id = ?1",
+            )?;
+            let row = st.query_row(params![id], |r: &Row| {
+                let dx: Option<i64> = r.get(0)?;
+                let dy: Option<i64> = r.get(1)?;
+                let dp: Option<i64> = r.get(2)?;
+                let ntype: Option<String> = r.get(3)?;
+                let nid: Option<i64> = r.get(4)?;
+                let cost: f64 = r.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
+                let req: Option<String> = r.get(6)?;
+                Ok(StepRow {
+                    dest: match (dx, dy, dp) {
+                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
+                        _ => None,
+                    },
+                    next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
+                    next_id: nid,
+                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
+                    requirements: parse_requirements(req),
+                    lodestone: None,
+                })
+            }).optional()?;
+            Ok(row)
+        }
         NodeKind::Ifslot => {
             let mut st = conn.prepare_cached(
                 "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_ifslot_nodes WHERE id = ?1",
@@ -333,6 +377,9 @@ fn collect_incoming_pairs(conn: &Connection) -> Result<HashSet<(NodeKind, i64)>>
     add_from("SELECT next_node_type, next_node_id FROM teleports_object_nodes WHERE next_node_type IS NOT NULL AND next_node_id IS NOT NULL")?;
     add_from("SELECT next_node_type, next_node_id FROM teleports_item_nodes WHERE next_node_type IS NOT NULL AND next_node_id IS NOT NULL")?;
     add_from("SELECT next_node_type, next_node_id FROM teleports_ifslot_nodes WHERE next_node_type IS NOT NULL AND next_node_id IS NOT NULL")?;
+    if table_exists(conn, "teleports_useOn_nodes")? {
+        add_from("SELECT next_node_type, next_node_id FROM teleports_useOn_nodes WHERE next_node_type IS NOT NULL AND next_node_id IS NOT NULL")?;
+    }
     Ok(set)
 }
 
@@ -390,6 +437,23 @@ fn enumerate_chain_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64, (i32,
             Ok((id, (x as i32, y as i32, p as i32)))
         })?;
         for r in rows { let (id, pos) = r?; if !incoming.contains(&(NodeKind::Object, id)) { out.push((NodeKind::Object, id, pos)); } }
+    }
+
+    // useOn ("use item on object"): src is orig_min_*
+    if table_exists(conn, "teleports_useOn_nodes")? {
+        let mut st = conn.prepare_cached(
+            "SELECT id, orig_min_x, orig_min_y, orig_plane FROM teleports_useOn_nodes \
+             WHERE orig_min_x IS NOT NULL AND orig_min_y IS NOT NULL AND orig_plane IS NOT NULL \
+             ORDER BY orig_plane, orig_min_y, orig_min_x",
+        )?;
+        let rows = st.query_map([], |r: &Row| {
+            let id: i64 = r.get(0)?;
+            let x: i64 = r.get(1)?;
+            let y: i64 = r.get(2)?;
+            let p: i64 = r.get(3)?;
+            Ok((id, (x as i32, y as i32, p as i32)))
+        })?;
+        for r in rows { let (id, pos) = r?; if !incoming.contains(&(NodeKind::UseOn, id)) { out.push((NodeKind::UseOn, id, pos)); } }
     }
 
     Ok(out)

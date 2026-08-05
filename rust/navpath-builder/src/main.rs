@@ -253,6 +253,42 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
             }
             None
         }
+        "use_on" => {
+            if let Ok(mut st) = conn.prepare_cached(
+                "SELECT item_id, object_id,
+                        dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
+                        orig_min_x, orig_max_x, orig_min_y, orig_max_y, orig_plane,
+                        cost, next_node_type, next_node_id, requirements
+                 FROM teleports_useOn_nodes WHERE id = ?1"
+            ) {
+                let row: std::result::Result<serde_json::Value, _> = st.query_row([id], |r: &rusqlite::Row| {
+                    let iid: Option<i64> = r.get(0)?; let oid: Option<i64> = r.get(1)?;
+                    let dminx: Option<i64> = r.get(2)?; let dmaxx: Option<i64> = r.get(3)?; let dminy: Option<i64> = r.get(4)?; let dmaxy: Option<i64> = r.get(5)?; let dp: Option<i64> = r.get(6)?;
+                    let ominx: Option<i64> = r.get(7)?; let omaxx: Option<i64> = r.get(8)?; let ominy: Option<i64> = r.get(9)?; let omaxy: Option<i64> = r.get(10)?; let op: Option<i64> = r.get(11)?;
+                    let cost: Option<f64> = r.get(12)?; let next_t: Option<String> = r.get(13)?; let next_id: Option<i64> = r.get(14)?; let req: Option<String> = r.get(15)?;
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("item_id".to_string(), iid.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("object_id".to_string(), oid.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("dest_min_x".to_string(), dminx.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("dest_max_x".to_string(), dmaxx.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("dest_min_y".to_string(), dminy.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("dest_max_y".to_string(), dmaxy.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("dest_plane".to_string(), dp.map(|v| serde_json::Value::from(v as i32)).unwrap_or(serde_json::Value::Null));
+                    obj.insert("orig_min_x".to_string(), ominx.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("orig_max_x".to_string(), omaxx.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("orig_min_y".to_string(), ominy.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("orig_max_y".to_string(), omaxy.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("orig_plane".to_string(), op.map(|v| serde_json::Value::from(v as i32)).unwrap_or(serde_json::Value::Null));
+                    obj.insert("cost".to_string(), cost.map(|c| serde_json::Value::from(c as f32)).unwrap_or(serde_json::Value::Null));
+                    obj.insert("next_node_type".to_string(), next_t.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+                    obj.insert("next_node_id".to_string(), next_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("requirements".to_string(), req.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+                    Ok(serde_json::Value::Object(obj))
+                });
+                return row.ok();
+            }
+            None
+        }
         "ifslot" => {
             if let Ok(mut st) = conn.prepare_cached(
                 "SELECT interface_id, component_id, slot_id, click_id,
@@ -382,6 +418,7 @@ fn main() -> Result<()> {
                 "item" => 5u32,
                 "ifslot" => 6u32,
                 "poa_item" => 7u32,
+                "use_on" => 8u32,
                 _ => 0u32,
             };
             let idu = if first.id >= 0 { (first.id as u64).min(u32::MAX as u64) as u32 } else { 0u32 };
@@ -422,7 +459,7 @@ fn main() -> Result<()> {
 
         // Start building meta object
         let mut meta_obj = serde_json::Map::new();
-        meta_obj.insert("kind".to_string(), serde_json::Value::String(match k { 1=>"door",2=>"lodestone",3=>"npc",4=>"object",5=>"item",6=>"ifslot",7=>"poa_item", _=>"unknown" }.to_string()));
+        meta_obj.insert("kind".to_string(), serde_json::Value::String(match k { 1=>"door",2=>"lodestone",3=>"npc",4=>"object",5=>"item",6=>"ifslot",7=>"poa_item",8=>"use_on", _=>"unknown" }.to_string()));
         meta_obj.insert("first_id".to_string(), serde_json::Value::from(id));
         meta_obj.insert("steps".to_string(), serde_json::Value::from(steps_json));
         meta_obj.insert("requirements".to_string(), serde_json::Value::from(m.requirement_ids.clone()));

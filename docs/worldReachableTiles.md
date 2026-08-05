@@ -74,6 +74,11 @@ These tables are copied to support additional movements beyond adjacency. All ha
   - Key cols: `match_type`, `object_id`, `object_name`, `action`, destination bounds, origin bounds, `search_radius`, `cost`, `next_node_type`, `next_node_id`, `requirement_id`.
   - Index: `idx_tobj_req(requirement_id)`.
 
+- **`teleports_useOn_nodes`**
+  - "Use item X on object Y" at a fixed spot: `item_id`, `object_id`, destination bounds, origin bounds (`orig_min/max_(x,y)`, `orig_plane`), `cost`, `next_node_type`, `next_node_id`, `requirements`.
+  - Index: `idx_tuseon_req(requirements)`.
+  - Positional like `teleports_object_nodes`, so the builder flattens it into a macro edge `orig_min_* -> dest_min_*` (kind code `8`, action type `use_on`); not part of the `teleports_all` view.
+
 - **`teleports_requirements`**
   - Cols: `metaInfo`, `key`, `value`, `comparison` (free-form requirement metadata).
   - Index: `idx_teleport_req_all(id)`.

@@ -39,7 +39,7 @@
 - **Teleport/action edges** from `teleports_*_nodes` (via `teleports_all`):
 
   - These represent **non-walk connections** between tiles or UI actions that cannot be traversed by walking.
-  - `kind` determines the subtype (`door`, `lodestone`, `object`, `npc`, `item`, `ifslot`, etc.).
+  - `kind` determines the subtype (`door`, `lodestone`, `object`, `npc`, `item`, `ifslot`, `use_on`, etc.).
   - **Cost** comes from the row’s `cost` and is accumulated across chains (see below).
 
 #### 2.2.1 Chaining (`next_node_id`, `next_node_type`)

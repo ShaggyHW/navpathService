@@ -69,6 +69,8 @@ fn parse_globals_full(snap: &Snapshot) -> Vec<(u32, f32, u32)> {
                                 "object" => 4,
                                 "item" => 5,
                                 "ifslot" => 6,
+                                "poa_item" => 7,
+                                "use_on" => 8,
                                 _ => 0,
                             };
                             if dst != 0 {

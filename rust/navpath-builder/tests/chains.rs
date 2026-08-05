@@ -50,6 +50,14 @@ fn create_schema(conn: &Connection) {
             next_node_type TEXT, next_node_id INTEGER,
             cost REAL, requirements TEXT
         );
+        CREATE TABLE teleports_useOn_nodes (
+            id INTEGER PRIMARY KEY,
+            item_id INTEGER, object_id INTEGER,
+            orig_min_x INTEGER, orig_min_y INTEGER, orig_plane INTEGER,
+            dest_min_x INTEGER, dest_min_y INTEGER, dest_plane INTEGER,
+            next_node_type TEXT, next_node_id INTEGER,
+            cost INTEGER, requirements TEXT
+        );
         CREATE TABLE teleports_fairy_rings_nodes (
             id INTEGER PRIMARY KEY,
             object_id INTEGER,
@@ -161,6 +169,96 @@ fn cycle_is_dropped() {
 
     let metas = flatten_chains(&conn, &tiles, &node_id_of).unwrap();
     assert!(metas.is_empty());
+}
+
+#[test]
+fn use_on_node_becomes_macro_edge() {
+    let conn = mem_conn();
+    create_schema(&conn);
+
+    // "Use rope (954) on object 1996": orig tile -> dest tile, no chaining.
+    conn.execute(
+        "INSERT INTO teleports_useOn_nodes (id, item_id, object_id, orig_min_x, orig_min_y, orig_plane, dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements)
+         VALUES (1, 954, 1996, 3, 3, 0, 44, 44, 0, NULL, NULL, 10000, '179')",
+        [],
+    )
+    .unwrap();
+
+    let tiles: Vec<Tile> = vec![];
+    let node_id_of = NodeIndex::from_coords(&[((3, 3, 0), 4), ((44, 44, 0), 5)]);
+
+    let metas = flatten_chains(&conn, &tiles, &node_id_of).unwrap();
+    assert_eq!(metas.len(), 1);
+    let m = &metas[0];
+    assert_eq!(m.src, 4);
+    assert_eq!(m.dst, 5);
+    assert!((m.cost - 10000.0).abs() < 1e-5);
+    assert_eq!(m.requirement_ids, vec![179]);
+    assert_eq!(m.steps.len(), 1);
+    assert_eq!(m.steps[0].kind, "use_on");
+    assert_eq!(m.steps[0].id, 1);
+}
+
+#[test]
+fn use_on_chains_and_is_chained_into() {
+    let conn = mem_conn();
+    create_schema(&conn);
+
+    // object(20) -> useOn(1) -> lodestone(2): the useOn node has an incoming edge, so it
+    // must not also be emitted as a chain start of its own.
+    conn.execute(
+        "INSERT INTO teleports_object_nodes (id, orig_min_x, orig_min_y, orig_plane, dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements)
+         VALUES (20, 7, 7, 0, NULL, NULL, NULL, 'useOn', 1, 1.0, '103')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO teleports_useOn_nodes (id, item_id, object_id, orig_min_x, orig_min_y, orig_plane, dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements)
+         VALUES (1, 954, 1996, 7, 7, 0, NULL, NULL, NULL, 'lodestone', 2, 2.0, '179')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO teleports_lodestone_nodes (id, dest_x, dest_y, dest_plane, next_node_type, next_node_id, cost, requirements)
+         VALUES (2, 60, 60, 0, NULL, NULL, 3.0, '104')",
+        [],
+    )
+    .unwrap();
+
+    let tiles: Vec<Tile> = vec![];
+    let node_id_of = NodeIndex::from_coords(&[((7, 7, 0), 0), ((60, 60, 0), 9)]);
+
+    let metas = flatten_chains(&conn, &tiles, &node_id_of).unwrap();
+    assert_eq!(metas.len(), 1);
+    let m = &metas[0];
+    assert_eq!(m.src, 0);
+    assert_eq!(m.dst, 9);
+    assert!((m.cost - 6.0).abs() < 1e-5);
+    let kinds: Vec<&str> = m.steps.iter().map(|s| s.kind).collect();
+    assert_eq!(kinds, vec!["object", "use_on", "lodestone"]);
+    assert_eq!(m.requirement_ids, vec![103, 104, 179]);
+}
+
+#[test]
+fn missing_use_on_table_is_tolerated() {
+    let conn = mem_conn();
+    create_schema(&conn);
+    // A pre-useOn DB must still build.
+    conn.execute_batch("DROP TABLE teleports_useOn_nodes").unwrap();
+
+    conn.execute(
+        "INSERT INTO teleports_door_nodes (id, tile_outside_x, tile_outside_y, tile_outside_plane, tile_inside_x, tile_inside_y, tile_inside_plane, next_node_type, next_node_id, cost, requirements)
+         VALUES (1, 0, 0, 0, 1, 1, 0, NULL, NULL, 1.0, '100')",
+        [],
+    )
+    .unwrap();
+
+    let tiles: Vec<Tile> = vec![];
+    let node_id_of = NodeIndex::from_coords(&[((0, 0, 0), 0), ((1, 1, 0), 1)]);
+
+    let metas = flatten_chains(&conn, &tiles, &node_id_of).unwrap();
+    // Forward outside->inside plus the door's reverse edge.
+    assert_eq!(metas.len(), 2);
 }
 
 #[test]
