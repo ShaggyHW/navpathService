@@ -713,6 +713,122 @@ pub async fn tile_exists(
     }
 }
 
+/// Maximum start->goal range for `/reachable` (Chebyshev tiles, i.e. the in-game
+/// "within N tiles" square).
+const REACHABLE_RANGE_TILES: i32 = 20;
+
+#[derive(Debug, Deserialize)]
+pub struct ReachableQuery {
+    pub sx: i32,
+    pub sy: i32,
+    pub splane: i32,
+    pub gx: i32,
+    pub gy: i32,
+    pub gplane: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReachableResponse {
+    pub reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+/// Walk-only proximity check: true iff the goal is within
+/// [`REACHABLE_RANGE_TILES`] of the start AND a pure walk path connects them —
+/// no macro edges (doors, stairs, teleports) allowed — without leaving the
+/// endpoints' 20-tile neighbourhood.
+///
+/// Two-stage answer, both stages exact for their claim:
+/// 1. Walk-component ids (built over walk edges ONLY — see the builder's
+///    `walk_component_ids`) decide "connected by walks at all" in O(1). A goal
+///    behind a closed door/fence is a different component and rejects here.
+/// 2. A BFS over the walk CSR, restricted to tiles within range of either
+///    endpoint (union keeps the answer symmetric), confirms the path is local.
+///    Same component but only connected around a long detour (river bank,
+///    cliff) rejects here. The region is at most ~61x61 tiles, so the whole
+///    check is microseconds — no blocking task or search permit needed.
+pub async fn reachable(
+    State(state): State<AppState>,
+    Query(q): Query<ReachableQuery>,
+) -> Result<Json<ReachableResponse>, (StatusCode, String)> {
+    let cur = state.current.load();
+    let Some(snap) = cur.snapshot.as_ref() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "snapshot not loaded".into()));
+    };
+
+    let deny = |reason: &'static str| {
+        Ok(Json(ReachableResponse { reachable: false, reason: Some(reason) }))
+    };
+
+    // Walk edges never change plane; a cross-plane pair can't be walk-reachable.
+    if q.splane != q.gplane {
+        return deny("different_plane");
+    }
+    let cheb = (q.sx - q.gx).abs().max((q.sy - q.gy).abs());
+    if cheb > REACHABLE_RANGE_TILES {
+        return deny("out_of_range");
+    }
+
+    let Some(sid) = snap.find_node(q.sx, q.sy, q.splane) else {
+        return deny("start_tile_not_found");
+    };
+    let Some(gid) = snap.find_node(q.gx, q.gy, q.gplane) else {
+        return deny("goal_tile_not_found");
+    };
+    if sid == gid {
+        return Ok(Json(ReachableResponse { reachable: true, reason: None }));
+    }
+
+    // Stage 1: no walk path exists AT ALL (the goal is only reachable through a
+    // door/teleport, if at all) — reject without touching the grid.
+    let comps = snap.comp_ids();
+    if comps[sid as usize] != comps[gid as usize] {
+        return deny("not_connected");
+    }
+
+    // Stage 2: BFS over walk edges, confined to tiles within range of either
+    // endpoint. `visited` is a dense bitmap over the region's bounding box
+    // (endpoints are <= range apart, so at most (3*range+1)^2 slots).
+    let r = REACHABLE_RANGE_TILES;
+    let (x0, y0) = (q.sx.min(q.gx) - r, q.sy.min(q.gy) - r);
+    let width = (q.sx.max(q.gx) + r - x0 + 1) as usize;
+    let height = (q.sy.max(q.gy) + r - y0 + 1) as usize;
+    let idx = |x: i32, y: i32| (y - y0) as usize * width + (x - x0) as usize;
+    let in_region = |x: i32, y: i32| {
+        (x - q.sx).abs().max((y - q.sy).abs()) <= r
+            || (x - q.gx).abs().max((y - q.gy).abs()) <= r
+    };
+
+    let offs = snap.walk_offsets();
+    let dst = snap.walk_dst();
+    let mut visited = vec![false; width * height];
+    let mut queue = std::collections::VecDeque::with_capacity(64);
+    visited[idx(q.sx, q.sy)] = true;
+    queue.push_back(sid);
+    while let Some(u) = queue.pop_front() {
+        let (s, e) = (offs[u as usize] as usize, offs[u as usize + 1] as usize);
+        for &v in &dst[s..e] {
+            if v == gid {
+                return Ok(Json(ReachableResponse { reachable: true, reason: None }));
+            }
+            let (vx, vy, vp) = snap.node_coord(v);
+            if vp != q.splane || !in_region(vx, vy) {
+                continue;
+            }
+            let i = idx(vx, vy);
+            if !visited[i] {
+                visited[i] = true;
+                queue.push_back(v);
+            }
+        }
+    }
+
+    // A walk path exists (same component) but every one leaves the 20-tile
+    // neighbourhood — e.g. the far bank of a river whose bridge is 50 tiles away.
+    deny("no_path_in_range")
+}
+
 /// `steps[0].kind` from a global teleport's metadata (e.g. "lodestone", "npc"),
 /// falling back to the generic tag.
 fn global_step_kind(meta: &serde_json::Value) -> &str {

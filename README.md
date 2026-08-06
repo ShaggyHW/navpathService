@@ -27,6 +27,8 @@ export NAVPATH_HOST=127.0.0.1
 export NAVPATH_PORT=8080
 export RUST_LOG=info
 cargo run -p navpath-service --release
+cargo run -p navpath-service --release -- --dump-result result.json --no-seed
+
 ```
 
 ## Validation & perf tooling
@@ -80,6 +82,29 @@ Response if tile doesn't exist:
 ```json
 {"exists": false}
 ```
+
+### Check walk-only reachability
+
+True iff the goal is within a 20-tile range (Chebyshev) of the start AND a pure
+walk path connects them — no macro edges (doors, stairs, teleports) — without
+leaving the endpoints' 20-tile neighbourhood. Answered from the snapshot's
+walk-component ids plus a bounded BFS (microseconds; no search permit).
+
+```sh
+curl -s "http://127.0.0.1:8080/reachable?sx=3259&sy=3101&splane=0&gx=3262&gy=3105&gplane=0"
+```
+
+Response:
+```json
+{"reachable": true}
+```
+
+When false, `reason` says why: `out_of_range` (further than 20 tiles),
+`different_plane`, `start_tile_not_found` / `goal_tile_not_found` (coordinate is
+not a walkable tile), `not_connected` (no walk-only path exists at all — e.g.
+the goal is behind a closed door or fence), or `no_path_in_range` (a walk path
+exists but every one detours outside the 20-tile neighbourhood — e.g. the far
+bank of a river whose bridge is 50 tiles away).
 
 ### Calculate a route
 

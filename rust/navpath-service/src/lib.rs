@@ -359,6 +359,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/healthz", get(routes::health))
         .route("/route", post(routes::route))
         .route("/tile/exists", get(routes::tile_exists))
+        .route("/reachable", get(routes::reachable))
         .route("/admin/reload", post(routes::reload))
         .route("/stats", get(routes::stats))
         .with_state(state)
