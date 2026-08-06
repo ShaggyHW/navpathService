@@ -100,6 +100,7 @@ fn avx512_full_row() -> bool {
     *ON.get_or_init(|| {
         std::env::var("NAVPATH_H_SIMD").ok().as_deref() != Some("0")
             && std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
             && std::is_x86_feature_detected!("avx2")
             && std::is_x86_feature_detected!("sse4.1")
     })
