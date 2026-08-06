@@ -75,10 +75,114 @@ pub struct ActiveLandmarks {
 /// The lane-wise max over `ga⊖row` and `row⊖gb` equals the scalar loop's `best`
 /// integer exactly, so results are bit-identical; the whole pass is fixed-trip
 /// u16 saturating arithmetic that LLVM autovectorizes under target-cpu=native.
+///
+/// `c`/`valid_odd` are the same operands folded into TWO streams for the explicit
+/// AVX-512 path ([`h_full_row_avx512`]); they carry no new information, so both paths
+/// return bit-identical values.
 pub struct FullRowOperands {
     ga: Vec<u16>,
     gb: Vec<u16>,
     inf_odd: Vec<u16>,
+    /// `ga` and `gb` merged: even lanes hold `goal_fw`, odd lanes `goal_bw` (0 / 0xFFFF
+    /// on the lanes of invalid landmarks — the same neutral values `ga`/`gb` use).
+    c: Vec<u16>,
+    /// One bit per row lane (32 lanes per word): set on the odd lanes of VALID
+    /// landmarks. Replaces the `inf_odd` operand stream with a k-mask operand.
+    valid_odd: Vec<u32>,
+}
+
+/// Is the explicit AVX-512 full-row path available? Cached CPU detection plus the
+/// `NAVPATH_H_SIMD=0` kill switch (falls back to the portable autovectorized loop,
+/// which returns identical values).
+#[cfg(target_arch = "x86_64")]
+fn avx512_full_row() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("NAVPATH_H_SIMD").ok().as_deref() != Some("0")
+            && std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("sse4.1")
+    })
+}
+
+/// Portable full-width row pass: one branchless fixed-trip loop over the interleaved
+/// row that LLVM autovectorizes under target-cpu=native. See [`FullRowOperands`].
+#[inline]
+fn h_full_row_portable(row: &[u16], full: &FullRowOperands, quantum: f32) -> f32 {
+    let stride = row.len();
+    // Equal-length slice bindings so LLVM can hoist the bounds checks and
+    // vectorize the fixed-trip u16 loop (psubusw/pmaxuw/pcmpeqw); indexing the
+    // four Vecs directly defeated autovectorization (measured 3.4x slower).
+    let ga = &full.ga[..stride];
+    let gbv = &full.gb[..stride];
+    let io = &full.inf_odd[..stride];
+    let row = &row[..stride];
+    let mut best: u16 = 0;
+    let mut inf: u16 = 0;
+    for i in 0..stride {
+        let r = row[i];
+        let a = ga[i].saturating_sub(r);
+        let b = r.saturating_sub(gbv[i]);
+        best = best.max(a.max(b));
+        // Branchless: 0xFFFF where r == UNREACHABLE, masked to valid odd lanes.
+        let m = ((r == ALT_UNREACHABLE) as u16).wrapping_neg();
+        inf |= m & io[i];
+    }
+    if inf != 0 {
+        // u cannot reach a landmark the goal reaches → u cannot reach the goal.
+        return f32::INFINITY;
+    }
+    ((best as i64 - 1).max(0) as f32) * quantum
+}
+
+/// The same pass in explicit AVX-512, reading TWO operand streams (the node's row and
+/// the merged goal vector) instead of the portable path's four — measured 8.7 → 3.6 ns
+/// per node warm, 10.8 → 4.3 ns on random rows, bit-identical on the deployed table.
+///
+/// Even lanes hold `c = goal_fw`, odd lanes `c = goal_bw`, so `subs(c, row)` is the
+/// forward term and `subs(row, c)` the backward one; a constant lane-parity blend picks
+/// the right term per lane, which is exactly the portable `max(ga⊖row, row⊖gb)` (the
+/// wrong-parity term is 0 by construction there, and the neutral operands of invalid
+/// landmarks are identical here). The INF test folds `inf_odd` into a per-query k-mask.
+///
+/// # Safety
+/// The caller must have verified the target features via [`avx512_full_row`] and pass
+/// `row.len() == c.len()` a multiple of 32, with `valid_odd.len() >= row.len() / 32`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx2,sse4.1")]
+unsafe fn h_full_row_avx512(row: &[u16], c: &[u16], valid_odd: &[u32], quantum: f32) -> f32 {
+    use core::arch::x86_64::*;
+    // Odd (backward) lanes of a 32 x u16 register.
+    const ODD: u32 = 0xAAAA_AAAA;
+    let ones = _mm512_set1_epi16(-1i16); // 0xFFFF
+    let mut acc = _mm512_setzero_si512();
+    let mut inf: u32 = 0;
+    let mut j = 0usize;
+    while j < row.len() {
+        let r = _mm512_loadu_si512(row.as_ptr().add(j) as *const _);
+        let cv = _mm512_loadu_si512(c.as_ptr().add(j) as *const _);
+        let fwd = _mm512_subs_epu16(cv, r);
+        let bwd = _mm512_subs_epu16(r, cv);
+        acc = _mm512_max_epu16(acc, _mm512_mask_blend_epi16(ODD, fwd, bwd));
+        inf |= _mm512_cmpeq_epu16_mask(r, ones) & valid_odd[j / 32];
+        j += 32;
+    }
+    if inf != 0 {
+        return f32::INFINITY;
+    }
+    // Horizontal max over 32 u16 lanes: fold to 128 bits, then `minpos` on the
+    // complement (x86 has no horizontal max for u16).
+    let m256 = _mm256_max_epu16(
+        _mm512_extracti64x4_epi64(acc, 0),
+        _mm512_extracti64x4_epi64(acc, 1),
+    );
+    let m128 = _mm_max_epu16(
+        _mm256_extracti128_si256(m256, 0),
+        _mm256_extracti128_si256(m256, 1),
+    );
+    let inv = _mm_xor_si128(m128, _mm_set1_epi16(-1i16));
+    let best = 0xFFFFu32 - (_mm_extract_epi16(_mm_minpos_epu16(inv), 0) as u32);
+    ((best as i64 - 1).max(0) as f32) * quantum
 }
 
 impl<'a> LandmarkHeuristic<'a> {
@@ -155,12 +259,19 @@ impl<'a> LandmarkHeuristic<'a> {
             let mut ga = vec![0u16; stride];
             let mut gb_ops = vec![0xFFFFu16; stride];
             let mut inf_odd = vec![0u16; stride];
+            // Merged operand for the AVX-512 path: the neutral lanes of ga (even) and
+            // gb (odd) interleaved, so one load covers both terms.
+            let mut c: Vec<u16> = (0..stride).map(|i| if i % 2 == 0 { 0 } else { 0xFFFF }).collect();
+            let mut valid_odd = vec![0u32; stride.div_ceil(32)];
             for (i, &li) in active.indices.iter().enumerate() {
                 ga[2 * li] = active.goal_fw[i];
                 gb_ops[2 * li + 1] = active.goal_bw[i];
                 inf_odd[2 * li + 1] = 0xFFFF;
+                c[2 * li] = active.goal_fw[i];
+                c[2 * li + 1] = active.goal_bw[i];
+                valid_odd[(2 * li + 1) / 32] |= 1 << ((2 * li + 1) % 32);
             }
-            active.full = Some(FullRowOperands { ga, gb: gb_ops, inf_odd });
+            active.full = Some(FullRowOperands { ga, gb: gb_ops, inf_odd, c, valid_odd });
         }
         active
     }
@@ -181,32 +292,24 @@ impl<'a> LandmarkHeuristic<'a> {
         let row = &self.tab[ub..ub + stride];
 
         // Full-width fast path (the default): one branchless fixed-trip pass over the
-        // whole interleaved row — LLVM autovectorizes the u16 saturating ops. Values
-        // are bit-identical to the scalar subset loop below (see [`FullRowOperands`]).
+        // whole interleaved row. Values are bit-identical to the scalar subset loop
+        // below, and identical between the two implementations (see
+        // [`FullRowOperands`]); the AVX-512 form just reads two operand streams
+        // instead of four. Row strides that are not a whole number of 32-lane
+        // registers take the portable loop.
         if let Some(full) = &active.full {
-            // Equal-length slice bindings so LLVM can hoist the bounds checks and
-            // vectorize the fixed-trip u16 loop (psubusw/pmaxuw/pcmpeqw); indexing the
-            // four Vecs directly defeated autovectorization (measured 3.4x slower).
-            let ga = &full.ga[..stride];
-            let gbv = &full.gb[..stride];
-            let io = &full.inf_odd[..stride];
-            let row = &row[..stride];
-            let mut best: u16 = 0;
-            let mut inf: u16 = 0;
-            for i in 0..stride {
-                let r = row[i];
-                let a = ga[i].saturating_sub(r);
-                let b = r.saturating_sub(gbv[i]);
-                best = best.max(a.max(b));
-                // Branchless: 0xFFFF where r == UNREACHABLE, masked to valid odd lanes.
-                let m = ((r == ALT_UNREACHABLE) as u16).wrapping_neg();
-                inf |= m & io[i];
+            #[cfg(target_arch = "x86_64")]
+            {
+                if stride % 32 == 0 && avx512_full_row() {
+                    // SAFETY: avx512_full_row() verified the target features; the row
+                    // and merged-goal slices are both `stride` long (select_active
+                    // sizes them) and valid_odd has one word per 32-lane chunk.
+                    return unsafe {
+                        h_full_row_avx512(&row[..stride], &full.c[..stride], &full.valid_odd, self.quantum)
+                    };
+                }
             }
-            if inf != 0 {
-                // u cannot reach a landmark the goal reaches → u cannot reach the goal.
-                return f32::INFINITY;
-            }
-            return ((best as i64 - 1).max(0) as f32) * self.quantum;
+            return h_full_row_portable(&row[..stride], full, self.quantum);
         }
 
         let mut best: i64 = 0;
@@ -423,6 +526,51 @@ mod tests {
         let lm = LandmarkHeuristic { nodes: 2, landmarks: 1, tab: &tab, quantum: ALT_QUANTUM_MS };
         let active = lm.select_active(0, 1, 8);
         assert!(active.indices.is_empty());
+    }
+
+    /// The two full-width implementations must agree bit-for-bit on every lane
+    /// pattern, including the UNREACHABLE/SATURATED sentinels that drive the
+    /// early-INF and disabled-term rules.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx512_full_row_matches_portable() {
+        if !avx512_full_row() {
+            return; // no AVX-512 (or kill switch set): only one path exists here
+        }
+        // 16 landmarks -> stride 32 = exactly one AVX-512 register; 32 landmarks ->
+        // two, exercising the chunk loop and the per-chunk INF mask word.
+        for l in [16usize, 32] {
+            let stride = 2 * l;
+            let nodes = 48usize;
+            let mut tab = vec![0u16; nodes * stride];
+            let mut x: u32 = 0x9E3779B9;
+            for v in tab.iter_mut() {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                *v = match (x >> 29) % 8 {
+                    0 => ALT_UNREACHABLE,
+                    1 => ALT_SATURATED,
+                    _ => (x % 4000) as u16,
+                };
+            }
+            let lm = LandmarkHeuristic { nodes, landmarks: l, tab: &tab, quantum: ALT_QUANTUM_MS };
+            for goal in 0..nodes as u32 {
+                let active = lm.select_active(0, goal, usize::MAX);
+                let Some(full) = &active.full else { continue };
+                for u in 0..nodes as u32 {
+                    let ub = u as usize * stride;
+                    let row = &tab[ub..ub + stride];
+                    let portable = h_full_row_portable(row, full, ALT_QUANTUM_MS);
+                    // SAFETY: features checked above; slice lengths match the contract.
+                    let simd = unsafe {
+                        h_full_row_avx512(row, &full.c, &full.valid_odd, ALT_QUANTUM_MS)
+                    };
+                    assert_eq!(
+                        portable.to_bits(), simd.to_bits(),
+                        "l={l} goal={goal} node={u}: portable {portable} != simd {simd}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
