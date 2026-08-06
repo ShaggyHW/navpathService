@@ -40,6 +40,7 @@ async fn main() {
     }
 
     let snap = navpath_core::Snapshot::open(&snap_path).expect("open snapshot");
+    let req_tag_index = navpath_service::build_req_tag_index(Some(&snap));
     let (n, nr, g, m) = navpath_service::engine_adapter::build_neighbor_provider(&snap);
     let (fr, nfr) = navpath_service::engine_adapter::build_fairy_rings(&snap);
     let cg = navpath_service::engine_adapter::build_component_graph(&snap, &g, &fr);
@@ -52,6 +53,7 @@ async fn main() {
             neighbors_rev: Some(Arc::new(nr)),
             globals: Arc::new(g),
             macro_lookup: Arc::new(m),
+            req_tag_index: Arc::new(req_tag_index),
             loaded_at_unix: 0,
             snapshot_hash_hex: None,
             route_cache: navpath_service::new_route_cache(),

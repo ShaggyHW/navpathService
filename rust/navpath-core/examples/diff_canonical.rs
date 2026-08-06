@@ -74,7 +74,7 @@ fn main() {
 
     let mk_view = |canonical: Option<Arc<CanonicalGrid>>| -> EngineView {
         let mut view = EngineView::from_snapshot(&snap);
-        view.extra.global = parse_globals(&snap);
+        view.extra.global = parse_globals(&snap).into();
         let mut sources: Vec<u32> = snap.fairy_nodes().to_vec();
         sources.sort_unstable();
         let mut dests: Vec<(u32, f32)> = snap
@@ -84,8 +84,8 @@ fn main() {
             .map(|(&n, &c)| (n, c))
             .collect();
         dests.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        view.extra.fairy_sources = sources;
-        view.extra.fairy_dests = dests;
+        view.extra.fairy_sources = sources.into();
+        view.extra.fairy_dests = dests.into();
         view.canonical = canonical;
         view
     };
@@ -120,9 +120,9 @@ fn main() {
             out
         };
         for v in [&mut full, &mut canon] {
-            v.extra.global = lode.clone();
-            v.extra.fairy_sources.clear();
-            v.extra.fairy_dests.clear();
+            v.extra.global = lode.clone().into();
+            v.extra.fairy_sources = Default::default();
+            v.extra.fairy_dests = Default::default();
         }
     }
     // sanity: canonical view really is a CSR walk with coords

@@ -88,6 +88,7 @@ async fn health_and_route_and_reload() {
     let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
     let (neighbors, neighbors_rev, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
     let snapshot = Some(Arc::new(opened));
+    let req_tag_index = Arc::new(navpath_service::build_req_tag_index(snapshot.as_deref()));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
         snapshot,
@@ -95,12 +96,13 @@ async fn health_and_route_and_reload() {
         neighbors_rev: Some(Arc::new(neighbors_rev)),
         globals: Arc::new(globals),
         macro_lookup: Arc::new(macro_lookup),
+        req_tag_index,
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
         route_cache: navpath_service::new_route_cache(),
         seed_shadow: navpath_service::new_seed_shadow(),
         fairy_rings: Arc::new(Vec::new()),
-        node_to_fairy_ring: Arc::new(HashMap::new()),
+        node_to_fairy_ring: Arc::new(navpath_service::FxHashMap::default()),
         comp_graph: None,
         canonical_grid: None,
         profile_cache: navpath_service::new_profile_cache(),
@@ -148,6 +150,7 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
     let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
     let (neighbors, neighbors_rev, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
     let snapshot = Some(Arc::new(opened));
+    let req_tag_index = Arc::new(navpath_service::build_req_tag_index(snapshot.as_deref()));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
         snapshot,
@@ -155,12 +158,13 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
         neighbors_rev: Some(Arc::new(neighbors_rev)),
         globals: Arc::new(globals),
         macro_lookup: Arc::new(macro_lookup),
+        req_tag_index,
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
         route_cache: navpath_service::new_route_cache(),
         seed_shadow: navpath_service::new_seed_shadow(),
         fairy_rings: Arc::new(Vec::new()),
-        node_to_fairy_ring: Arc::new(HashMap::new()),
+        node_to_fairy_ring: Arc::new(navpath_service::FxHashMap::default()),
         comp_graph: None,
         canonical_grid: None,
         profile_cache: navpath_service::new_profile_cache(),

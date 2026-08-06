@@ -19,13 +19,23 @@ use navpath_service::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// Parse the `--dump-result <path>` / `--dump-result=<path>` flag. When present it sets
-/// `NAVPATH_DUMP_RESULT` so the existing (env-driven, cached) dump path in `routes.rs` picks
-/// it up. The flag takes precedence over an already-set env var; absent it, the env var still
-/// works. Must run before the first `/route` request, which is where the path is read & cached.
-fn apply_dump_result_flag() {
+/// Parse CLI flags into the env vars the (cached, env-driven) readers in `routes.rs`
+/// consume. Flags take precedence over already-set env vars; absent a flag, the env
+/// var still works. Must run before the first `/route` request, which is where the
+/// values are read & cached.
+///
+/// - `--dump-result <path>` / `--dump-result=<path>` → `NAVPATH_DUMP_RESULT`
+/// - `--no-seed` → `NAVPATH_IGNORE_SEED=1`: ignore client-sent seeds entirely — every
+///   request is answered with the deterministic unseeded optimum (no edge jitter,
+///   canonical pruning engages), marked `degraded: "seed_ignored"` when a seed was
+///   sent (plan v3 §3b).
+fn apply_cli_flags() {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if arg == "--no-seed" {
+            std::env::set_var("NAVPATH_IGNORE_SEED", "1");
+            continue;
+        }
         let path = if arg == "--dump-result" {
             args.next()
         } else if let Some(rest) = arg.strip_prefix("--dump-result=") {
@@ -44,7 +54,7 @@ async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder().with_ansi(false).finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    apply_dump_result_flag();
+    apply_cli_flags();
 
     let host = env_var("NAVPATH_HOST", "127.0.0.1");
     let port: u16 = env_var("NAVPATH_PORT", "8080").parse().unwrap_or(8080);
@@ -60,13 +70,14 @@ async fn main() -> Result<()> {
         },
         Err(e) => {
             error!(error=?e, path=?snapshot_path, "failed to open snapshot; service will still start but /route will 503");
-            (None, None, None, Arc::new(Vec::new()), Arc::new(std::collections::HashMap::<(u32, u32), Vec<u32>>::new()), Arc::new(Vec::new()), Arc::new(std::collections::HashMap::new()), None, None)
+            (None, None, None, Arc::new(Vec::new()), Arc::new(navpath_service::FxHashMap::default()), Arc::new(Vec::new()), Arc::new(navpath_service::FxHashMap::default()), None, None)
         }
     };
 
     // Provide not-ready state if snapshot failed to load
     let hash_hex = read_tail_hash_hex(&snapshot_path);
-    let init = SnapshotState { path: snapshot_path.clone(), snapshot, neighbors, neighbors_rev, globals, macro_lookup, loaded_at_unix: now_unix(), snapshot_hash_hex: hash_hex, route_cache: navpath_service::new_route_cache(), seed_shadow: navpath_service::new_seed_shadow(), fairy_rings, node_to_fairy_ring, comp_graph, canonical_grid, profile_cache: navpath_service::new_profile_cache() };
+    let req_tag_index = Arc::new(navpath_service::build_req_tag_index(snapshot.as_deref()));
+    let init = SnapshotState { path: snapshot_path.clone(), snapshot, neighbors, neighbors_rev, globals, macro_lookup, req_tag_index, loaded_at_unix: now_unix(), snapshot_hash_hex: hash_hex, route_cache: navpath_service::new_route_cache(), seed_shadow: navpath_service::new_seed_shadow(), fairy_rings, node_to_fairy_ring, comp_graph, canonical_grid, profile_cache: navpath_service::new_profile_cache() };
     let state = AppState {
         current: Arc::new(ArcSwap::from_pointee(init)),
         search_permits: navpath_service::default_search_permits(),
@@ -81,9 +92,14 @@ async fn main() -> Result<()> {
             info!(path = %dump, "result dumping enabled; each /route response overwrites this file");
         }
     }
+    if navpath_service::routes::seeding_disabled() {
+        info!("seeding disabled (--no-seed): client seeds are ignored; all searches run unseeded");
+    }
     info!(%addr, path=?snapshot_path, "starting navpath-service");
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    axum::serve(listener, app.into_make_service())
+        .tcp_nodelay(true)
+        .await?;
     Ok(())
 }
 

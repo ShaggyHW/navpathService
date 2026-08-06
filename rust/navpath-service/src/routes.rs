@@ -62,23 +62,13 @@ fn req_has_quick_tele(reqs: &[RequirementKV]) -> bool {
     false
 }
 
-fn build_req_id_to_tag_index(req_words: &[u32]) -> std::collections::HashMap<u32, usize> {
-    let mut map = std::collections::HashMap::new();
-    let mut i = 0usize;
-    while i + 3 < req_words.len() {
-        map.insert(req_words[i], i / 4);
-        i += 4;
-    }
-    map
-}
-
 /// Parse a macro edge's metadata once and return it if the profile satisfies the edge's
 /// requirements (missing/unparseable metadata counts as allowed, matching the search's
 /// fail-open handling of empty requirement lists). None = edge not allowed.
 fn macro_edge_meta_if_allowed(
     snap: &navpath_core::Snapshot,
     macro_idx: usize,
-    req_id_to_tag_idx: &std::collections::HashMap<u32, usize>,
+    req_id_to_tag_idx: &crate::FxHashMap<u32, usize>,
     mask: &navpath_core::eligibility::EligibilityMask,
 ) -> Option<serde_json::Value> {
     let Some(bytes) = snap.macro_meta_at(macro_idx) else { return Some(serde_json::json!({})); };
@@ -653,8 +643,11 @@ pub struct RouteResponse {
     /// "seed_dropped": the request sent a seed, both seeded attempts exhausted their
     /// budgets, and the served route is the deterministic unseeded optimum.
     #[serde(skip_serializing_if = "Option::is_none")] pub degraded: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub actions: Option<Vec<Action>>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub geometry: Option<Vec<[i32; 3]>>,
+    /// Pre-serialized in the blocking task (`RawValue` embeds verbatim), so the multi-KB
+    /// action list / geometry never serialize on the reactor thread. Bytes are identical
+    /// to serializing the typed values here — same serializer, same values.
+    #[serde(skip_serializing_if = "Option::is_none")] pub actions: Option<Box<serde_json::value::RawValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub geometry: Option<Box<serde_json::value::RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -739,9 +732,10 @@ fn global_step_kind(meta: &serde_json::Value) -> &str {
 fn build_route_payload(
     snap: &navpath_core::Snapshot,
     globals: &[engine_adapter::GlobalTeleport],
-    macro_lookup: &std::collections::HashMap<(u32, u32), Vec<u32>>,
+    macro_lookup: &crate::FxHashMap<(u32, u32), Vec<u32>>,
     fairy_rings: &[engine_adapter::FairyRing],
-    node_to_fairy_ring: &std::collections::HashMap<u32, usize>,
+    node_to_fairy_ring: &crate::FxHashMap<u32, usize>,
+    req_id_to_tag_idx: &crate::FxHashMap<u32, usize>,
     mask: &navpath_core::eligibility::EligibilityMask,
     quick_tele: bool,
     return_geometry: bool,
@@ -773,13 +767,11 @@ fn build_route_payload(
         return (None, geometry);
     }
 
-    let req_id_to_tag_idx = build_req_id_to_tag_index(snap.req_tags());
-
     // Eligible global teleports for action annotation, from the metadata parsed once
     // at snapshot load (no per-request 113KB JSON re-parse). Metadata stays behind the
     // shared Arc — serialization reads through it, so nothing is deep-cloned here.
-    let mut global_cost: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
-    let mut global_meta: std::collections::HashMap<u32, Arc<serde_json::Value>> = std::collections::HashMap::new();
+    let mut global_cost: crate::FxHashMap<u32, f32> = crate::FxHashMap::default();
+    let mut global_meta: crate::FxHashMap<u32, Arc<serde_json::Value>> = crate::FxHashMap::default();
     for g in globals.iter() {
         if g.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
             continue;
@@ -999,8 +991,8 @@ fn build_route_payload(
 struct RouteTaskOut {
     res: navpath_core::SearchResult,
     virtual_entry: Option<u32>,
-    actions: Option<Vec<Action>>,
-    geometry: Option<Vec<[i32; 3]>>,
+    actions: Option<Box<serde_json::value::RawValue>>,
+    geometry: Option<Box<serde_json::value::RawValue>>,
     retried: bool,
     attempts_pops: [u32; 3],
     seed_dropped: bool,
@@ -1035,26 +1027,46 @@ pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "ignore_seed": cache_ignore_seed(),
             }),
         );
+        obj.insert("seeding_disabled".to_string(), serde_json::json!(seeding_disabled()));
     }
     Json(out)
 }
 
-/// Opt-in cache policy (`NAVPATH_CACHE_IGNORE_SEED=1`, default off): drop the seed
-/// from the route-cache key, so repeat traffic with varying seeds — the dominant
-/// production shape, which otherwise never hits — is served the cached path. Cached
-/// hits then lose per-seed tie variety (jitter is < 0.1 ms/edge against 300 ms edges,
-/// so only equal-cost tie selection changes — the same trade the budget retry already
-/// makes). Flip only with the client owner's sign-off; measure hit rates via /stats
-/// first (roadmap 5.2).
+/// Cache seed policy (`NAVPATH_CACHE_IGNORE_SEED`, **default ON since 2026-08-06** —
+/// plan v3 §3a): drop the seed from the route-cache key, so repeat traffic with
+/// varying seeds — the dominant production shape, which otherwise never hits — is
+/// served the cached path. Cached hits lose per-seed tie variety (jitter is
+/// < 0.1 ms/edge against 300 ms edges, so only equal-cost tie selection changes —
+/// the same trade the budget retry already makes). Measured on the gate that
+/// roadmap 5.2 demanded (2026-07-31): 11 of 12 repeat requests became hits,
+/// ~118 ms → ~0.3–0.9 ms. Set `NAVPATH_CACHE_IGNORE_SEED=0` to restore the legacy
+/// per-seed keying.
 fn cache_ignore_seed() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(std::env::var("NAVPATH_CACHE_IGNORE_SEED").ok().as_deref().map(str::trim), Some("1") | Some("true"))
+        !matches!(std::env::var("NAVPATH_CACHE_IGNORE_SEED").ok().as_deref().map(str::trim), Some("0") | Some("false"))
     })
 }
 
-pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>) -> Result<Json<RouteResponse>, (StatusCode, String)> {
+/// Server-side seed kill switch (`--no-seed` / `NAVPATH_IGNORE_SEED=1`, default off —
+/// plan v3 §3b): every request is treated as unseeded even when the client sends a
+/// seed. The seed is cleared at ingestion, so everything downstream — search engine,
+/// retry ladder, cache keys, miss attribution — sees an unseeded request: no edge
+/// jitter, canonical pruning engages, the seeded retry rungs never run. Responses to
+/// requests that DID send a seed carry `degraded: "seed_ignored"` (contract rewrites
+/// must be visible — same rule as `seed_dropped`).
+pub fn seeding_disabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("NAVPATH_IGNORE_SEED").ok().as_deref().map(str::trim), Some("1") | Some("true"))
+    })
+}
+
+pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteRequest>) -> Result<Json<RouteResponse>, (StatusCode, String)> {
     let start = std::time::Instant::now();
+    // Seed kill switch: clear before ANY reader (cache key, shadow attribution,
+    // search) so the request is unseeded everywhere, not just in the engine.
+    let seed_ignored = seeding_disabled() && req.seed.take().is_some();
     let metrics = state.metrics.clone();
     metrics.requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cur = state.current.load();
@@ -1202,8 +1214,10 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     // Offload search to a blocking thread, bounded by the search semaphore so a burst of
     // slow queries cannot pin hundreds of blocking-pool threads (each holding a
     // node-sized SearchContext). Overload fails fast instead of queueing floods. Cache
-    // hits skip the search and need no permit.
-    let _permit = if cached.is_none() {
+    // hits skip the search and need no permit. The permit moves into the blocking task
+    // and is released the moment the search itself finishes — payload building and
+    // response serialization must not count against search admission.
+    let permit = if cached.is_none() {
         match state.search_permits.clone().try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
@@ -1274,6 +1288,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
     let used_virtual_start_for_search = used_virtual_start;
     let cancel_for_search = cancel.clone();
     let macro_lookup_arc = cur.macro_lookup.clone();
+    let req_tag_index_arc = cur.req_tag_index.clone();
     let return_geometry = req.options.return_geometry;
     let only_actions = req.options.only_actions;
     let surge_cfg = req.surge.clone();
@@ -1321,6 +1336,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
             ), None)
         };
         let search_ms = t_search.elapsed().as_millis() as u64;
+        drop(permit);
         let t_payload = std::time::Instant::now();
         let (actions, geometry) = build_route_payload(
             &snap_arc,
@@ -1328,6 +1344,7 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
             &macro_lookup_arc,
             &fairy_rings_arc,
             &node_to_fairy_ring_arc,
+            &req_tag_index_arc,
             &mask_for_search,
             quick_tele,
             return_geometry,
@@ -1339,6 +1356,12 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
             sid,
             &outcome.res,
         );
+        // Serialize the bulky payload halves here, off the reactor; `payload_ms`
+        // deliberately includes it (it is payload work).
+        let actions = actions
+            .map(|a| serde_json::value::to_raw_value(&a).expect("actions serialize"));
+        let geometry = geometry
+            .map(|g| serde_json::value::to_raw_value(&g).expect("geometry serialize"));
         let payload_ms = t_payload.elapsed().as_millis() as u64;
         RouteTaskOut {
             res: outcome.res,
@@ -1423,7 +1446,15 @@ pub async fn route(State(state): State<AppState>, Json(req): Json<RouteRequest>)
         navpath_core::SearchStatus::Cancelled => Some("cancelled".to_string()),
         _ => None,
     };
-    let degraded = if seed_dropped { Some("seed_dropped".to_string()) } else { None };
+    let degraded = if seed_dropped {
+        Some("seed_dropped".to_string())
+    } else if seed_ignored {
+        // The client sent a seed but the server runs with --no-seed: the served route
+        // is the deterministic unseeded optimum.
+        Some("seed_ignored".to_string())
+    } else {
+        None
+    };
     let resp = RouteResponse {
         found: res.found,
         cost: res.cost,
@@ -1471,34 +1502,46 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
     let cur = state.current.load();
     let path = cur.path.clone();
 
-    match navpath_core::Snapshot::open(&path) {
-        Ok(new_snap) => {
-            let new_hash = crate::read_tail_hash_hex(&path);
-            // Pre-compute neighbors and globals
-            let (neighbors, neighbors_rev, globals, macro_lookup) = crate::engine_adapter::build_neighbor_provider(&new_snap);
-            // Pre-compute fairy rings
-            let (fairy_rings, node_to_fairy_ring) = crate::engine_adapter::build_fairy_rings(&new_snap);
-            let comp_graph = crate::engine_adapter::build_component_graph(&new_snap, &globals, &fairy_rings);
-            let canonical_grid = crate::engine_adapter::build_canonical_grid(&new_snap);
-            let new_state = SnapshotState {
-                path: path.clone(),
-                snapshot: Some(Arc::new(new_snap)),
-                neighbors: Some(Arc::new(neighbors)),
-                neighbors_rev: Some(Arc::new(neighbors_rev)),
-                globals: Arc::new(globals),
-                macro_lookup: Arc::new(macro_lookup),
-                loaded_at_unix: crate::now_unix(),
-                snapshot_hash_hex: new_hash.clone(),
-                route_cache: crate::new_route_cache(),
-                seed_shadow: crate::new_seed_shadow(),
-                fairy_rings: Arc::new(fairy_rings),
-                node_to_fairy_ring: Arc::new(node_to_fairy_ring),
-                comp_graph: Some(Arc::new(comp_graph)),
-                canonical_grid,
-                profile_cache: crate::new_profile_cache(),
-            };
+    // Snapshot open + provider/component/canonical builds are ~100 ms of CPU work —
+    // run them on the blocking pool so reactor threads keep serving requests.
+    let log_path = path.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        let new_snap = navpath_core::Snapshot::open(&path).map_err(|e| e.to_string())?;
+        let new_hash = crate::read_tail_hash_hex(&path);
+        // Pre-compute neighbors and globals
+        let (neighbors, neighbors_rev, globals, macro_lookup) = crate::engine_adapter::build_neighbor_provider(&new_snap);
+        // Pre-compute fairy rings
+        let (fairy_rings, node_to_fairy_ring) = crate::engine_adapter::build_fairy_rings(&new_snap);
+        let comp_graph = crate::engine_adapter::build_component_graph(&new_snap, &globals, &fairy_rings);
+        let canonical_grid = crate::engine_adapter::build_canonical_grid(&new_snap);
+        let req_tag_index = crate::build_req_tag_index(Some(&new_snap));
+        Ok::<SnapshotState, String>(SnapshotState {
+            path,
+            snapshot: Some(Arc::new(new_snap)),
+            neighbors: Some(Arc::new(neighbors)),
+            neighbors_rev: Some(Arc::new(neighbors_rev)),
+            globals: Arc::new(globals),
+            macro_lookup: Arc::new(macro_lookup),
+            req_tag_index: Arc::new(req_tag_index),
+            loaded_at_unix: crate::now_unix(),
+            snapshot_hash_hex: new_hash,
+            route_cache: crate::new_route_cache(),
+            seed_shadow: crate::new_seed_shadow(),
+            fairy_rings: Arc::new(fairy_rings),
+            node_to_fairy_ring: Arc::new(node_to_fairy_ring),
+            comp_graph: Some(Arc::new(comp_graph)),
+            canonical_grid,
+            profile_cache: crate::new_profile_cache(),
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    match built {
+        Ok(new_state) => {
+            let new_hash = new_state.snapshot_hash_hex.clone();
             state.current.store(Arc::new(new_state));
-            info!(path=?path, hash=?new_hash, "reloaded snapshot");
+            info!(path=?log_path, hash=?new_hash, "reloaded snapshot");
             let latest = state.current.load();
             Ok(Json(serde_json::json!({
                 "reloaded": true,
@@ -1507,8 +1550,8 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
             })))
         }
         Err(e) => {
-            warn!(error=?e, path=?path, "reload failed; keeping old snapshot");
-            Err((StatusCode::CONFLICT, e.to_string()))
+            warn!(error=%e, path=?log_path, "reload failed; keeping old snapshot");
+            Err((StatusCode::CONFLICT, e))
         }
     }
 }

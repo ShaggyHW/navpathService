@@ -228,7 +228,7 @@ fn bench_astar(c: &mut Criterion) {
         .map(std::sync::Arc::new)
     };
     let mut view = EngineView::from_snapshot(&snap);
-    view.extra.global = globals.clone();
+    view.extra.global = globals.clone().into();
     view.canonical = canonical.clone();
 
     // Reversed macro provider for the bidirectional groups (what the service builds at
@@ -268,7 +268,8 @@ fn bench_astar(c: &mut Criterion) {
         .iter()
         .filter(|&&(_, _, k)| k == 2)
         .map(|&(d, _, _)| (d, 2400.0))
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
 
     let mut ctx = SearchContext::new(view.nodes);
     let mut cf = SearchContext::new(view.nodes);

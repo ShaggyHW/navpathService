@@ -57,6 +57,29 @@ pub fn edge_jitter(seed: u64, from: u32, to: u32) -> f32 {
     ((h & 0xFFFF) as f32) / 655360.0
 }
 
+/// Per-edge pricing policy, monomorphized so the unseeded hot loop carries no
+/// per-edge seed branch and the seeded loop no `Option` unwrap (roadmap 2.6(2)).
+/// Both implementations are the exact arithmetic the old inline `match params.seed`
+/// performed, so results are bit-identical.
+trait JitterPolicy: Copy {
+    /// Price of the forward edge `from -> to` with base weight `w` (ms).
+    fn w(self, from: u32, to: u32, w: f32) -> f32;
+}
+
+#[derive(Clone, Copy)]
+struct NoJitter;
+impl JitterPolicy for NoJitter {
+    #[inline(always)]
+    fn w(self, _from: u32, _to: u32, w: f32) -> f32 { w }
+}
+
+#[derive(Clone, Copy)]
+struct SeededJitter(u64);
+impl JitterPolicy for SeededJitter {
+    #[inline(always)]
+    fn w(self, from: u32, to: u32, w: f32) -> f32 { w + edge_jitter(self.0, from, to) }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchStatus {
     Found,
@@ -158,10 +181,10 @@ impl Ord for Key {
 
 /// Best-effort prefetch of a node's search state (prefetches never fault, so the
 /// unchecked pointer arithmetic is safe for any id). Used to overlap the relax loop's
-/// random 16-byte NodeState loads and the next stale-check line with current work —
+/// random hot-record loads and the next stale-check line with current work —
 /// the loop is memory-bound, not branch-bound (measured; PGO showed no win).
 #[inline(always)]
-fn prefetch_node(nodes: &[NodeState], id: u32) {
+fn prefetch_node<T>(nodes: &[T], id: u32) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
@@ -193,35 +216,43 @@ fn canonical_ctx<'a>(
     Some((cg, coords, offsets, dst))
 }
 
-/// Per-node search state, packed so one relaxation touches a single 16-byte record
-/// (four records per cache line) instead of four parallel arrays. `h` caches the ALT
-/// heuristic for the node, valid for the same `gen` — a grid node can be relaxed from
-/// up to 8 predecessors, but pays the landmark gather only once per query.
+/// Hot half of the per-node search state (roadmap 2.10): the fields EVERY probe of a
+/// node reads — stale-pop checks, the ~4-6x-more-common failed relax attempts, and the
+/// bidir meet probe all need only (g, gen). 8 B puts eight records per cache line
+/// (vs four for the fused 16 B record), halving line traffic on exactly those reads.
 #[derive(Clone, Copy)]
-pub struct NodeState {
+pub struct HotState {
     pub g: f32,
-    pub h: f32,
-    pub parent: u32,
     pub gen: u32,
 }
 
-const EMPTY_STATE: NodeState = NodeState { g: f32::INFINITY, h: 0.0, parent: u32::MAX, gen: 0 };
+/// Cold half: written only on improvements, read on expansion (canonical parent
+/// recovery), h-cache hits, and reconstruction. `h` caches the ALT heuristic for the
+/// node, valid for the same `gen` as the hot record — a grid node can be relaxed from
+/// up to 8 predecessors, but pays the landmark gather only once per query.
+#[derive(Clone, Copy)]
+pub struct ColdState {
+    pub parent: u32,
+    pub h: f32,
+}
 
-/// All-zero bytes are a valid, semantically-empty NodeState: `gen == 0` never matches
-/// the live generation (which starts at 1 and the wrap path re-fills), so `g`/`parent`
-/// read as INFINITY/unset through the generation guards, and `h` is only ever read
-/// after `set_g`/relax stamp the record (writing the NAN sentinel first). Allocating
-/// zeroed instead of `vec![EMPTY_STATE; n]` lets the allocator hand back untouched
-/// kernel zero pages: no multi-MB memset on context creation (the recurring
-/// cold-thread p99 spike), and physical commit proportional to the touched search
-/// corridor instead of `nodes * 16 B`.
-fn zeroed_states(n: usize) -> Vec<NodeState> {
+const EMPTY_HOT: HotState = HotState { g: f32::INFINITY, gen: 0 };
+const EMPTY_COLD: ColdState = ColdState { parent: u32::MAX, h: 0.0 };
+
+/// All-zero bytes are valid, semantically-empty state for BOTH halves: `gen == 0`
+/// never matches the live generation (which starts at 1 and the wrap path re-fills),
+/// so `g`/`parent` read as INFINITY/unset through the generation guards, and `h` is
+/// only ever read after `set_g`/relax stamp the record (writing the NAN sentinel
+/// first). Allocating zeroed lets the allocator hand back untouched kernel zero
+/// pages: no multi-MB memset on context creation (the recurring cold-thread p99
+/// spike), and physical commit proportional to the touched search corridor.
+fn zeroed_vec<T>(n: usize) -> Vec<T> {
     if n == 0 {
         return Vec::new();
     }
-    let layout = std::alloc::Layout::array::<NodeState>(n).expect("NodeState array layout");
+    let layout = std::alloc::Layout::array::<T>(n).expect("search state array layout");
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout) as *mut NodeState;
+        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -230,7 +261,8 @@ fn zeroed_states(n: usize) -> Vec<NodeState> {
 }
 
 pub struct SearchContext {
-    pub nodes: Vec<NodeState>,
+    pub hot: Vec<HotState>,
+    pub cold: Vec<ColdState>,
     pub generation: u32,
     pub open: BinaryHeap<Key>,
 }
@@ -238,19 +270,21 @@ pub struct SearchContext {
 impl SearchContext {
     pub fn new(nodes: usize) -> Self {
         Self {
-            nodes: zeroed_states(nodes),
+            hot: zeroed_vec(nodes),
+            cold: zeroed_vec(nodes),
             generation: 1,
             open: BinaryHeap::with_capacity(1024),
         }
     }
 
     pub fn reset(&mut self, nodes: usize) {
-        if self.nodes.len() != nodes {
+        if self.hot.len() != nodes {
             *self = Self::new(nodes);
         } else {
             self.generation = self.generation.wrapping_add(1);
             if self.generation == 0 {
-                 self.nodes.fill(EMPTY_STATE);
+                 self.hot.fill(EMPTY_HOT);
+                 self.cold.fill(EMPTY_COLD);
                  self.generation = 1;
             }
             self.open.clear();
@@ -259,38 +293,36 @@ impl SearchContext {
 
     #[inline(always)]
     pub fn get_g(&self, u: usize) -> f32 {
-        let st = self.nodes[u];
+        let st = self.hot[u];
         if st.gen == self.generation { st.g } else { f32::INFINITY }
     }
 
     #[inline(always)]
     pub fn set_g(&mut self, u: usize, val: f32) {
         let gen = self.generation;
-        let st = &mut self.nodes[u];
-        if st.gen != gen {
-            st.gen = gen;
-            st.h = f32::NAN; // h not yet computed this query
+        if self.hot[u].gen != gen {
+            self.hot[u].gen = gen;
+            self.cold[u].h = f32::NAN; // h not yet computed this query
         }
-        st.g = val;
+        self.hot[u].g = val;
     }
 
     #[inline(always)]
     pub fn set_parent(&mut self, u: usize, p: u32) {
         // Assume set_g was called first to init generation
-        self.nodes[u].parent = p;
+        self.cold[u].parent = p;
     }
 
     #[inline(always)]
     pub fn get_parent(&self, u: usize) -> u32 {
-        let st = self.nodes[u];
-        if st.gen == self.generation { st.parent } else { u32::MAX }
+        if self.hot[u].gen == self.generation { self.cold[u].parent } else { u32::MAX }
     }
 
     /// Cached heuristic for a node already stamped by `set_g` this query; computes and
     /// stores it on first use (NAN marks "not yet computed").
     #[inline(always)]
     fn h_cached(&mut self, u: usize, compute: impl FnOnce() -> f32) -> f32 {
-        let st = &mut self.nodes[u];
+        let st = &mut self.cold[u];
         if st.h.is_nan() {
             st.h = compute();
         }
@@ -307,13 +339,25 @@ impl SearchContext {
 /// - Fairy-ring hops are location-specific: nodes listed in `fairy_sources` (sorted) can
 ///   hop to every entry in `fairy_dests` (sorted by dst id; the self-hop is skipped during
 ///   the merge). Both slices are shared for the whole query — no per-pop allocation.
-#[derive(Default)]
-pub struct ExtraEdges {
-    pub global: Vec<(u32, f32)>,
+///
+/// `Cow` so the service borrows these straight out of its per-profile artifact cache
+/// (no per-request copies) while tests and examples keep assigning owned Vecs.
+pub struct ExtraEdges<'a> {
+    pub global: std::borrow::Cow<'a, [(u32, f32)]>,
     /// Sorted node ids that have fairy-ring hops available.
-    pub fairy_sources: Vec<u32>,
+    pub fairy_sources: std::borrow::Cow<'a, [u32]>,
     /// Sorted (dst, cost) fairy destinations shared by all sources.
-    pub fairy_dests: Vec<(u32, f32)>,
+    pub fairy_dests: std::borrow::Cow<'a, [(u32, f32)]>,
+}
+
+impl Default for ExtraEdges<'_> {
+    fn default() -> Self {
+        ExtraEdges {
+            global: std::borrow::Cow::Borrowed(&[]),
+            fairy_sources: std::borrow::Cow::Borrowed(&[]),
+            fairy_dests: std::borrow::Cow::Borrowed(&[]),
+        }
+    }
 }
 
 pub struct EngineView<'a> {
@@ -321,7 +365,7 @@ pub struct EngineView<'a> {
     pub walk: WalkGraph<'a>,
     pub macros: Arc<NeighborProvider>,
     pub lm: LandmarkHeuristic<'a>,
-    pub extra: ExtraEdges,
+    pub extra: ExtraEdges<'a>,
     /// Packed (plane,y,x) coordinates in node-id order — parent-direction recovery for
     /// canonical pruning. Set by [`EngineView::from_snapshot`]; None disables pruning.
     pub coords: Option<&'a [u32]>,
@@ -375,6 +419,8 @@ impl<'a> EngineView<'a> {
         self.search_core(None, seeds, params.goal, &params, ctx)
     }
 
+    /// Dispatch once on the seed so both loop bodies compile without the per-edge
+    /// seed branch (see [`JitterPolicy`]).
     fn search_core(
         &self,
         origin: Option<u32>,
@@ -382,6 +428,21 @@ impl<'a> EngineView<'a> {
         goal_id: u32,
         params: &SearchParams,
         ctx: &mut SearchContext,
+    ) -> SearchResult {
+        match params.seed {
+            Some(s) => self.search_core_impl(origin, seeds, goal_id, params, ctx, SeededJitter(s)),
+            None => self.search_core_impl(origin, seeds, goal_id, params, ctx, NoJitter),
+        }
+    }
+
+    fn search_core_impl<J: JitterPolicy>(
+        &self,
+        origin: Option<u32>,
+        seeds: &[(u32, f32)],
+        goal_id: u32,
+        params: &SearchParams,
+        ctx: &mut SearchContext,
+        jit: J,
     ) -> SearchResult {
         let n = self.nodes;
         let goal = goal_id as usize;
@@ -423,10 +484,7 @@ impl<'a> EngineView<'a> {
             // here instead of merging them into every pop's neighbor stream.
             for &(dst, w) in self.extra.global.iter() {
                 if dst as usize >= n { continue; }
-                let w_jittered = match params.seed {
-                    Some(seed) => w + edge_jitter(seed, start_id, dst),
-                    None => w,
-                };
+                let w_jittered = jit.w(start_id, dst, w);
                 if w_jittered < ctx.get_g(dst as usize) {
                     ctx.set_g(dst as usize, w_jittered);
                     ctx.set_parent(dst as usize, start_id);
@@ -466,7 +524,7 @@ impl<'a> EngineView<'a> {
             let u = id as usize;
             // Overlap the NEXT iteration's stale-check load with this expansion.
             if let Some(k) = ctx.open.peek() {
-                prefetch_node(&ctx.nodes, k.id);
+                prefetch_node(&ctx.hot, k.id);
             }
             // Lazy-deletion: skip heap entries that were superseded by a better g.
             if gcur > ctx.get_g(u) { continue; }
@@ -499,28 +557,26 @@ impl<'a> EngineView<'a> {
             // record through a single borrow instead of four accessor round-trips.
             let mut relax = |v_id: u32, w: f32, ctx: &mut SearchContext| {
                 let v = v_id as usize;
-                // Add deterministic jitter if seed is provided
-                let w_jittered = match params.seed {
-                    Some(seed) => w + edge_jitter(seed, id, v_id),
-                    None => w,
-                };
+                let w_jittered = jit.w(id, v_id, w);
                 let ng = gcur + w_jittered;
                 let gen = ctx.generation;
-                let st = &mut ctx.nodes[v];
-                let cur_g = if st.gen == gen { st.g } else { f32::INFINITY };
+                let hot = &mut ctx.hot[v];
+                let cur_g = if hot.gen == gen { hot.g } else { f32::INFINITY };
                 if ng < cur_g {
-                    if st.gen != gen {
-                        st.gen = gen;
-                        st.h = f32::NAN;
+                    let fresh = hot.gen != gen;
+                    hot.gen = gen;
+                    hot.g = ng;
+                    let cold = &mut ctx.cold[v];
+                    if fresh {
+                        cold.h = f32::NAN;
                     }
-                    st.g = ng;
-                    st.parent = id;
-                    let hv = if st.h.is_nan() {
+                    cold.parent = id;
+                    let hv = if cold.h.is_nan() {
                         let hh = h(v_id);
-                        st.h = hh;
+                        cold.h = hh;
                         hh
                     } else {
-                        st.h
+                        cold.h
                     };
                     if hv.is_finite() {
                         if v == goal {
@@ -538,7 +594,7 @@ impl<'a> EngineView<'a> {
                 // Canonical strict-domination pruning: relax only the successor bits
                 // for the stored parent's incoming direction, resolved to CSR slots in
                 // O(1); weights derive from the direction bit (0-3 cardinal).
-                let parent = ctx.nodes[u].parent;
+                let parent = ctx.cold[u].parent;
                 let mask = cg.masks[u];
                 let mut bits = cg.succ_bits(id, parent, coords) & mask;
                 let s0 = offsets[u] as usize;
@@ -550,11 +606,11 @@ impl<'a> EngineView<'a> {
                     relax(dst[slot], w, ctx);
                 }
             } else {
-                // Issue all neighbor NodeState loads up front: the relax loop's
+                // Issue all neighbor hot-state loads up front: the relax loop's
                 // improving branch is data-dependent, so hardware alone cannot keep 8
                 // misses in flight across mispredicts.
                 for &d in self.walk.neighbor_ids(id) {
-                    prefetch_node(&ctx.nodes, d);
+                    prefetch_node(&ctx.hot, d);
                 }
                 self.walk.for_each_neighbor(id, |v_id, w| relax(v_id, w, ctx));
             }
@@ -638,6 +694,7 @@ impl<'a> EngineView<'a> {
         self.bidir_core(None, seeds, bp, params, ctx_f, ctx_b)
     }
 
+    /// Dispatch once on the seed (see [`JitterPolicy`] / `search_core`).
     fn bidir_core(
         &self,
         origin: Option<u32>,
@@ -646,6 +703,23 @@ impl<'a> EngineView<'a> {
         params: SearchParams,
         ctx_f: &mut SearchContext,
         ctx_b: &mut SearchContext,
+    ) -> SearchResult {
+        match params.seed {
+            Some(s) => self.bidir_core_impl(origin, seeds, bp, params, ctx_f, ctx_b, SeededJitter(s)),
+            None => self.bidir_core_impl(origin, seeds, bp, params, ctx_f, ctx_b, NoJitter),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bidir_core_impl<J: JitterPolicy>(
+        &self,
+        origin: Option<u32>,
+        seeds: &[(u32, f32)],
+        bp: &BidirParams,
+        params: SearchParams,
+        ctx_f: &mut SearchContext,
+        ctx_b: &mut SearchContext,
+        jit: J,
     ) -> SearchResult {
         let n = self.nodes;
         let goal_id = params.goal;
@@ -695,10 +769,7 @@ impl<'a> EngineView<'a> {
             }
             for &(dst, w) in self.extra.global.iter() {
                 if dst as usize >= n { continue; }
-                let w_j = match params.seed {
-                    Some(seed) => w + edge_jitter(seed, origin_id, dst),
-                    None => w,
-                };
+                let w_j = jit.w(origin_id, dst, w);
                 if w_j < ctx_f.get_g(dst as usize) {
                     ctx_f.set_g(dst as usize, w_j);
                     ctx_f.set_parent(dst as usize, origin_id);
@@ -767,9 +838,9 @@ impl<'a> EngineView<'a> {
             };
             // Overlap the chosen side's NEXT stale-check load with this expansion.
             if forward {
-                if let Some(k) = ctx_f.open.peek() { prefetch_node(&ctx_f.nodes, k.id); }
+                if let Some(k) = ctx_f.open.peek() { prefetch_node(&ctx_f.hot, k.id); }
             } else if let Some(k) = ctx_b.open.peek() {
-                prefetch_node(&ctx_b.nodes, k.id);
+                prefetch_node(&ctx_b.hot, k.id);
             }
             let u = id as usize;
             // Lazy-deletion: an entry superseded by a better g is not an expansion, so it
@@ -803,35 +874,34 @@ impl<'a> EngineView<'a> {
                 // (already-updated) meeting cost mu can never be expanded before the
                 // MM stop rule fires — mu only decreases after the decision, so the
                 // prune is pop-sequence-invariant, hence bit-exact.
-                let mut relax = |v_id: u32, w: f32, ctx: &mut SearchContext, other: &SearchContext,
+                let relax = |v_id: u32, w: f32, ctx: &mut SearchContext, other: &SearchContext,
                              mu: &mut f32, meet: &mut Option<u32>| {
                     let v = v_id as usize;
-                    let w_j = match params.seed {
-                        Some(seed) => w + edge_jitter(seed, id, v_id),
-                        None => w,
-                    };
+                    let w_j = jit.w(id, v_id, w);
                     let ng = gcur + w_j;
                     let gen = ctx.generation;
-                    let st = &mut ctx.nodes[v];
-                    let cur_g = if st.gen == gen { st.g } else { f32::INFINITY };
+                    let hot = &mut ctx.hot[v];
+                    let cur_g = if hot.gen == gen { hot.g } else { f32::INFINITY };
                     if ng < cur_g {
-                        if st.gen != gen {
-                            st.gen = gen;
-                            st.h = f32::NAN;
+                        let fresh = hot.gen != gen;
+                        hot.gen = gen;
+                        hot.g = ng;
+                        let cold = &mut ctx.cold[v];
+                        if fresh {
+                            cold.h = f32::NAN;
                         }
-                        st.g = ng;
-                        st.parent = id;
+                        cold.parent = id;
                         let og = other.get_g(v);
                         if og.is_finite() && ng + og < *mu {
                             *mu = ng + og;
                             *meet = Some(v_id);
                         }
-                        let hv = if st.h.is_nan() {
+                        let hv = if cold.h.is_nan() {
                             let hh = h_f(v_id);
-                            st.h = hh;
+                            cold.h = hh;
                             hh
                         } else {
-                            st.h
+                            cold.h
                         };
                         if hv.is_finite() {
                             let pr = (ng + hv).max(2.0 * ng);
@@ -842,7 +912,7 @@ impl<'a> EngineView<'a> {
                     }
                 };
                 if let Some((cg, coords, offsets, dst)) = canon {
-                    let parent = ctx_f.nodes[u].parent;
+                    let parent = ctx_f.cold[u].parent;
                     let mask = cg.masks[u];
                     let mut bits = cg.succ_bits(id, parent, coords) & mask;
                     let s0 = offsets[u] as usize;
@@ -855,7 +925,7 @@ impl<'a> EngineView<'a> {
                     }
                 } else {
                     for &d in self.walk.neighbor_ids(id) {
-                        prefetch_node(&ctx_f.nodes, d);
+                        prefetch_node(&ctx_f.hot, d);
                     }
                     self.walk.for_each_neighbor(id, |v_id, w| {
                         relax(v_id, w, ctx_f, ctx_b, &mut mu, &mut meet)
@@ -880,37 +950,36 @@ impl<'a> EngineView<'a> {
                         && self.extra.fairy_sources.binary_search(&id).is_ok()
                     { fairy_cost_of(id) } else { None };
 
-                let mut relax = |y_id: u32, w: f32, ctx: &mut SearchContext, other: &SearchContext,
+                let relax = |y_id: u32, w: f32, ctx: &mut SearchContext, other: &SearchContext,
                              mu: &mut f32, meet: &mut Option<u32>| {
                     let y = y_id as usize;
                     // Forward edge identity is (y -> id): jitter must match the forward
                     // search's pricing of the same physical edge.
-                    let w_j = match params.seed {
-                        Some(seed) => w + edge_jitter(seed, y_id, id),
-                        None => w,
-                    };
+                    let w_j = jit.w(y_id, id, w);
                     let ng = gcur + w_j;
                     let gen = ctx.generation;
-                    let st = &mut ctx.nodes[y];
-                    let cur_g = if st.gen == gen { st.g } else { f32::INFINITY };
+                    let hot = &mut ctx.hot[y];
+                    let cur_g = if hot.gen == gen { hot.g } else { f32::INFINITY };
                     if ng < cur_g {
-                        if st.gen != gen {
-                            st.gen = gen;
-                            st.h = f32::NAN;
+                        let fresh = hot.gen != gen;
+                        hot.gen = gen;
+                        hot.g = ng;
+                        let cold = &mut ctx.cold[y];
+                        if fresh {
+                            cold.h = f32::NAN;
                         }
-                        st.g = ng;
-                        st.parent = id;
+                        cold.parent = id;
                         let og = other.get_g(y);
                         if og.is_finite() && ng + og < *mu {
                             *mu = ng + og;
                             *meet = Some(y_id);
                         }
-                        let hv = if st.h.is_nan() {
+                        let hv = if cold.h.is_nan() {
                             let hh = h_b(y_id);
-                            st.h = hh;
+                            cold.h = hh;
                             hh
                         } else {
-                            st.h
+                            cold.h
                         };
                         if hv.is_finite() {
                             let pr = (ng + hv).max(2.0 * ng);
@@ -926,7 +995,7 @@ impl<'a> EngineView<'a> {
                     // Walk symmetry (builder-asserted) makes the same table valid for
                     // the reversed graph: predecessors == successors, direction taken
                     // from the backward parent exactly as forward.
-                    let parent = ctx_b.nodes[u].parent;
+                    let parent = ctx_b.cold[u].parent;
                     let mask = cg.masks[u];
                     let mut bits = cg.succ_bits(id, parent, coords) & mask;
                     let s0 = offsets[u] as usize;
@@ -939,7 +1008,7 @@ impl<'a> EngineView<'a> {
                     }
                 } else {
                     for &d in self.walk.neighbor_ids(id) {
-                        prefetch_node(&ctx_b.nodes, d);
+                        prefetch_node(&ctx_b.hot, d);
                     }
                     self.walk.for_each_neighbor(id, |y_id, w| {
                         relax(y_id, w, ctx_b, ctx_f, &mut mu, &mut meet)
@@ -1038,7 +1107,7 @@ mod tests {
         let walk_dst = [1u32, 2, 3];
         let walk_w = [1.0f32, 1.0, 1.0];
         let mut view = line_view(&walk_src, &walk_dst, &walk_w, &[], &[], &[], 4);
-        view.extra.global = vec![(3, 1.5)];
+        view.extra.global = vec![(3, 1.5)].into();
         let mut ctx = SearchContext::new(4);
         let res = view.astar(SearchParams { start: 0, goal: 3, macro_filter: None, seed: None, max_pops: None, cancel: None, bucket_ms: 0.0 }, &mut ctx);
         assert!(res.found);
@@ -1053,8 +1122,8 @@ mod tests {
         let walk_dst = [1u32, 2];
         let walk_w = [1.0f32, 1.0];
         let mut view = line_view(&walk_src, &walk_dst, &walk_w, &[], &[], &[], 4);
-        view.extra.fairy_sources = vec![1, 3];
-        view.extra.fairy_dests = vec![(1, 0.25), (3, 0.25)];
+        view.extra.fairy_sources = vec![1, 3].into();
+        view.extra.fairy_dests = vec![(1, 0.25), (3, 0.25)].into();
         let mut ctx = SearchContext::new(4);
         let res = view.astar(SearchParams { start: 0, goal: 3, macro_filter: None, seed: None, max_pops: None, cancel: None, bucket_ms: 0.0 }, &mut ctx);
         assert!(res.found);
@@ -1092,8 +1161,8 @@ mod tests {
         let walk_dst = [1u32, 2];
         let walk_w = [1.0f32, 1.0];
         let mut view = line_view(&walk_src, &walk_dst, &walk_w, &[], &[], &[], 4);
-        view.extra.fairy_sources = vec![1, 3];
-        view.extra.fairy_dests = vec![(1, 0.25), (3, 0.25)];
+        view.extra.fairy_sources = vec![1, 3].into();
+        view.extra.fairy_dests = vec![(1, 0.25), (3, 0.25)].into();
         let mut ctx = SearchContext::new(4);
         let params = SearchParams { start: 3, goal: 3, macro_filter: None, seed: None, max_pops: None, cancel: None, bucket_ms: 0.0 };
         let res = view.astar_multi(&[(0, 2.0)], params, &mut ctx);
@@ -1163,9 +1232,9 @@ mod tests {
             ws.push(b); wd.push(a); ww.push(1.0);
         }
         let mut view = line_view(&ws, &wd, &ww, &[], &[], &[], 4);
-        view.extra.global = vec![(3, 1.5)];
-        view.extra.fairy_sources = vec![1, 3];
-        view.extra.fairy_dests = vec![(1, 0.25), (3, 0.25)];
+        view.extra.global = vec![(3, 1.5)].into();
+        view.extra.fairy_sources = vec![1, 3].into();
+        view.extra.fairy_dests = vec![(1, 0.25), (3, 0.25)].into();
         let mut ctx = SearchContext::new(4);
         for (s, g) in [(0u32, 3u32), (0, 2), (3, 0), (2, 0)] {
             let uni = view.astar(SearchParams { start: s, goal: g, macro_filter: None, seed: None, max_pops: None, cancel: None, bucket_ms: 0.0 }, &mut ctx);
@@ -1260,8 +1329,8 @@ mod tests {
             ws.push(b); wd.push(a); ww.push(1.0);
         }
         let mut view = line_view(&ws, &wd, &ww, &[], &[], &[], 4);
-        view.extra.fairy_sources = vec![1, 3];
-        view.extra.fairy_dests = vec![(1, 0.25), (3, 0.25)];
+        view.extra.fairy_sources = vec![1, 3].into();
+        view.extra.fairy_dests = vec![(1, 0.25), (3, 0.25)].into();
         let macros_rev = NeighborProvider::new(4, &[], &[], &[]);
         let bp = BidirParams { macros_rev: &macros_rev, macro_filter_rev: None };
         let mut cf = SearchContext::new(4);
@@ -1328,7 +1397,7 @@ mod tests {
         let walk_dst = [1u32, 2, 3];
         let walk_w = [1.0f32, 1.0, 1.0];
         let mut view = line_view(&walk_src, &walk_dst, &walk_w, &[], &[], &[], 4);
-        view.extra.global = vec![(3, 10.0)];
+        view.extra.global = vec![(3, 10.0)].into();
         let mut ctx = SearchContext::new(4);
 
         let truncated = view.astar(
@@ -1361,7 +1430,7 @@ mod tests {
             ws.push(b); wd.push(a); ww.push(1.0);
         }
         let mut view = line_view(&ws, &wd, &ww, &[], &[], &[], 4);
-        view.extra.global = vec![(3, 10.0)];
+        view.extra.global = vec![(3, 10.0)].into();
 
         let truncated = {
             let macros_rev = NeighborProvider::new(4, &[], &[], &[]);

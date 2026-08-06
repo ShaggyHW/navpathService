@@ -49,13 +49,13 @@ fn main() {
     println!("start node {s}, goal node {g}, landmarks {}", snap.counts().landmarks);
 
     let mut view = EngineView::from_snapshot(&snap);
-    view.extra.global = parse_globals(&snap);
+    view.extra.global = parse_globals(&snap).into();
     let mut sources: Vec<u32> = snap.fairy_nodes().to_vec();
     sources.sort_unstable();
     let mut dests: Vec<(u32, f32)> = snap.fairy_nodes().iter().zip(snap.fairy_cost_ms().iter()).map(|(&n, &c)| (n, c)).collect();
     dests.sort_unstable_by(|x, y| x.0.cmp(&y.0));
-    view.extra.fairy_sources = sources;
-    view.extra.fairy_dests = dests;
+    view.extra.fairy_sources = sources.into();
+    view.extra.fairy_dests = dests.into();
 
     // h quality at the start
     let active = view.lm.select_active(s, g, ACTIVE_LANDMARKS);
@@ -79,9 +79,9 @@ fn main() {
     let bib = view.astar_bidir(&bp, p(Some(500_000)), &mut cf, &mut cb);
     println!("bidir@500k: found={} status={:?} pops={} time={:?}", bib.found, bib.status, bib.pops, t.elapsed());
     // Also without any teleports (pure walk) for h_f sanity
-    view.extra.global.clear();
-    view.extra.fairy_sources.clear();
-    view.extra.fairy_dests.clear();
+    view.extra.global = Default::default();
+    view.extra.fairy_sources = Default::default();
+    view.extra.fairy_dests = Default::default();
     let t = std::time::Instant::now();
     let plain = view.astar(p(None), &mut ctx);
     println!("walk-only uni: found={} cost={:.0} pops={} time={:?}", plain.found, plain.cost, plain.pops, t.elapsed());

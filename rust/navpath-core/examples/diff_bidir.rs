@@ -47,7 +47,7 @@ fn main() {
     let nodes = snap.counts().nodes as usize;
 
     let mut view = EngineView::from_snapshot(&snap);
-    view.extra.global = parse_globals(&snap);
+    view.extra.global = parse_globals(&snap).into();
     // Fairy clique from the snapshot (all rings, mirroring an all-eligible profile).
     let mut sources: Vec<u32> = snap.fairy_nodes().to_vec();
     sources.sort_unstable();
@@ -58,8 +58,8 @@ fn main() {
         .map(|(&n, &c)| (n, c))
         .collect();
     dests.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    view.extra.fairy_sources = sources;
-    view.extra.fairy_dests = dests;
+    view.extra.fairy_sources = sources.into();
+    view.extra.fairy_dests = dests.into();
 
     // Reversed macro provider from the snapshot's raw arrays.
     let macros_rev = NeighborProvider::new(nodes, snap.macro_dst(), snap.macro_src(), snap.macro_w());

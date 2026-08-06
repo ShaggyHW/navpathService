@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use navpath_core::{EngineView, SearchParams, SearchResult, SearchStatus, Snapshot, NeighborProvider};
 use navpath_core::engine::canonical::CanonicalGrid;
@@ -569,7 +570,7 @@ fn kind_code(kind: &str) -> u32 {
     }
 }
 
-pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, NeighborProvider, Vec<GlobalTeleport>, HashMap<(u32, u32), Vec<u32>>) {
+pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, NeighborProvider, Vec<GlobalTeleport>, FxHashMap<(u32, u32), Vec<u32>>) {
     // 1. Build map of req_id -> tag_index
     let req_words: &[u32] = snapshot.req_tags();
     let mut id_to_idx = std::collections::HashMap::new();
@@ -585,7 +586,7 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Neighb
     let len = msrc.len();
     let mut macro_reqs: Vec<Vec<usize>> = Vec::with_capacity(len);
     let mut globals: Vec<GlobalTeleport> = Vec::new();
-    let mut macro_lookup: HashMap<(u32, u32), Vec<u32>> = HashMap::with_capacity(len);
+    let mut macro_lookup: FxHashMap<(u32, u32), Vec<u32>> = FxHashMap::with_capacity_and_hasher(len, Default::default());
     
     let msrc_vec: &[u32] = msrc;
     let mdst_vec: &[u32] = snapshot.macro_dst();
@@ -687,7 +688,7 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Neighb
 
 /// Build fairy ring runtime data from snapshot.
 /// Returns: (Vec<FairyRing>, HashMap<node_id, ring_index>)
-pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, HashMap<u32, usize>) {
+pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, FxHashMap<u32, usize>) {
     // Build req_id -> tag_index map
     let req_words: &[u32] = snapshot.req_tags();
     let mut id_to_idx: HashMap<u32, usize> = HashMap::new();
@@ -700,7 +701,7 @@ pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, HashMap<u32, u
 
     let fairy_count = snapshot.counts().fairy_rings as usize;
     let mut rings: Vec<FairyRing> = Vec::with_capacity(fairy_count);
-    let mut node_to_ring: HashMap<u32, usize> = HashMap::with_capacity(fairy_count);
+    let mut node_to_ring: FxHashMap<u32, usize> = FxHashMap::with_capacity_and_hasher(fairy_count, Default::default());
     let mut missing_req_ids: u64 = 0;
 
     let nodes = snapshot.fairy_nodes();
@@ -831,9 +832,9 @@ pub fn run_route_with_requirements_and_fairy_rings(
     // relaxes them once from the start, so they never enter per-pop neighbor merges),
     // fairy sources/dests, and the folded macro filters — all pre-sorted exactly as the
     // engine expects (see build_profile_artifacts).
-    view.extra.global = artifacts.eligible_globals.clone();
-    view.extra.fairy_sources = artifacts.fairy_sources.clone();
-    view.extra.fairy_dests = artifacts.fairy_dests.clone();
+    view.extra.global = std::borrow::Cow::Borrowed(artifacts.eligible_globals.as_slice());
+    view.extra.fairy_sources = std::borrow::Cow::Borrowed(artifacts.fairy_sources.as_slice());
+    view.extra.fairy_dests = std::borrow::Cow::Borrowed(artifacts.fairy_dests.as_slice());
 
     let macro_filter = &artifacts.macro_filter;
 
@@ -933,8 +934,8 @@ pub fn run_route_with_requirements_virtual_start(
         coords: Some(snap_ref.coords_packed()),
         canonical,
     };
-    view.extra.fairy_sources = artifacts.fairy_sources.clone();
-    view.extra.fairy_dests = artifacts.fairy_dests.clone();
+    view.extra.fairy_sources = std::borrow::Cow::Borrowed(artifacts.fairy_sources.as_slice());
+    view.extra.fairy_dests = std::borrow::Cow::Borrowed(artifacts.fairy_dests.as_slice());
 
     let macro_filter = &artifacts.macro_filter;
 

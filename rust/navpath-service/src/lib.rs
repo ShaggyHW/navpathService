@@ -1,9 +1,13 @@
-use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
+use std::{num::NonZeroUsize, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
 
 use arc_swap::ArcSwap;
 use axum::{routing::{get, post}, Router};
 use navpath_core::engine::search::SearchContext;
 use navpath_core::{Snapshot, NeighborProvider};
+/// FxHash maps for the id-keyed lookup tables probed on payload/search setup paths
+/// (`macro_lookup` alone is probed once per path window): u32/u64 keys, non-adversarial,
+/// so SipHash buys nothing here.
+pub use rustc_hash::FxHashMap;
 
 use crate::engine_adapter::{GlobalTeleport, FairyRing};
 
@@ -121,6 +125,21 @@ pub fn new_profile_cache() -> Arc<ProfileCache> {
     )))
 }
 
+/// Requirement id -> tag index from the snapshot's 4-word `req_tags` records.
+/// Empty when no snapshot is loaded.
+pub fn build_req_tag_index(snapshot: Option<&Snapshot>) -> FxHashMap<u32, usize> {
+    let mut map = FxHashMap::default();
+    if let Some(s) = snapshot {
+        let req_words: &[u32] = s.req_tags();
+        let mut i = 0usize;
+        while i + 3 < req_words.len() {
+            map.insert(req_words[i], i / 4);
+            i += 4;
+        }
+    }
+    map
+}
+
 #[derive(Clone)]
 pub struct SnapshotState {
     pub path: PathBuf,
@@ -129,7 +148,10 @@ pub struct SnapshotState {
     /// Reversed macro adjacency for bidirectional searches.
     pub neighbors_rev: Option<Arc<NeighborProvider>>,
     pub globals: Arc<Vec<GlobalTeleport>>, // dst, cost, reqs (indices)
-    pub macro_lookup: Arc<HashMap<(u32, u32), Vec<u32>>>,
+    pub macro_lookup: Arc<FxHashMap<(u32, u32), Vec<u32>>>,
+    /// Requirement id -> tag index, derived from the snapshot's `req_tags` section once
+    /// at load (previously rebuilt on every payload).
+    pub req_tag_index: Arc<FxHashMap<u32, usize>>,
     pub loaded_at_unix: u64,
     pub snapshot_hash_hex: Option<String>,
     /// Per-snapshot route result cache (None = disabled). Dropped on snapshot swap.
@@ -139,7 +161,7 @@ pub struct SnapshotState {
     pub seed_shadow: Option<Arc<SeedShadow>>,
     // Fairy Ring data
     pub fairy_rings: Arc<Vec<FairyRing>>,
-    pub node_to_fairy_ring: Arc<HashMap<u32, usize>>,
+    pub node_to_fairy_ring: Arc<FxHashMap<u32, usize>>,
     /// Condensed special-edge graph over walk components for the exact reachability
     /// precheck (roadmap 4.1). None when no snapshot is loaded.
     pub comp_graph: Option<Arc<engine_adapter::ComponentGraph>>,

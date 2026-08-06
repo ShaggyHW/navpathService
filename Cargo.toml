@@ -27,3 +27,9 @@ strip = "none"
 inherits = "release"
 panic = "unwind"
 strip = "none"
+
+# Engine iteration speed (roadmap 9.8): examples/benches are usable in the dev profile
+# because the engine crate itself is optimized, without paying the release profile's
+# fat-LTO + codegen-units=1 link on every edit. Test/debug code stays unoptimized.
+[profile.dev.package.navpath-core]
+opt-level = 3

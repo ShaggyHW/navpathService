@@ -119,13 +119,26 @@ curl -s http://127.0.0.1:8080/route \
 
 If no seed is provided, the same optimal path is always returned. With a seed, small random jitter is added to edge weights to explore alternative routes.
 
-**A seed costs you the cache.** The route cache is keyed on the seed, so a client that
-sends a fresh random seed per request never hits it — every request pays a full search.
-Seeded searches also expand ~1.5-3x more heap pops than unseeded ones (jitter breaks the
-exact f-value ties the engine relies on, and it disables canonical pruning outright), for
-a path that differs only in which of several *equal-cost* routes is chosen. If you don't
-need per-request variety, drop the seed. If you want variety **and** the cache, see
-`NAVPATH_CACHE_IGNORE_SEED` below.
+**A seed costs you the search, and (under the legacy cache policy) the cache.** Seeded
+searches expand ~1.5-3x more heap pops than unseeded ones (jitter breaks the exact
+f-value ties the engine relies on, and it disables canonical pruning outright), for a
+path that differs only in which of several *equal-cost* routes is chosen. Since
+2026-08-06 the cache is **seed-blind by default** (`NAVPATH_CACHE_IGNORE_SEED=1`):
+repeat traffic with varying seeds is served the cached path, so only the *first*
+request for a pair pays the seeded search. Set `NAVPATH_CACHE_IGNORE_SEED=0` to
+restore per-seed cache keys (per-seed tie variety on repeats, at ~100x the repeat
+latency). If you don't need variety at all, drop the seed — unseeded searches are also
+the only ones canonical pruning accelerates.
+
+**Server-side kill switch:** start the service with `--no-seed` (or
+`NAVPATH_IGNORE_SEED=1`) to ignore client seeds entirely. Every request is answered
+with the deterministic unseeded optimum — no edge jitter, canonical pruning engages,
+the seeded retry rungs never run — and responses to requests that did send a seed
+carry `degraded: "seed_ignored"`. `/stats` reports `seeding_disabled: true`.
+
+```sh
+cargo run -p navpath-service --release -- --no-seed
+```
 
 ## Route cache
 
@@ -146,7 +159,7 @@ curl -s http://127.0.0.1:8080/stats | jq '{cache_hits, cache_miss_seed, cache_mi
 | `cache=` | meaning | what to do |
 |---|---|---|
 | `hit` | served from cache, no search ran | — |
-| `miss_seed` | same start/goal/profile is cached, only the **seed** differed | set `NAVPATH_CACHE_IGNORE_SEED=1`, or stop sending seeds |
+| `miss_seed` | same start/goal/profile is cached, only the **seed** differed (only possible with `NAVPATH_CACHE_IGNORE_SEED=0`) | leave the default seed-blind policy on, or stop sending seeds |
 | `miss_cold` | this start/goal/profile pair isn't cached | irreducible — no cache policy helps |
 | `off` | `NAVPATH_ROUTE_CACHE=0` | re-enable the cache |
 
@@ -162,7 +175,8 @@ same path.
 | `SNAPSHOT_PATH` | `./graph.snapshot` | Snapshot to serve. |
 | `NAVPATH_HOST` / `NAVPATH_PORT` | `127.0.0.1` / `8080` | Listen address. |
 | `NAVPATH_ROUTE_CACHE` | `2048` | Route-cache entries; `0` disables it. |
-| `NAVPATH_CACHE_IGNORE_SEED` | `0` | `1` drops `seed` from the cache key: any seed is served the cached path. Recovers the hit rate for varying-seed traffic; loses per-seed path variety (the paths only ever differed in equal-cost tie selection). |
+| `NAVPATH_CACHE_IGNORE_SEED` | `1` | Seed-blind cache keys (default since 2026-08-06): any seed is served the cached path — recovers the hit rate for varying-seed traffic. `0` restores per-seed keys (per-seed tie variety on repeats; the paths only ever differed in equal-cost tie selection). |
+| `NAVPATH_IGNORE_SEED` | `0` | `1` (or the `--no-seed` flag) ignores client seeds entirely: all searches run unseeded (no jitter, canonical pruning engages); seeded requests are answered with `degraded: "seed_ignored"`. |
 | `NAVPATH_ROUTE_TIMEOUT_MS` | `10000` | Per-request wall-clock deadline (`0` = effectively none); a breach returns 504. |
 | `NAVPATH_MAX_CONCURRENT_SEARCHES` | CPU count | Concurrent searches; excess requests get 503 rather than queueing. |
 | `NAVPATH_MAX_POPS` | `max(1.5M, nodes/2)` | First-attempt pop budget (`0` = unbounded). |
