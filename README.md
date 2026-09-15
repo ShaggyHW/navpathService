@@ -22,6 +22,13 @@ cargo run -p navpath-builder --release --   --sqlite /home/query/Dev/rs3cache_ex
 
 UPDATE THE PATH TO YOUR ONW
 
+Every build also writes `walkableTiles.bin` next to the snapshot (`--out-walkable PATH`
+to move it, `--no-walkable` to skip): a ~400 KB coordinate-keyed presence bitmap of the
+same tile set `/tile/exists` answers from — `"WTIL"`, version u8, chunk count u32 LE, then
+per populated 64x64 region `plane u8, rx u16, ry u16, bitmap[512]` (bit `(y%64)*64 + x%64`,
+LSB first). Copy it into Hoor2 (`launcher/payload/resources/walkableTiles.bin`) so
+`Area.getRandomWalkableTile()` can answer offline without hitting the service.
+
 export SNAPSHOT_PATH=/home/query/Dev/navpathService/graph.snapshot 
 export NAVPATH_HOST=127.0.0.1
 export NAVPATH_PORT=8080

@@ -35,6 +35,16 @@ struct Args {
     #[arg(long = "out-tiles", value_name = "PATH")] 
     out_tiles: Option<PathBuf>,
 
+    /// walkableTiles.bin output: a coordinate-keyed presence bitmap of every tile in the
+    /// DB (the same set `/tile/exists` answers from), small enough to ship inside a client.
+    /// Defaults to `walkableTiles.bin` next to the snapshot; `--no-walkable` skips it.
+    #[arg(long = "out-walkable", value_name = "PATH")] 
+    out_walkable: Option<PathBuf>,
+
+    /// Skip writing walkableTiles.bin
+    #[arg(long = "no-walkable", default_value_t = false)] 
+    no_walkable: bool,
+
     /// Landmark count (simple selection for now)
     #[arg(long = "landmarks", value_name = "N", default_value_t = 0)] 
     landmarks: u32,
@@ -758,5 +768,54 @@ fn main() -> Result<()> {
         info!(path = ?out_tiles, bytes = tiles.len(), "wrote tiles.bin");
     }
 
+    if !args.no_walkable {
+        let out_walkable = args
+            .out_walkable
+            .unwrap_or_else(|| args.out_snapshot.with_file_name("walkableTiles.bin"));
+        let bytes = encode_walkable_tiles(&tiles);
+        let mut f = File::create(&out_walkable)
+            .with_context(|| format!("creating {:?}", out_walkable))?;
+        f.write_all(&bytes)?;
+        f.flush()?;
+        info!(path = ?out_walkable, bytes = bytes.len(), tiles = tiles.len(), "wrote walkableTiles.bin");
+    }
+
     Ok(())
+}
+
+/// walkableTiles.bin, version 1 (all integers little-endian):
+///
+/// ```text
+/// magic   "WTIL"                    4 bytes
+/// version u8 = 1
+/// chunks  u32                       number of 64x64 chunks that follow
+/// chunk*  plane u8, rx u16, ry u16  region coords (rx = x / 64, ry = y / 64)
+///         bitmap [u8; 512]          bit i = (y % 64) * 64 + (x % 64), LSB first;
+///                                   set iff the tile is in the DB (walkable)
+/// ```
+///
+/// Chunks are sorted by (plane, ry, rx) and only non-empty ones are written, so the file
+/// is ~517 bytes per populated region (~400 KB for the whole world). Presence is the
+/// `/tile/exists` set: every DB row, including the handful of teleport-only tiles whose
+/// walk_mask is 0. Consumed by Hoor2's `WalkMap` (Area.getRandomWalkableTile()).
+fn encode_walkable_tiles(tiles: &[build::load_sqlite::Tile]) -> Vec<u8> {
+    use std::collections::BTreeMap;
+    let mut chunks: BTreeMap<(u8, u16, u16), [u8; 512]> = BTreeMap::new();
+    for t in tiles {
+        let key = (t.plane as u8, (t.y / 64) as u16, (t.x / 64) as u16);
+        let bm = chunks.entry(key).or_insert([0u8; 512]);
+        let i = ((t.y % 64) * 64 + (t.x % 64)) as usize;
+        bm[i / 8] |= 1 << (i % 8);
+    }
+    let mut out = Vec::with_capacity(9 + chunks.len() * 517);
+    out.extend_from_slice(b"WTIL");
+    out.push(1);
+    out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    for ((plane, ry, rx), bm) in &chunks {
+        out.push(*plane);
+        out.extend_from_slice(&rx.to_le_bytes());
+        out.extend_from_slice(&ry.to_le_bytes());
+        out.extend_from_slice(bm);
+    }
+    out
 }
