@@ -109,6 +109,12 @@ pub struct SearchResult {
     /// above the forward one on a slow query is the weak-backward-bound signature
     /// (roadmap 4.2) — the signal the bidir/uni demotion policy is tuned against.
     pub pops_b: u32,
+    /// Cumulative cost from the origin at each `path` node (same length as `path`;
+    /// `path_g[0]` is 0 for on-graph starts, the seed cost for multi-source searches,
+    /// and `path_g.last() == cost`). Lets the service serve any sub-path of a cached
+    /// optimal path — a sub-path of a shortest path is a shortest path — with the exact
+    /// cost `path_g[j] - path_g[i]`, no re-costing.
+    pub path_g: Vec<f32>,
 }
 
 impl SearchResult {
@@ -117,6 +123,7 @@ impl SearchResult {
             found: false,
             status,
             path: Vec::new(),
+            path_g: Vec::new(),
             cost: f32::INFINITY,
             pops: pops_f + pops_b,
             pops_f,
@@ -275,6 +282,31 @@ impl SearchContext {
             generation: 1,
             open: BinaryHeap::with_capacity(1024),
         }
+    }
+
+    /// Make every page of the state arrays resident (they are allocated as untouched
+    /// zero pages and would otherwise fault in during the first search that walks
+    /// them). Writes a zero to one byte per page, so the all-zero empty-state
+    /// invariant is preserved and the pool can pre-warm contexts at startup instead
+    /// of paying the fault storm (and, under THP direct compaction, 100+ ms stalls)
+    /// inside the first request on each blocking thread.
+    pub fn prefault(&mut self) {
+        const PAGE: usize = 4096;
+        fn touch<T>(v: &mut Vec<T>) {
+            let bytes = std::mem::size_of_val(v.as_slice());
+            let base = v.as_mut_ptr() as *mut u8;
+            let mut off = 0;
+            while off < bytes {
+                // SAFETY: `off < bytes`, so the pointer stays inside the allocation;
+                // the page is zero already (or holds live state whose byte at this
+                // offset is being rewritten with its own value only when the array is
+                // freshly zeroed, which is the only time prefault is called).
+                unsafe { std::ptr::write_volatile(base.add(off), 0u8) };
+                off += PAGE;
+            }
+        }
+        touch(&mut self.hot);
+        touch(&mut self.cold);
     }
 
     pub fn reset(&mut self, nodes: usize) {
@@ -629,26 +661,30 @@ impl<'a> EngineView<'a> {
             return SearchResult::not_found(ended.unwrap_or(SearchStatus::NotFound), pops, 0);
         }
         let mut path = Vec::new();
+        let mut path_g = Vec::new();
         let mut cur = goal_id;
         loop {
             if let Some(start_id) = origin {
                 if cur == start_id {
                     path.push(cur);
+                    path_g.push(ctx.get_g(cur as usize));
                     break;
                 }
             }
             path.push(cur);
+            path_g.push(ctx.get_g(cur as usize));
             let p = ctx.get_parent(cur as usize);
             if p == u32::MAX { break; }
             cur = p;
         }
         path.reverse();
+        path_g.reverse();
         // A budget/cancel break can land AFTER a path to the goal was discovered but
         // BEFORE the goal popped (i.e. before its cost was proven minimal) — e.g. a
         // global teleport seeds g(goal) at pop zero. Surface the truncation in the
         // status so callers can retry / refuse to cache instead of trusting the cost.
         let status = ended.unwrap_or(SearchStatus::Found);
-        SearchResult { found: true, status, path, cost: ctx.get_g(goal), pops, pops_f: pops, pops_b: 0 }
+        SearchResult { found: true, status, path, path_g, cost: ctx.get_g(goal), pops, pops_f: pops, pops_b: 0 }
     }
 }
 
@@ -727,7 +763,7 @@ impl<'a> EngineView<'a> {
         let bucket = params.bucket_ms;
 
         if origin == Some(goal_id) {
-            return SearchResult { found: true, status: SearchStatus::Found, path: vec![goal_id], cost: 0.0, pops: 0, pops_f: 0, pops_b: 0 };
+            return SearchResult { found: true, status: SearchStatus::Found, path: vec![goal_id], path_g: vec![0.0], cost: 0.0, pops: 0, pops_f: 0, pops_b: 0 };
         }
 
         ctx_f.reset(n);
@@ -1036,29 +1072,34 @@ impl<'a> EngineView<'a> {
         // Reconstruct origin/seed->meet from forward parents, meet->goal from backward
         // parents. Multi-source paths start at the winning seed (parent == u32::MAX).
         let mut path = Vec::new();
+        let mut path_g = Vec::new();
         let mut cur = m;
         loop {
             path.push(cur);
+            path_g.push(ctx_f.get_g(cur as usize));
             if origin == Some(cur) { break; }
             let p = ctx_f.get_parent(cur as usize);
             if p == u32::MAX { break; }
             cur = p;
         }
         path.reverse();
+        path_g.reverse();
+        let cost = ctx_f.get_g(m as usize) + ctx_b.get_g(m as usize);
         let mut cur = m;
         loop {
             let p = ctx_b.get_parent(cur as usize);
             if p == u32::MAX { break; }
             path.push(p);
+            // Origin-to-p cost along this path: total minus the backward remainder.
+            path_g.push(cost - ctx_b.get_g(p as usize));
             cur = p;
         }
-        let cost = ctx_f.get_g(m as usize) + ctx_b.get_g(m as usize);
         // MM records mu/meet at FIRST frontier contact (or immediately, when a global
         // teleport seed IS the goal) but proves optimality only at the stop rule; a
         // budget/cancel break inside that window leaves a valid-but-unproven meeting
         // path. Surface the truncation instead of reporting Found.
         let status = ended.unwrap_or(SearchStatus::Found);
-        SearchResult { found: true, status, path, cost, pops, pops_f, pops_b }
+        SearchResult { found: true, status, path, path_g, cost, pops, pops_f, pops_b }
     }
 }
 

@@ -90,6 +90,43 @@ impl Snapshot {
         Ok(Snapshot { mmap, manifest, alt_heap })
     }
 
+    /// Touch every page of the file mapping (and the optional ALT heap copy) so the
+    /// whole snapshot is resident before the first search. The mapping is opened with
+    /// `Advice::Random` on the ALT range, so without this every untouched 4 KB page is
+    /// a synchronous read inside a request: measured 50-90 µs per pop on cold map
+    /// regions vs 150-230 ns warm (docs/route_latency_improvements_2026-09-17.md §1.4).
+    /// Returns the number of bytes touched.
+    pub fn populate(&self) -> usize {
+        const PAGE: usize = 4096;
+        fn touch(bytes: &[u8]) -> u64 {
+            let mut acc = 0u64;
+            let mut off = 0;
+            while off < bytes.len() {
+                // SAFETY: `off < len`; volatile so the loads are not elided.
+                acc = acc.wrapping_add(unsafe { std::ptr::read_volatile(bytes.as_ptr().add(off)) } as u64);
+                off += PAGE;
+            }
+            acc
+        }
+        let mut n = self.mmap.len();
+        std::hint::black_box(touch(&self.mmap));
+        if let Some(h) = &self.alt_heap {
+            std::hint::black_box(touch(h));
+            n += h.len();
+        }
+        n
+    }
+
+    /// `mlock` the mapping so the page cache cannot evict it under memory pressure.
+    /// Fails (harmlessly) when `RLIMIT_MEMLOCK` is below the snapshot size.
+    pub fn lock_memory(&self) -> std::io::Result<()> {
+        self.mmap.lock()?;
+        if let Some(h) = &self.alt_heap {
+            h.lock()?;
+        }
+        Ok(())
+    }
+
     pub fn manifest(&self) -> &Manifest { &self.manifest }
     pub fn counts(&self) -> super::manifest::SnapshotCounts { self.manifest.counts }
 

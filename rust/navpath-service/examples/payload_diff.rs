@@ -21,6 +21,7 @@ use tower::ServiceExt;
 fn strip_volatile(v: &mut Value) {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("duration_ms");
+        obj.remove("duration_us");
     }
 }
 
@@ -62,11 +63,11 @@ async fn main() {
             node_to_fairy_ring: Arc::new(nfr),
             comp_graph: Some(Arc::new(cg)),
             canonical_grid: canon,
-            profile_cache: navpath_service::new_profile_cache(),
+            profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache(),
         })),
         search_permits: navpath_service::default_search_permits(),
         metrics: Arc::new(navpath_service::Metrics::default()),
-        ctx_pool: navpath_service::ContextPool::new(),
+        ctx_pool: navpath_service::ContextPool::new(), ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     let app = navpath_service::build_router(state);
 

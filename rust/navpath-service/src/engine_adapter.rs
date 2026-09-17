@@ -11,7 +11,7 @@ use navpath_core::engine::search::BidirParams;
 
 /// Empty "no path" result for early-exit paths in this module.
 fn not_found_result() -> SearchResult {
-    SearchResult { found: false, status: SearchStatus::NotFound, path: Vec::new(), cost: f32::INFINITY, pops: 0, pops_f: 0, pops_b: 0 }
+    SearchResult { found: false, status: SearchStatus::NotFound, path: Vec::new(), path_g: Vec::new(), cost: f32::INFINITY, pops: 0, pops_f: 0, pops_b: 0 }
 }
 use serde_json::Value as JsonValue;
 use navpath_core::eligibility::{fnv1a32, EligibilityMask};
@@ -24,13 +24,15 @@ use tracing::{info, warn};
 /// min-aggregates flatten map-wide on permissive profiles; MM then grinds a
 /// reverse-Dijkstra ball of cost-radius ~C*/2 where a strong-h forward search runs a
 /// corridor. Both engines are exact, so this only chooses which one runs.
-/// `NAVPATH_BIDIR_MIN_HB_RATIO`, default 0.5; `0` disables demotion (always bidir).
+/// `NAVPATH_BIDIR_MIN_HB_RATIO`, default 0 (always bidir) since 2026-09-17: the 0.5
+/// demotion measured 1.3-3x slower on long walk routes over 300 random pairs
+/// (docs/route_latency_improvements_2026-09-17.md §1.3). Set e.g. 0.5 to re-enable.
 fn bidir_min_hb_ratio() -> f32 {
     static R: OnceLock<f32> = OnceLock::new();
     *R.get_or_init(|| {
         std::env::var("NAVPATH_BIDIR_MIN_HB_RATIO").ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(0.5)
+            .unwrap_or(0.0)
     })
 }
 
@@ -122,7 +124,7 @@ pub fn build_canonical_grid(snapshot: &Snapshot) -> Option<Arc<CanonicalGrid>> {
 
 /// Whether normal routes use the bidirectional search (NAVPATH_BIDIR, default on;
 /// set 0 to fall back to unidirectional).
-fn bidir_enabled() -> bool {
+pub(crate) fn bidir_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(std::env::var("NAVPATH_BIDIR").ok().as_deref().map(str::trim), Some("0") | Some("false"))
@@ -192,6 +194,20 @@ pub struct SearchOutcome {
     /// rung of the retry ladder). Surfaced to clients as `degraded: "seed_dropped"` —
     /// previously this contract rewrite was silent.
     pub seed_dropped: bool,
+    /// Which engine produced `res`: "uni", "bidir", or "cache".
+    pub engine: &'static str,
+}
+
+/// Which engine a route runs on. `Policy` is the shipped selection (bidirectional unless
+/// `NAVPATH_BIDIR=0` or the `NAVPATH_BIDIR_MIN_HB_RATIO` demotion fires); `Uni` /
+/// `Bidir` force one side for the hedged race (`NAVPATH_RACE=1`), where both engines
+/// run concurrently and the first stable result wins. Both engines are exact, so the
+/// choice never changes the served cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineChoice {
+    Policy,
+    Uni,
+    Bidir,
 }
 
 /// Budget-retry ladder (roadmap 1.5). A `BudgetExceeded` first attempt earns:
@@ -206,10 +222,11 @@ fn retry_ladder(
     seed: Option<u64>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     nodes: usize,
+    engine: &'static str,
     mut search: impl FnMut(Option<u64>, Option<u32>) -> SearchResult,
 ) -> SearchOutcome {
     let Some(retry_pops) = budget_retry_pops(&first, seed, cancel, nodes) else {
-        return SearchOutcome { attempts_pops: [first.pops, 0, 0], retried: false, seed_dropped: false, res: first };
+        return SearchOutcome { attempts_pops: [first.pops, 0, 0], retried: false, seed_dropped: false, engine, res: first };
     };
     warn!(
         pops = first.pops, found = first.found, retry_pops, seeded = seed.is_some(),
@@ -218,24 +235,24 @@ fn retry_ladder(
     let second = search(seed, Some(retry_pops));
     let mut attempts_pops = [first.pops, second.pops, 0];
     if seed.is_none() || second.status == SearchStatus::Found {
-        return SearchOutcome { attempts_pops, retried: true, seed_dropped: false, res: better_of(first, second) };
+        return SearchOutcome { attempts_pops, retried: true, seed_dropped: false, engine, res: better_of(first, second) };
     }
     let best2 = better_of(first, second);
     if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
-        return SearchOutcome { attempts_pops, retried: true, seed_dropped: false, res: best2 };
+        return SearchOutcome { attempts_pops, retried: true, seed_dropped: false, engine, res: best2 };
     }
     warn!(retry_pops, "seeded retry also exhausted its budget; dropping the seed");
     let third = search(None, Some(retry_pops));
     attempts_pops[2] = third.pops;
     if third.status == SearchStatus::Found || (third.found && (!best2.found || third.cost < best2.cost)) {
-        return SearchOutcome { attempts_pops, retried: true, seed_dropped: true, res: third };
+        return SearchOutcome { attempts_pops, retried: true, seed_dropped: true, engine, res: third };
     }
     if !best2.found {
         // No rung found a path; the deeper search's verdict (e.g. a heap-exhausting
         // NotFound) is the most truthful one.
-        return SearchOutcome { attempts_pops, retried: true, seed_dropped: false, res: better_of(best2, third) };
+        return SearchOutcome { attempts_pops, retried: true, seed_dropped: false, engine, res: better_of(best2, third) };
     }
-    SearchOutcome { attempts_pops, retried: true, seed_dropped: false, res: best2 }
+    SearchOutcome { attempts_pops, retried: true, seed_dropped: false, engine, res: best2 }
 }
 
 /// Choose which of (first attempt, budget retry) to serve. A proven result always wins;
@@ -243,7 +260,7 @@ fn retry_ladder(
 /// truncated paths the cheaper wins. The retry is unseeded and proves optimality on the
 /// base graph, so a `Found` retry costs no more than any truncated path (jitter only
 /// ever adds to edge weights).
-fn better_of(first: SearchResult, retry: SearchResult) -> SearchResult {
+pub(crate) fn better_of(first: SearchResult, retry: SearchResult) -> SearchResult {
     if retry.status == SearchStatus::Found {
         return retry;
     }
@@ -786,6 +803,8 @@ pub fn run_route_with_requirements_and_fairy_rings(
     canonical: Option<Arc<CanonicalGrid>>,
     // Pooled per-search state (forward, backward); reset per search, checked out for
     // the duration of this call only.
+    // Engine selection: `Policy` for normal requests, `Uni`/`Bidir` for the race.
+    engine: EngineChoice,
     ctxs: &mut (SearchContext, SearchContext),
 ) -> SearchOutcome {
     // Per-request requirement diagnostics, gated behind NAVPATH_DEBUG_REQS=1 so the hot
@@ -843,9 +862,9 @@ pub fn run_route_with_requirements_and_fairy_rings(
     // the forward search's effective bound; hb_goal is the backward bound anchored on
     // the same origin set. If the backward bound is provably loose relative to the
     // forward one, unidirectional wins — skip bidir for this request.
-    let bidir_ok = bidir_enabled() && neighbors_rev.is_some() && {
+    let bidir_ok = bidir_enabled() && neighbors_rev.is_some() && engine != EngineChoice::Uni && {
         let ratio = bidir_min_hb_ratio();
-        if ratio <= 0.0 {
+        if ratio <= 0.0 || engine == EngineChoice::Bidir {
             true
         } else {
             let active_f = view.lm.select_active(start_id, goal_id, active_landmarks());
@@ -889,7 +908,8 @@ pub fn run_route_with_requirements_and_fairy_rings(
     };
 
     let res = search(seed, default_max_pops(nodes), ctxs);
-    retry_ladder(res, seed, cancel, nodes, |s, m| search(s, m, ctxs))
+    let engine_name = if bidir.is_some() { "bidir" } else { "uni" };
+    retry_ladder(res, seed, cancel, nodes, engine_name, |s, m| search(s, m, ctxs))
 }
 
 pub fn run_route_with_requirements_virtual_start(
@@ -907,12 +927,13 @@ pub fn run_route_with_requirements_virtual_start(
     // so admissibility is unaffected.
     artifacts: &ProfileArtifacts,
     canonical: Option<Arc<CanonicalGrid>>,
+    engine: EngineChoice,
     ctxs: &mut (SearchContext, SearchContext),
 ) -> (SearchOutcome, Option<u32>) {
     let eligible_globals: &[(u32, f32)] = &artifacts.eligible_globals;
     if eligible_globals.is_empty() {
         return (
-            SearchOutcome { res: not_found_result(), retried: false, attempts_pops: [0, 0, 0], seed_dropped: false },
+            SearchOutcome { res: not_found_result(), retried: false, attempts_pops: [0, 0, 0], seed_dropped: false, engine: "uni" },
             None,
         );
     }
@@ -941,9 +962,9 @@ pub fn run_route_with_requirements_virtual_start(
 
     // Weak-backward demotion, virtual-start flavor (roadmap 4.2/4.4): anchors are the
     // seed set itself, and lb_fwd = min over seeds (g0 + h(dst)).
-    let bidir_ok = bidir_enabled() && neighbors_rev.is_some() && {
+    let bidir_ok = bidir_enabled() && neighbors_rev.is_some() && engine != EngineChoice::Uni && {
         let ratio = bidir_min_hb_ratio();
-        if ratio <= 0.0 {
+        if ratio <= 0.0 || engine == EngineChoice::Bidir {
             true
         } else {
             let active_f = view.lm.select_active(goal_id, goal_id, active_landmarks());
@@ -985,7 +1006,8 @@ pub fn run_route_with_requirements_virtual_start(
     };
 
     let res = search(seed, default_max_pops(nodes), ctxs);
-    let outcome = retry_ladder(res, seed, cancel, nodes, |s, m| search(s, m, ctxs));
+    let engine_name = if bidir.is_some() { "bidir" } else { "uni" };
+    let outcome = retry_ladder(res, seed, cancel, nodes, engine_name, |s, m| search(s, m, ctxs));
 
     let entry = if outcome.res.found { outcome.res.path.first().copied() } else { None };
     (outcome, entry)
@@ -1000,6 +1022,7 @@ mod tests {
             found,
             status,
             path: if found { vec![0, 1] } else { Vec::new() },
+            path_g: if found { vec![0.0, cost] } else { Vec::new() },
             cost,
             pops: 0,
             pops_f: 0,

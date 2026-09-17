@@ -92,6 +92,9 @@ pub enum CacheOutcome {
     MissCold,
     /// `NAVPATH_ROUTE_CACHE=0` — caching is switched off.
     Disabled,
+    /// The exact key missed but both endpoints lie on a cached optimal path for the
+    /// same profile; the sub-path was served (exact, no search).
+    Subpath,
 }
 
 impl CacheOutcome {
@@ -101,6 +104,7 @@ impl CacheOutcome {
             CacheOutcome::MissSeed => "miss_seed",
             CacheOutcome::MissCold => "miss_cold",
             CacheOutcome::Disabled => "off",
+            CacheOutcome::Subpath => "subpath",
         }
     }
 }
@@ -110,6 +114,98 @@ impl CacheOutcome {
 /// key) plus the quick-tele flag. Snapshot identity is implicit: the cache lives in
 /// [`SnapshotState`], so a snapshot swap drops it wholesale.
 pub type ProfileKey = (Vec<u64>, bool);
+
+/// One cached optimal path with a node -> position index, for exact sub-path reuse.
+pub struct PathRecord {
+    pub res: navpath_core::SearchResult,
+    pub pos: FxHashMap<u32, u32>,
+}
+
+/// Exact sub-path reuse for re-plans (docs/route_latency_improvements_2026-09-17.md
+/// §2.4). Bots re-request the same goal as they walk; the exact route-cache key misses
+/// every time the start moves. A sub-path of a shortest path is a shortest path in the
+/// same graph, and the graph is identical for the same (mask bits, quick_tele) profile
+/// — including origin-only global teleports: if the cached optimum walks S..S'..G' then
+/// d(S',G') <= d(S,S') + d(S',G') <= c + d(dst,G') for any teleport (c, dst), so no
+/// teleport from S' beats the sub-path. Per profile the newest N paths are kept
+/// (`NAVPATH_SUBPATH_CACHE`, default 64; 0 disables); lookup is N hash probes.
+pub type SubpathCache = Mutex<lru::LruCache<ProfileKey, std::collections::VecDeque<Arc<PathRecord>>>>;
+
+pub fn subpath_cache_paths() -> usize {
+    std::env::var("NAVPATH_SUBPATH_CACHE").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(64)
+}
+
+pub fn new_subpath_cache() -> Option<Arc<SubpathCache>> {
+    if subpath_cache_paths() == 0 {
+        return None;
+    }
+    // `NAVPATH_ROUTE_CACHE=0` means "no caching" (the payload/replay harnesses rely on
+    // it for deterministic captures); follow it unless the sub-path size is set explicitly.
+    let route_cache_off = std::env::var("NAVPATH_ROUTE_CACHE").ok().and_then(|v| v.trim().parse::<usize>().ok()) == Some(0);
+    if route_cache_off && std::env::var("NAVPATH_SUBPATH_CACHE").is_err() {
+        return None;
+    }
+    Some(Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(32).expect("32 is non-zero")))))
+}
+
+/// Returns the served sub-path (if any) and whether ANY cached path for this profile
+/// contains the goal — the latter counts how often a near-start variant would pay.
+pub fn subpath_lookup(cache: &SubpathCache, key: &ProfileKey, sid: u32, gid: u32) -> (Option<navpath_core::SearchResult>, bool) {
+    let mut goal_known = false;
+    let Ok(mut c) = cache.lock() else { return (None, false) };
+    let Some(paths) = c.get(key) else { return (None, false) };
+    for rec in paths.iter() {
+        let Some(&pg) = rec.pos.get(&gid) else { continue };
+        goal_known = true;
+        let Some(&ps) = rec.pos.get(&sid) else { continue };
+        if ps > pg {
+            continue;
+        }
+        let (ps, pg) = (ps as usize, pg as usize);
+        let g0 = rec.res.path_g[ps];
+        let path = rec.res.path[ps..=pg].to_vec();
+        let path_g: Vec<f32> = rec.res.path_g[ps..=pg].iter().map(|g| g - g0).collect();
+        let cost = rec.res.path_g[pg] - g0;
+        return (
+            Some(navpath_core::SearchResult {
+                found: true,
+                status: navpath_core::SearchStatus::Found,
+                path,
+                path_g,
+                cost,
+                pops: 0,
+                pops_f: 0,
+                pops_b: 0,
+            }),
+            true,
+        );
+    }
+    (None, goal_known)
+}
+
+/// Remember a fresh, proven-optimal, on-graph-start result (virtual starts excluded:
+/// their `path[0]` is a teleport landing, not a requestable start).
+pub fn subpath_insert(cache: &SubpathCache, key: ProfileKey, res: &navpath_core::SearchResult) {
+    if !(res.found && res.status == navpath_core::SearchStatus::Found)
+        || res.path.len() < 2
+        || res.path_g.len() != res.path.len()
+    {
+        return;
+    }
+    let mut pos = FxHashMap::with_capacity_and_hasher(res.path.len(), Default::default());
+    for (i, &n) in res.path.iter().enumerate() {
+        pos.entry(n).or_insert(i as u32);
+    }
+    let rec = Arc::new(PathRecord { res: res.clone(), pos });
+    let cap = subpath_cache_paths();
+    if let Ok(mut c) = cache.lock() {
+        let paths = c.get_or_insert_mut(key, std::collections::VecDeque::new);
+        paths.push_front(rec);
+        paths.truncate(cap);
+    }
+}
 
 /// Per-snapshot LRU of per-profile search artifacts (forward/reversed MacroFilters,
 /// eligible globals, eligible fairy sources/dests) — pure functions of
@@ -170,6 +266,7 @@ pub struct SnapshotState {
     pub canonical_grid: Option<Arc<navpath_core::engine::canonical::CanonicalGrid>>,
     /// Per-profile artifact cache (roadmap 5.4). Dropped on snapshot swap.
     pub profile_cache: Arc<ProfileCache>,
+    pub subpath_cache: Option<Arc<SubpathCache>>,
 }
 
 #[derive(Clone)]
@@ -183,6 +280,28 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// Bounded checkout pool for per-search context pairs (see [`ContextPool`]).
     pub ctx_pool: Arc<ContextPool>,
+    /// False until the startup warm-up (snapshot populate + context pre-warm) has run;
+    /// `/route` answers 503 and `/health` reports `ready: false` meanwhile, so an
+    /// orchestrator never routes traffic at a cold mapping.
+    pub ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Page the snapshot in (default on; `NAVPATH_MMAP_POPULATE=0` disables) and optionally
+/// `mlock` it (`NAVPATH_MLOCK=1`). Used at startup and before every `/admin/reload`
+/// swap, so no request ever runs against a cold mapping.
+pub fn warm_snapshot(snapshot: &Snapshot) {
+    let populate = !matches!(std::env::var("NAVPATH_MMAP_POPULATE").ok().as_deref().map(str::trim), Some("0") | Some("false"));
+    if populate {
+        let t = std::time::Instant::now();
+        let bytes = snapshot.populate();
+        tracing::info!(mib = bytes / (1024 * 1024), elapsed_ms = t.elapsed().as_millis() as u64, "populated snapshot mapping");
+    }
+    if matches!(std::env::var("NAVPATH_MLOCK").ok().as_deref().map(str::trim), Some("1") | Some("true")) {
+        match snapshot.lock_memory() {
+            Ok(()) => tracing::info!("mlock'd snapshot mapping"),
+            Err(e) => tracing::warn!(error = %e, "mlock failed (raise RLIMIT_MEMLOCK); continuing without it"),
+        }
+    }
 }
 
 /// Checkout pool for the node-sized per-search context pair.
@@ -205,6 +324,22 @@ impl ContextPool {
 
     /// Check out a context pair (fresh and empty if the pool has none spare); it
     /// returns to the pool when the guard drops.
+    /// Pre-allocate and page in `pairs` context pairs for `nodes` nodes so no request
+    /// pays the ~36 MB first-touch fault storm (docs/route_latency_improvements_2026-09-17.md
+    /// §2.2). Sized to the search permits (x2 with the engine race on) at startup.
+    pub fn prewarm(&self, pairs: usize, nodes: usize) {
+        let mut warmed = Vec::with_capacity(pairs);
+        for _ in 0..pairs {
+            let mut pair = Box::new((SearchContext::new(nodes), SearchContext::new(nodes)));
+            pair.0.prefault();
+            pair.1.prefault();
+            warmed.push(pair);
+        }
+        if let Ok(mut s) = self.stack.lock() {
+            s.extend(warmed);
+        }
+    }
+
     pub fn checkout(self: &Arc<Self>) -> PooledContexts {
         let pair = self
             .stack
@@ -253,6 +388,10 @@ pub struct Metrics {
     /// Misses on an (endpoints, profile) combination not currently cached — the
     /// irreducible kind. A client that never repeats a start/goal pair sees only these.
     pub cache_miss_cold: AtomicU64,
+    /// Sub-path cache (see [`SubpathCache`]): hits served, and misses whose goal was on
+    /// some cached path for the profile but whose start was not (the near-start signal).
+    pub cache_subpath_hits: AtomicU64,
+    pub cache_miss_goal_known: AtomicU64,
     pub searches: AtomicU64,
     pub retries: AtomicU64,
     pub retry_found: AtomicU64,
@@ -265,10 +404,20 @@ pub struct Metrics {
     /// Requests answered found=false by the component reachability precheck — each one
     /// is a budget-capped flood that never ran.
     pub precheck_rejects: AtomicU64,
+    /// Hedged-race accounting (`NAVPATH_RACE=1`): races started, and which engine won.
+    pub race_runs: AtomicU64,
+    pub race_wins_uni: AtomicU64,
+    pub race_wins_bidir: AtomicU64,
     /// log2 histogram of heap pops per fresh search (bucket i>0 covers [2^(i-1), 2^i)).
     pub pops_log2: [AtomicU64; 26],
     /// log2 histogram of search wall time in ms (same bucket scheme).
     pub search_ms_log2: [AtomicU64; 18],
+    /// Search wall time in microseconds, log2 buckets (the ms histogram above puts most
+    /// routes in bucket 0; this one resolves them).
+    pub search_us_log2: [AtomicU64; 28],
+    /// Nanoseconds per heap pop, log2 buckets: the memory-behaviour signal. Warm searches
+    /// sit at 128-256 ns; a cold page cache shows up as 32-128 µs.
+    pub ns_per_pop_log2: [AtomicU64; 22],
 }
 
 impl Metrics {
@@ -279,6 +428,16 @@ impl Metrics {
     pub fn record_pops(&self, pops: u64) {
         let i = Self::log2_bucket(pops, self.pops_log2.len());
         self.pops_log2[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_search_us(&self, us: u64, pops: u64) {
+        let i = Self::log2_bucket(us, self.search_us_log2.len());
+        self.search_us_log2[i].fetch_add(1, Ordering::Relaxed);
+        if pops > 0 {
+            let ns = us.saturating_mul(1000) / pops;
+            let j = Self::log2_bucket(ns, self.ns_per_pop_log2.len());
+            self.ns_per_pop_log2[j].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn record_search_ms(&self, ms: u64) {
@@ -308,6 +467,8 @@ impl Metrics {
             "cache_puts": c(&self.cache_puts),
             "cache_miss_seed": c(&self.cache_miss_seed),
             "cache_miss_cold": c(&self.cache_miss_cold),
+            "cache_subpath_hits": c(&self.cache_subpath_hits),
+            "cache_miss_goal_known": c(&self.cache_miss_goal_known),
             "searches": c(&self.searches),
             "retries": c(&self.retries),
             "retry_found": c(&self.retry_found),
@@ -318,8 +479,13 @@ impl Metrics {
             "semaphore_rejects": c(&self.semaphore_rejects),
             "deadline_timeouts": c(&self.deadline_timeouts),
             "precheck_rejects": c(&self.precheck_rejects),
+            "race_runs": c(&self.race_runs),
+            "race_wins_uni": c(&self.race_wins_uni),
+            "race_wins_bidir": c(&self.race_wins_bidir),
             "pops_log2": hist(&self.pops_log2),
             "search_ms_log2": hist(&self.search_ms_log2),
+            "search_us_log2": hist(&self.search_us_log2),
+            "ns_per_pop_log2": hist(&self.ns_per_pop_log2),
         })
     }
 }
@@ -363,4 +529,50 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/reload", post(routes::reload))
         .route("/stats", get(routes::stats))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod subpath_tests {
+    use super::*;
+    use navpath_core::{SearchResult, SearchStatus};
+
+    fn res(path: Vec<u32>, path_g: Vec<f32>) -> SearchResult {
+        let cost = *path_g.last().unwrap();
+        SearchResult { found: true, status: SearchStatus::Found, path, path_g, cost, pops: 7, pops_f: 7, pops_b: 0 }
+    }
+
+    #[test]
+    fn subpath_cache_serves_exact_slices_and_reports_goal_known() {
+        let cache = new_subpath_cache().expect("enabled by default");
+        let key: ProfileKey = (vec![0b101], false);
+        subpath_insert(&cache, key.clone(), &res(vec![10, 11, 12, 13], vec![0.0, 300.0, 600.0, 1024.0]));
+
+        // suffix
+        let (hit, known) = subpath_lookup(&cache, &key, 11, 13);
+        let hit = hit.expect("suffix hit");
+        assert!(known);
+        assert_eq!(hit.path, vec![11, 12, 13]);
+        assert_eq!(hit.path_g, vec![0.0, 300.0, 724.0]);
+        assert_eq!(hit.cost, 724.0);
+        assert_eq!(hit.pops, 0);
+        // prefix and interior
+        assert_eq!(subpath_lookup(&cache, &key, 10, 12).0.unwrap().cost, 600.0);
+        assert_eq!(subpath_lookup(&cache, &key, 11, 12).0.unwrap().path, vec![11, 12]);
+        // wrong direction: goal known, no hit
+        let (hit, known) = subpath_lookup(&cache, &key, 13, 11);
+        assert!(hit.is_none() && known);
+        // start off-path: goal known (the near-start signal), no hit
+        let (hit, known) = subpath_lookup(&cache, &key, 99, 12);
+        assert!(hit.is_none() && known);
+        // goal off-path
+        let (hit, known) = subpath_lookup(&cache, &key, 10, 99);
+        assert!(hit.is_none() && !known);
+        // other profile sees nothing
+        assert!(subpath_lookup(&cache, &(vec![0b111], false), 11, 13).0.is_none());
+        // truncated / not-found results are never inserted
+        let mut bad = res(vec![1, 2], vec![0.0, 300.0]);
+        bad.status = SearchStatus::BudgetExceeded;
+        subpath_insert(&cache, key.clone(), &bad);
+        assert!(subpath_lookup(&cache, &key, 1, 2).0.is_none());
+    }
 }

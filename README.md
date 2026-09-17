@@ -29,11 +29,19 @@ per populated 64x64 region `plane u8, rx u16, ry u16, bitmap[512]` (bit `(y%64)*
 LSB first). Copy it into Hoor2 (`launcher/payload/resources/walkableTiles.bin`) so
 `Area.getRandomWalkableTile()` can answer offline without hitting the service.
 
-export SNAPSHOT_PATH=/home/query/Dev/navpathService/graph.snapshot 
+export SNAPSHOT_PATH=/home/query/Dev/navpathService/graph.snapshot
 export NAVPATH_HOST=127.0.0.1
 export NAVPATH_PORT=8080
 export RUST_LOG=info
+
+# Recommended for latency (docs/route_latency_improvements_2026-09-17.md):
+export NAVPATH_RACE=1            # hedged uni/bidir race per cache miss (3-7x on teleport-heavy routes)
+# export NAVPATH_MLOCK=1         # also mlock the mapping so memory pressure cannot evict it (needs RLIMIT_MEMLOCK >= snapshot size)
+# export NAVPATH_CTX_PREWARM=32  # raise the startup context pre-warm on a dedicated box (default 8 pairs, ~36 MB each)
+
 cargo run -p navpath-service --release
+# --no-seed: ignore client seeds (no jitter, no seeded retry ladder; same optimal path).
+# --dump-result: rewrites result.json on every request (debugging only; a sync file write per response).
 cargo run -p navpath-service --release -- --dump-result result.json --no-seed
 
 ```
@@ -69,6 +77,19 @@ scripts/perf-gate.sh install-hook   # optional git pre-push hook (PERF_GATE_SKIP
 The DB producer must ship the `tiles_regions` table (run `migrate_tiles_regions.py`
 after any tiles change) — the builder falls back to a ~10x slower row-per-tile scan
 and warns loudly when it is missing.
+
+## Startup warm-up and readiness
+
+The listener binds immediately, but routes are served only after the warm-up thread
+has paged the snapshot in (`NAVPATH_MMAP_POPULATE`) and pre-warmed the search context
+pool (`NAVPATH_CTX_PREWARM`), a few seconds on a warm page cache. Until then `/health`
+answers **503** with `"ready": false` and `/route` answers 503 `warming up`; `/stats`
+carries `ready` too. Orchestrators should gate traffic on `/health` returning 200.
+
+Every `/route` response carries `duration_us` next to the integer `duration_ms`, and
+each route log line carries `duration_us`, `search_us`, `payload_us` and `ns_per_pop`
+(≈150-230 warm; tens of thousands means the search hit a cold page cache). `/stats`
+adds `search_us_log2` and `ns_per_pop_log2` histograms.
 
 ## API Endpoints
 
@@ -180,6 +201,20 @@ entirely (sub-millisecond responses); the actions/geometry payload is still rebu
 request, so one entry serves every `options`/`surge`/`dive` combination. The cache is
 dropped whenever the snapshot is swapped (`/admin/reload`).
 
+### Sub-path reuse (re-plans)
+
+Bots re-request the same goal as they walk, and every such request misses the exact
+key. A second, per-profile index keeps the newest `NAVPATH_SUBPATH_CACHE` optimal paths
+with a node→position map; if both the requested start and goal lie on one of them (in
+order), the slice is served with the exact cost `path_g[goal] - path_g[start]`. A
+sub-path of a shortest path is a shortest path, and the graph is identical for the
+same profile, so this is exact — including origin-only global teleports (the cached
+optimum already proved walking on beats teleporting from any node on it). Suffix
+(re-plan), prefix (stop early) and interior slices all qualify; virtual starts do not.
+The route log reports `cache=subpath`, `/stats` counts `cache_subpath_hits` and
+`cache_miss_goal_known` (misses whose goal was on a cached path but whose start was
+not — the size of the near-start opportunity).
+
 ### Diagnosing a low hit rate
 
 Every `/route` log line ends with a `cache=` field, and `/stats` breaks the misses down:
@@ -193,6 +228,7 @@ curl -s http://127.0.0.1:8080/stats | jq '{cache_hits, cache_miss_seed, cache_mi
 | `hit` | served from cache, no search ran | — |
 | `miss_seed` | same start/goal/profile is cached, only the **seed** differed (only possible with `NAVPATH_CACHE_IGNORE_SEED=0`) | leave the default seed-blind policy on, or stop sending seeds |
 | `miss_cold` | this start/goal/profile pair isn't cached | irreducible — no cache policy helps |
+| `subpath` | both endpoints lie on a cached optimal path for the profile; the slice was served without a search | — |
 | `off` | `NAVPATH_ROUTE_CACHE=0` | re-enable the cache |
 
 `cache_miss_seed` is exactly how many requests `NAVPATH_CACHE_IGNORE_SEED=1` would turn
@@ -207,14 +243,19 @@ same path.
 | `SNAPSHOT_PATH` | `./graph.snapshot` | Snapshot to serve. |
 | `NAVPATH_HOST` / `NAVPATH_PORT` | `127.0.0.1` / `8080` | Listen address. |
 | `NAVPATH_ROUTE_CACHE` | `2048` | Route-cache entries; `0` disables it. |
+| `NAVPATH_SUBPATH_CACHE` | `64` | Paths kept per profile for exact sub-path reuse: a request whose start and goal both lie on a cached optimal path (same eligibility bits and quick-tele flag) is served the slice in microseconds, no search. `0` disables. |
 | `NAVPATH_CACHE_IGNORE_SEED` | `1` | Seed-blind cache keys (default since 2026-08-06): any seed is served the cached path — recovers the hit rate for varying-seed traffic. `0` restores per-seed keys (per-seed tie variety on repeats; the paths only ever differed in equal-cost tie selection). |
 | `NAVPATH_IGNORE_SEED` | `0` | `1` (or the `--no-seed` flag) ignores client seeds entirely: all searches run unseeded (no jitter, canonical pruning engages); seeded requests are answered with `degraded: "seed_ignored"`. |
 | `NAVPATH_ROUTE_TIMEOUT_MS` | `10000` | Per-request wall-clock deadline (`0` = effectively none); a breach returns 504. |
 | `NAVPATH_MAX_CONCURRENT_SEARCHES` | CPU count | Concurrent searches; excess requests get 503 rather than queueing. |
+| `NAVPATH_MMAP_POPULATE` | `1` | Page the whole snapshot in during the startup warm-up (and before every `/admin/reload` swap). `0` disables; a cold page then costs 50-90 µs per pop on first touch. |
+| `NAVPATH_MLOCK` | `0` | `1` also `mlock`s the mapping (334 MB) so the page cache cannot evict it; needs `RLIMIT_MEMLOCK` at least that large, otherwise it warns and continues. |
+| `NAVPATH_CTX_PREWARM` | min(permits, 8) (x2 permits with `NAVPATH_RACE=1`, same cap) | Search-context pairs allocated and paged in at startup (~36 MB each at 1.1M nodes). Removes the 100-400 ms first-touch stall a fresh blocking thread otherwise pays inside a request; `0` disables. Raise it on a dedicated box with more than ~4 concurrent cache misses; on a host under memory pressure a large idle pre-warm gets swapped out again and the first requests pay to fault it back in. |
 | `NAVPATH_MAX_POPS` | `max(1.5M, nodes/2)` | First-attempt pop budget (`0` = unbounded). |
 | `NAVPATH_RETRY_MAX_POPS` | `4x` the above | Budget for the retry rung (`0` disables the retry). |
 | `NAVPATH_BIDIR` | `1` | `0` forces the unidirectional engine. |
-| `NAVPATH_BIDIR_MIN_HB_RATIO` | `0.5` | Backward-bound strength below which a route is demoted to unidirectional; `0` always runs bidirectional. Measured on the current snapshot: `0` wins on some long/seeded routes (up to 2.6x fewer pops) and loses badly on others (`quick_tele_route` 1.8x worse) — the default is the better compromise. |
+| `NAVPATH_RACE` | `0` | `1` runs the hedged engine race on every cache miss: unidirectional and bidirectional searches start concurrently on two blocking threads, the first stable result (found / genuine not-found) is served and the loser is cancelled. Same exact cost either way; buys the per-pair minimum of two engines whose relative speed swings 3-5x both ways (walk- vs teleport-dominated routes). Needs a second search permit while both run; falls back to the single-engine path when none is free. `/stats` reports `race_runs`, `race_wins_uni`, `race_wins_bidir`; every route log line carries `engine=uni|bidir|cache`. Note: the two engines break equal-cost ties differently, so with the race on the served path among several **equal-cost** alternatives depends on which engine finished first (cost is identical either way; `tools/payload_baseline.json` is captured with the race off). |
+| `NAVPATH_BIDIR_MIN_HB_RATIO` | `0` | Backward-bound strength below which a route is demoted to unidirectional; `0` (default since 2026-09-17) always runs bidirectional. Measured over 300 random pairs: always-bidir is 1.3-3x faster on long walk routes and within 5% of per-pair best overall, but 3-5x slower on teleport-dominated pairs (`lum_to_falador`, virtual starts) — see `docs/route_latency_improvements_2026-09-17.md`. `0.5` restores the old demotion policy. |
 | `NAVPATH_TIEBREAK_BUCKET_MS` | `0` (off) | Bucketed f-comparison for seeded searches. **Measured harmful on the current snapshot** (2-20x more pops on both engines); leave off. |
 | `NAVPATH_CANONICAL` | `1` | `0` disables canonical successor pruning (unseeded searches only). |
 | `NAVPATH_ACTIVE_LANDMARKS` | all | Landmarks evaluated per heuristic call; for A/B runs only. |

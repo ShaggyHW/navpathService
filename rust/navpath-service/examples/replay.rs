@@ -39,7 +39,7 @@ use navpath_core::{NeighborProvider, SearchResult, Snapshot};
 use navpath_service::engine_adapter::{
     build_canonical_grid, build_component_graph, build_fairy_rings, build_neighbor_provider,
     build_profile_artifacts, goal_reachable, run_route_with_requirements_and_fairy_rings,
-    run_route_with_requirements_virtual_start, FairyRing, GlobalTeleport,
+    run_route_with_requirements_virtual_start, EngineChoice, FairyRing, GlobalTeleport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -341,6 +341,7 @@ fn main() {
                         None,
                         &artifacts,
                         canonical.clone(),
+                        EngineChoice::Policy,
                         &mut ctxs,
                     );
                     runs.push(RunOut { label, seed, res: out.res, entry: None });
@@ -359,6 +360,7 @@ fn main() {
                         None,
                         &artifacts,
                         canonical.clone(),
+                        EngineChoice::Policy,
                         &mut ctxs,
                     );
                     runs.push(RunOut { label, seed, res: out.res, entry: ventry });

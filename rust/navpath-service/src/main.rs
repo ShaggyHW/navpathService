@@ -77,14 +77,46 @@ async fn main() -> Result<()> {
     // Provide not-ready state if snapshot failed to load
     let hash_hex = read_tail_hash_hex(&snapshot_path);
     let req_tag_index = Arc::new(navpath_service::build_req_tag_index(snapshot.as_deref()));
-    let init = SnapshotState { path: snapshot_path.clone(), snapshot, neighbors, neighbors_rev, globals, macro_lookup, req_tag_index, loaded_at_unix: now_unix(), snapshot_hash_hex: hash_hex, route_cache: navpath_service::new_route_cache(), seed_shadow: navpath_service::new_seed_shadow(), fairy_rings, node_to_fairy_ring, comp_graph, canonical_grid, profile_cache: navpath_service::new_profile_cache() };
+    let init = SnapshotState { path: snapshot_path.clone(), snapshot, neighbors, neighbors_rev, globals, macro_lookup, req_tag_index, loaded_at_unix: now_unix(), snapshot_hash_hex: hash_hex, route_cache: navpath_service::new_route_cache(), seed_shadow: navpath_service::new_seed_shadow(), fairy_rings, node_to_fairy_ring, comp_graph, canonical_grid, profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache() };
     let state = AppState {
         current: Arc::new(ArcSwap::from_pointee(init)),
         search_permits: navpath_service::default_search_permits(),
         metrics: Arc::new(navpath_service::Metrics::default()),
         ctx_pool: navpath_service::ContextPool::new(),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
+    // Warm-up off the reactor: populate (and optionally mlock) the snapshot mapping,
+    // then pre-allocate + page in the search context pool. The listener is bound
+    // first so `/health` can report `ready: false` meanwhile; `/route` answers 503
+    // until this flips the flag.
+    {
+        let state = state.clone();
+        std::thread::Builder::new().name("navpath-warmup".into()).spawn(move || {
+            let t = std::time::Instant::now();
+            let cur = state.current.load();
+            if let Some(snap) = cur.snapshot.as_ref() {
+                navpath_service::warm_snapshot(snap);
+                // Default: one pair per search permit (two with the engine race on),
+                // capped at 8. Each pair is ~36 MB at 1.1M nodes; pairs beyond the
+                // concurrent-miss count are idle memory the kernel reclaims first under
+                // pressure, and measured on a swapping host the 64-pair (2.3 GB) warm-up
+                // produced 50-170 ms first-request stalls that 8 pairs (0.3 GB) did not.
+                // Raise `NAVPATH_CTX_PREWARM=<n>` on a dedicated box (0 disables).
+                let nodes = snap.counts().nodes as usize;
+                let permits = state.search_permits.available_permits();
+                let default_pairs = (if navpath_service::routes::race_enabled() { permits * 2 } else { permits }).min(8);
+                let pairs = std::env::var("NAVPATH_CTX_PREWARM").ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(default_pairs);
+                let tp = std::time::Instant::now();
+                state.ctx_pool.prewarm(pairs, nodes);
+                info!(pairs, elapsed_ms = tp.elapsed().as_millis() as u64, "pre-warmed search context pool");
+            }
+            state.ready.store(true, std::sync::atomic::Ordering::Release);
+            info!(elapsed_ms = t.elapsed().as_millis() as u64, "warm-up complete; serving routes");
+        }).expect("spawn warm-up thread");
+    }
     let app = build_router(state.clone());
     let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
     if let Ok(dump) = std::env::var("NAVPATH_DUMP_RESULT") {
