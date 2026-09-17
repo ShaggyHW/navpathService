@@ -111,8 +111,13 @@ pub fn build_canonical_grid(snapshot: &Snapshot) -> Option<Arc<CanonicalGrid>> {
         snapshot.macro_dst(),
         snapshot.macro_w(),
     ) {
-        Ok(g) => {
-            info!(elapsed_ms = t.elapsed().as_millis() as u64, "built canonical pruning grid");
+        Ok(mut g) => {
+            // Fairy rings carry non-grid edges too: jumps must stop on them.
+            g.add_stop_nodes(snapshot.fairy_nodes());
+            if navpath_core::engine::search::jps_enabled() {
+                g.build_jump_tables(snapshot.walk_offsets(), snapshot.walk_dst());
+            }
+            info!(elapsed_ms = t.elapsed().as_millis() as u64, jps = navpath_core::engine::search::jps_enabled(), "built canonical pruning grid");
             Some(Arc::new(g))
         }
         Err(e) => {
@@ -845,6 +850,7 @@ pub fn run_route_with_requirements_and_fairy_rings(
         extra: ExtraEdges::default(),
         coords: Some(snap_ref.coords_packed()),
         canonical,
+        jps: navpath_core::engine::search::jps_enabled(),
     };
 
     // Per-profile artifacts: eligible globals (available from every node; the engine
@@ -908,7 +914,7 @@ pub fn run_route_with_requirements_and_fairy_rings(
     };
 
     let res = search(seed, default_max_pops(nodes), ctxs);
-    let engine_name = if bidir.is_some() { "bidir" } else { "uni" };
+    let engine_name = if bidir.is_some() { "bidir" } else if view.jps && view.canonical.is_some() { "jps" } else { "uni" };
     retry_ladder(res, seed, cancel, nodes, engine_name, |s, m| search(s, m, ctxs))
 }
 
@@ -954,6 +960,7 @@ pub fn run_route_with_requirements_virtual_start(
         extra: ExtraEdges::default(),
         coords: Some(snap_ref.coords_packed()),
         canonical,
+        jps: navpath_core::engine::search::jps_enabled(),
     };
     view.extra.fairy_sources = std::borrow::Cow::Borrowed(artifacts.fairy_sources.as_slice());
     view.extra.fairy_dests = std::borrow::Cow::Borrowed(artifacts.fairy_dests.as_slice());
@@ -1006,7 +1013,7 @@ pub fn run_route_with_requirements_virtual_start(
     };
 
     let res = search(seed, default_max_pops(nodes), ctxs);
-    let engine_name = if bidir.is_some() { "bidir" } else { "uni" };
+    let engine_name = if bidir.is_some() { "bidir" } else if view.jps && view.canonical.is_some() { "jps" } else { "uni" };
     let outcome = retry_ladder(res, seed, cancel, nodes, engine_name, |s, m| search(s, m, ctxs));
 
     let entry = if outcome.res.found { outcome.res.path.first().copied() } else { None };

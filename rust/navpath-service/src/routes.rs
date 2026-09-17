@@ -1649,7 +1649,7 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
             loop {
                 match rx.recv().await {
                     Some(RaceMsg::Done(out)) => {
-                        let ctr = if out.engine == "uni" { &metrics.race_wins_uni } else { &metrics.race_wins_bidir };
+                        let ctr = if out.engine == "bidir" { &metrics.race_wins_bidir } else { &metrics.race_wins_uni };
                         ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Ok(out);
                     }

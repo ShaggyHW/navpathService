@@ -203,6 +203,17 @@ fn prefetch_node<T>(nodes: &[T], id: u32) {
     }
 }
 
+/// `NAVPATH_JPS=1`: jump-point expansion in the unidirectional engine (Phase E Stage
+/// 3). Requires the canonical grid and an unseeded search, exactly like pruning; the
+/// bidirectional engine keeps plain expansion (two independently jumped canonical
+/// orderings are not guaranteed to share a meeting node, which MM's stop rule needs).
+pub fn jps_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("NAVPATH_JPS").ok().as_deref().map(str::trim), Some("1") | Some("true"))
+    })
+}
+
 /// Canonical-pruning context for one search: engaged only when the grid exists, the
 /// walk graph is the zero-copy CSR, coords are available, and the search is UNSEEDED
 /// (pruning is cost-exact; jitter both breaks the uniform-cost premise of the table
@@ -272,6 +283,11 @@ pub struct SearchContext {
     pub cold: Vec<ColdState>,
     pub generation: u32,
     pub open: BinaryHeap<Key>,
+    /// Jump-point expansion only: the grid direction (index + 1; 0 = none, i.e. a
+    /// seed or a macro/teleport/fairy arrival) the node's current parent link travels
+    /// along. Written together with `parent` on every improvement, so it is valid
+    /// exactly when `parent` is; read only for the popped node and at reconstruction.
+    pub dirs: Vec<u8>,
 }
 
 impl SearchContext {
@@ -281,6 +297,7 @@ impl SearchContext {
             cold: zeroed_vec(nodes),
             generation: 1,
             open: BinaryHeap::with_capacity(1024),
+            dirs: zeroed_vec(nodes),
         }
     }
 
@@ -307,6 +324,7 @@ impl SearchContext {
         }
         touch(&mut self.hot);
         touch(&mut self.cold);
+        touch(&mut self.dirs);
     }
 
     pub fn reset(&mut self, nodes: usize) {
@@ -317,6 +335,7 @@ impl SearchContext {
             if self.generation == 0 {
                  self.hot.fill(EMPTY_HOT);
                  self.cold.fill(EMPTY_COLD);
+                 self.dirs.fill(0);
                  self.generation = 1;
             }
             self.open.clear();
@@ -337,6 +356,8 @@ impl SearchContext {
             self.cold[u].h = f32::NAN; // h not yet computed this query
         }
         self.hot[u].g = val;
+        // Seeds have no grid parent (used by seeding paths only, never the hot loop).
+        self.dirs[u] = 0;
     }
 
     #[inline(always)]
@@ -392,6 +413,54 @@ impl Default for ExtraEdges<'_> {
     }
 }
 
+/// Expand a jump-point chain (`path`/`path_g` as reconstructed from parent links)
+/// into the tile-by-tile path, re-accumulating `g` step by step along each run so
+/// the per-tile costs are bit-identical to the jump's own accumulation.
+fn expand_jumps(
+    path: &[u32],
+    path_g: &[f32],
+    dirs: &[u8],
+    cg: &CanonicalGrid,
+    offsets: &[u32],
+    dst: &[u32],
+    diag_w: f32,
+) -> (Vec<u32>, Vec<f32>) {
+    let mut out = Vec::with_capacity(path.len() * 4);
+    let mut out_g = Vec::with_capacity(path.len() * 4);
+    if path.is_empty() {
+        return (out, out_g);
+    }
+    out.push(path[0]);
+    out_g.push(path_g[0]);
+    for i in 1..path.len() {
+        let (a, b) = (path[i - 1], path[i]);
+        let dcode = dirs[b as usize];
+        if dcode == 0 {
+            out.push(b);
+            out_g.push(path_g[i]);
+            continue;
+        }
+        let d = (dcode - 1) as usize;
+        let w = if d < 4 { WALK_CARDINAL_MS } else { diag_w };
+        let mut cur = a as usize;
+        let mut g = path_g[i - 1];
+        loop {
+            let next = cg
+                .step(cur, d, offsets, dst)
+                .expect("jump link must be a straight walkable run");
+            g += w;
+            out.push(next as u32);
+            out_g.push(g);
+            if next as u32 == b {
+                break;
+            }
+            cur = next;
+        }
+        debug_assert_eq!(g.to_bits(), path_g[i].to_bits(), "jump expansion cost drift");
+    }
+    (out, out_g)
+}
+
 pub struct EngineView<'a> {
     pub nodes: usize,
     pub walk: WalkGraph<'a>,
@@ -406,6 +475,9 @@ pub struct EngineView<'a> {
     /// (every optimal path survives), while seeded jitter both breaks the uniform-cost
     /// premise of the table and exists precisely to explore tie variety.
     pub canonical: Option<Arc<CanonicalGrid>>,
+    /// Jump-point expansion for unseeded unidirectional searches (needs `canonical`).
+    /// Defaults to the `NAVPATH_JPS` env switch; harnesses flip it per view.
+    pub jps: bool,
 }
 
 impl<'a> EngineView<'a> {
@@ -421,6 +493,7 @@ impl<'a> EngineView<'a> {
             extra: ExtraEdges::default(),
             coords: Some(s.coords_packed()),
             canonical: None,
+            jps: jps_enabled(),
         }
     }
 
@@ -435,6 +508,7 @@ impl<'a> EngineView<'a> {
             extra: ExtraEdges::default(),
             coords: None,
             canonical: None,
+            jps: jps_enabled(),
         }
     }
 
@@ -550,6 +624,7 @@ impl<'a> EngineView<'a> {
         // is pop-sequence-invariant — bit-exact for path, cost, and the pops counter.
         let mut incumbent = ctx.get_g(goal);
         let canon = canonical_ctx(self, params.seed);
+        let jps = self.jps && canon.is_some();
         let diag_w = walk_diagonal_ms();
 
         while let Some(Key { g: gcur, id, .. }) = ctx.open.pop() {
@@ -587,10 +662,11 @@ impl<'a> EngineView<'a> {
             // One fused NodeState access per relaxation: the generation check, g
             // compare, g/parent/h writes, and the h cache all touch the same 16-byte
             // record through a single borrow instead of four accessor round-trips.
-            let mut relax = |v_id: u32, w: f32, ctx: &mut SearchContext| {
+            // `ng` is the full tentative cost (callers add the — possibly jittered —
+            // edge weight, or a whole jump's worth of steps); `dir` is the grid
+            // direction code of the link (jump-point mode only, 0 otherwise).
+            let mut relax = |v_id: u32, ng: f32, dir: u8, ctx: &mut SearchContext| {
                 let v = v_id as usize;
-                let w_jittered = jit.w(id, v_id, w);
-                let ng = gcur + w_jittered;
                 let gen = ctx.generation;
                 let hot = &mut ctx.hot[v];
                 let cur_g = if hot.gen == gen { hot.g } else { f32::INFINITY };
@@ -603,6 +679,9 @@ impl<'a> EngineView<'a> {
                         cold.h = f32::NAN;
                     }
                     cold.parent = id;
+                    if jps {
+                        ctx.dirs[v] = dir;
+                    }
                     let hv = if cold.h.is_nan() {
                         let hh = h(v_id);
                         cold.h = hh;
@@ -622,7 +701,26 @@ impl<'a> EngineView<'a> {
                 }
             };
 
-            if let Some((cg, coords, offsets, dst)) = canon {
+            if jps {
+                // Jump-point expansion: for each tie-pruned successor direction of the
+                // stored incoming direction, jump along the straight run and relax the
+                // jump point with the run's cost accumulated step by step (the same f32
+                // sequence plain expansion would produce along that run).
+                let (cg, coords, offsets, dst) = canon.unwrap();
+                let mut bits = cg.jps_succ(u, ctx.dirs[u]);
+                while bits != 0 {
+                    let d = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if let Some((j, k)) = cg.jump(u, d, goal, offsets, dst, coords) {
+                        let w = if d < 4 { WALK_CARDINAL_MS } else { diag_w };
+                        let mut ng = gcur;
+                        for _ in 0..k {
+                            ng += w;
+                        }
+                        relax(j as u32, ng, (d + 1) as u8, ctx);
+                    }
+                }
+            } else if let Some((cg, coords, offsets, dst)) = canon {
                 // Canonical strict-domination pruning: relax only the successor bits
                 // for the stored parent's incoming direction, resolved to CSR slots in
                 // O(1); weights derive from the direction bit (0-3 cardinal).
@@ -635,7 +733,8 @@ impl<'a> EngineView<'a> {
                     bits &= bits - 1;
                     let slot = s0 + (mask & ((1u8 << d) - 1)).count_ones() as usize;
                     let w = if d < 4 { WALK_CARDINAL_MS } else { diag_w };
-                    relax(dst[slot], w, ctx);
+                    let v_id = dst[slot];
+                    relax(v_id, gcur + jit.w(id, v_id, w), 0, ctx);
                 }
             } else {
                 // Issue all neighbor hot-state loads up front: the relax loop's
@@ -644,16 +743,16 @@ impl<'a> EngineView<'a> {
                 for &d in self.walk.neighbor_ids(id) {
                     prefetch_node(&ctx.hot, d);
                 }
-                self.walk.for_each_neighbor(id, |v_id, w| relax(v_id, w, ctx));
+                self.walk.for_each_neighbor(id, |v_id, w| relax(v_id, gcur + jit.w(id, v_id, w), 0, ctx));
             }
             if self.macros.has_macro(id) {
                 for (v_id, w) in self.macros.macro_neighbors(id, params.macro_filter) {
-                    relax(v_id, w, ctx);
+                    relax(v_id, gcur + jit.w(id, v_id, w), 0, ctx);
                 }
             }
             for &(v_id, w) in extra_slice {
                 if v_id != id {
-                    relax(v_id, w, ctx);
+                    relax(v_id, gcur + jit.w(id, v_id, w), 0, ctx);
                 }
             }
         }
@@ -679,6 +778,14 @@ impl<'a> EngineView<'a> {
         }
         path.reverse();
         path_g.reverse();
+        if jps {
+            // Parent links are jump points; expand each straight run back into tiles
+            // so the returned path is tile-adjacent exactly as plain expansion yields.
+            let (cg, _coords, offsets, dst) = canon.unwrap();
+            let (p, g) = expand_jumps(&path, &path_g, &ctx.dirs, cg, offsets, dst, diag_w);
+            path = p;
+            path_g = g;
+        }
         // A budget/cancel break can land AFTER a path to the goal was discovered but
         // BEFORE the goal popped (i.e. before its cost was proven minimal) — e.g. a
         // global teleport seeds g(goal) at pop zero. Surface the truncation in the

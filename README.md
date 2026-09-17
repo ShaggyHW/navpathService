@@ -35,7 +35,8 @@ export NAVPATH_PORT=8080
 export RUST_LOG=info
 
 # Recommended for latency (docs/route_latency_improvements_2026-09-17.md):
-export NAVPATH_RACE=1            # hedged uni/bidir race per cache miss (3-7x on teleport-heavy routes)
+export NAVPATH_JPS=1             # jump-point expansion for the unidirectional engine (1.4-3x on walk-dominated routes)
+export NAVPATH_RACE=1            # hedged JPS-uni/bidir race per cache miss (3-7x on teleport-heavy routes)
 # export NAVPATH_MLOCK=1         # also mlock the mapping so memory pressure cannot evict it (needs RLIMIT_MEMLOCK >= snapshot size)
 # export NAVPATH_CTX_PREWARM=32  # raise the startup context pre-warm on a dedicated box (default 8 pairs, ~36 MB each)
 
@@ -254,6 +255,7 @@ same path.
 | `NAVPATH_MAX_POPS` | `max(1.5M, nodes/2)` | First-attempt pop budget (`0` = unbounded). |
 | `NAVPATH_RETRY_MAX_POPS` | `4x` the above | Budget for the retry rung (`0` disables the retry). |
 | `NAVPATH_BIDIR` | `1` | `0` forces the unidirectional engine. |
+| `NAVPATH_JPS` | `0` | `1` enables jump-point expansion (JPS+ with precomputed jump tables, +54 MB, +100 ms at load) in the unidirectional engine for unseeded searches: straight runs on the uniform-cost walk grid are jumped instead of expanded node by node, 5-26x fewer expansions, cost-exact (a sub-path of a shortest path is a shortest path; jumps stop at the goal, at any node with a door/teleport/fairy edge, and at forced turns). Bidirectional searches keep plain expansion, so with the race on the JPS racer is the one that wins walk-dominated routes. Log lines report `engine=jps`. Ties among equal-cost paths resolve diagonal-first, so served paths can differ from plain expansion at identical cost. |
 | `NAVPATH_RACE` | `0` | `1` runs the hedged engine race on every cache miss: unidirectional and bidirectional searches start concurrently on two blocking threads, the first stable result (found / genuine not-found) is served and the loser is cancelled. Same exact cost either way; buys the per-pair minimum of two engines whose relative speed swings 3-5x both ways (walk- vs teleport-dominated routes). Needs a second search permit while both run; falls back to the single-engine path when none is free. `/stats` reports `race_runs`, `race_wins_uni`, `race_wins_bidir`; every route log line carries `engine=uni|bidir|cache`. Note: the two engines break equal-cost ties differently, so with the race on the served path among several **equal-cost** alternatives depends on which engine finished first (cost is identical either way; `tools/payload_baseline.json` is captured with the race off). |
 | `NAVPATH_BIDIR_MIN_HB_RATIO` | `0` | Backward-bound strength below which a route is demoted to unidirectional; `0` (default since 2026-09-17) always runs bidirectional. Measured over 300 random pairs: always-bidir is 1.3-3x faster on long walk routes and within 5% of per-pair best overall, but 3-5x slower on teleport-dominated pairs (`lum_to_falador`, virtual starts) — see `docs/route_latency_improvements_2026-09-17.md`. `0.5` restores the old demotion policy. |
 | `NAVPATH_TIEBREAK_BUCKET_MS` | `0` (off) | Bucketed f-comparison for seeded searches. **Measured harmful on the current snapshot** (2-20x more pops on both engines); leave off. |
