@@ -18,7 +18,9 @@ pub struct MacroEdgeData {
 
 pub struct Adjacency {
     pub nodes: usize,
-    pub offsets: Vec<usize>,
+    /// CSR row starts (u32: this graph holds ~1k macro edges, so 4 B per node instead
+    /// of 8 halves the ~9 MB offsets array each provider carries).
+    pub offsets: Vec<u32>,
     pub dst: Vec<u32>,
     pub w: Vec<f32>,
 }
@@ -32,9 +34,10 @@ impl Adjacency {
         // Counting-sort placement groups each node's neighbors contiguously. No per-node
         // ordering is imposed: A* relaxation is order-independent, and the input edge
         // order (builder emission order) keeps results deterministic.
-        let mut counts = vec![0usize; nodes];
+        assert!(src.len() <= u32::MAX as usize, "adjacency edge count exceeds u32 offsets");
+        let mut counts = vec![0u32; nodes];
         for &s in src { counts[s as usize] += 1; }
-        let mut offsets = vec![0usize; nodes + 1];
+        let mut offsets = vec![0u32; nodes + 1];
         for i in 0..nodes { offsets[i + 1] = offsets[i] + counts[i]; }
         let mut cur = offsets[..nodes].to_vec();
 
@@ -45,7 +48,7 @@ impl Adjacency {
 
         for i in 0..src.len() {
             let s = src[i] as usize;
-            let p = cur[s];
+            let p = cur[s] as usize;
             adst[p] = dst[i];
             aw[p] = w[i];
             if let Some(d) = data {
@@ -60,8 +63,8 @@ impl Adjacency {
     pub fn neighbors(&self, u: u32) -> (&[u32], &[f32]) {
         let u = u as usize;
         if u >= self.nodes { return (&[], &[]); }
-        let s = self.offsets[u];
-        let e = self.offsets[u + 1];
+        let s = self.offsets[u] as usize;
+        let e = self.offsets[u + 1] as usize;
         (&self.dst[s..e], &self.w[s..e])
     }
 }
@@ -271,7 +274,7 @@ impl NeighborProvider {
         let (md, _raw_w) = self.macro_edges.neighbors(u);
         let base = {
             let u = u as usize;
-            if u < self.macro_edges.offsets.len() - 1 { self.macro_edges.offsets[u] } else { 0 }
+            if u < self.macro_edges.offsets.len() - 1 { self.macro_edges.offsets[u] as usize } else { 0 }
         };
         let raw_w = &self.macro_edges.w;
         md.iter().copied().enumerate().filter_map(move |(i, d)| {

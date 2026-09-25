@@ -1,15 +1,15 @@
-use std::{num::NonZeroUsize, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
+use std::{num::NonZeroUsize, path::PathBuf, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock}, time::{SystemTime, UNIX_EPOCH}};
 
 use arc_swap::ArcSwap;
 use axum::{routing::{get, post}, Router};
 use navpath_core::engine::search::SearchContext;
-use navpath_core::{Snapshot, NeighborProvider};
+use navpath_core::{SearchResult, SearchStatus, Snapshot, NeighborProvider};
 /// FxHash maps for the id-keyed lookup tables probed on payload/search setup paths
 /// (`macro_lookup` alone is probed once per path window): u32/u64 keys, non-adversarial,
 /// so SipHash buys nothing here.
 pub use rustc_hash::FxHashMap;
 
-use crate::engine_adapter::{GlobalTeleport, FairyRing};
+use crate::engine_adapter::{GlobalTeleport, FairyRing, MacroLookup, SearchContexts};
 
 pub mod routes;
 pub mod engine_adapter;
@@ -25,36 +25,60 @@ pub struct RouteCacheKey {
     /// The eligibility mask's EXACT bits (one bit per requirement tag, packed). A
     /// 64-bit digest here would let two colliding profiles share a slot and serve a
     /// route computed under the wrong eligibility — identity keys must be lossless.
-    pub mask_bits: Vec<u64>,
+    /// Shared (`Arc`) with the request's [`ProfileKey`]: one allocation per request,
+    /// every further key copy is a reference-count bump.
+    pub mask_bits: Arc<[u64]>,
     pub quick_tele: bool,
     pub seed: Option<u64>,
 }
 
 /// Pack an eligibility mask's satisfied bits into the cache key's lossless form.
-pub fn pack_mask_bits(satisfied: &[bool]) -> Vec<u64> {
-    let mut bits = vec![0u64; satisfied.len().div_ceil(64)];
-    for (i, &b) in satisfied.iter().enumerate() {
-        if b {
-            bits[i / 64] |= 1u64 << (i % 64);
-        }
-    }
-    bits
+pub fn pack_mask_bits(satisfied: &[bool]) -> Arc<[u64]> {
+    satisfied
+        .chunks(64)
+        .map(|chunk| chunk.iter().enumerate().fold(0u64, |w, (i, &b)| w | (u64::from(b) << i)))
+        .collect()
 }
 
 /// Cached search outcome: the raw result, the winning virtual-entry teleport, and
 /// whether the result was served from an unseeded retry of a seeded request (the
 /// `degraded: "seed_dropped"` marker must survive cache hits). Response payloads
 /// (actions/geometry) are rebuilt per request so one entry serves every options
-/// combination.
-pub type RouteCacheEntry = Arc<(navpath_core::SearchResult, Option<u32>, bool)>;
+/// combination. The result is shared (T3.6): the route cache, the sub-path cache and
+/// every hit hold the same allocation — nothing is deep-copied on insert or on a hit.
+#[derive(Clone)]
+pub struct RouteCacheEntry {
+    pub res: Arc<SearchResult>,
+    pub virtual_entry: Option<u32>,
+    pub seed_dropped: bool,
+}
 pub type RouteCache = Mutex<lru::LruCache<RouteCacheKey, RouteCacheEntry>>;
+
+fn route_cache_entries() -> usize {
+    std::env::var("NAVPATH_ROUTE_CACHE").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2048)
+}
 
 /// Route cache sized from `NAVPATH_ROUTE_CACHE` (entries; default 2048, 0 disables).
 pub fn new_route_cache() -> Option<Arc<RouteCache>> {
-    let n = std::env::var("NAVPATH_ROUTE_CACHE").ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(2048);
-    NonZeroUsize::new(n).map(|cap| Arc::new(Mutex::new(lru::LruCache::new(cap))))
+    NonZeroUsize::new(route_cache_entries()).map(|cap| Arc::new(Mutex::new(lru::LruCache::new(cap))))
+}
+
+/// Cache seed policy (`NAVPATH_CACHE_IGNORE_SEED`, **default ON since 2026-08-06** —
+/// plan v3 §3a): drop the seed from the route-cache key, so repeat traffic with
+/// varying seeds — the dominant production shape, which otherwise never hits — is
+/// served the cached path. Cached hits lose per-seed tie variety (jitter is
+/// < 0.1 ms/edge against 300 ms edges, so only equal-cost tie selection changes —
+/// the same trade the budget retry already makes). Measured on the gate that
+/// roadmap 5.2 demanded (2026-07-31): 11 of 12 repeat requests became hits,
+/// ~118 ms → ~0.3–0.9 ms. Set `NAVPATH_CACHE_IGNORE_SEED=0` to restore the legacy
+/// per-seed keying.
+pub fn cache_ignore_seed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(std::env::var("NAVPATH_CACHE_IGNORE_SEED").ok().as_deref().map(str::trim), Some("0") | Some("false"))
+    })
 }
 
 /// Seed-blind shadow index over the route-cache key space: the same [`RouteCacheKey`]
@@ -71,12 +95,14 @@ pub fn new_route_cache() -> Option<Arc<RouteCache>> {
 pub type SeedShadow = Mutex<lru::LruCache<RouteCacheKey, ()>>;
 
 /// Shadow index sized like the route cache (same `NAVPATH_ROUTE_CACHE` budget) so the
-/// attribution it reports matches what the real cache could have held.
+/// attribution it reports matches what the real cache could have held. None under the
+/// default seed-blind policy (T3.12): route-cache keys then carry no seed, so a
+/// seed-caused miss cannot happen and the index would only be maintained, never read.
 pub fn new_seed_shadow() -> Option<Arc<SeedShadow>> {
-    let n = std::env::var("NAVPATH_ROUTE_CACHE").ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(2048);
-    NonZeroUsize::new(n).map(|cap| Arc::new(Mutex::new(lru::LruCache::new(cap))))
+    if cache_ignore_seed() {
+        return None;
+    }
+    NonZeroUsize::new(route_cache_entries()).map(|cap| Arc::new(Mutex::new(lru::LruCache::new(cap))))
 }
 
 /// Why a request was not served from the route cache. Logged per request as
@@ -113,12 +139,60 @@ impl CacheOutcome {
 /// packed bits (via [`pack_mask_bits`] — lossless, same rationale as the route-cache
 /// key) plus the quick-tele flag. Snapshot identity is implicit: the cache lives in
 /// [`SnapshotState`], so a snapshot swap drops it wholesale.
-pub type ProfileKey = (Vec<u64>, bool);
+pub type ProfileKey = (Arc<[u64]>, bool);
 
 /// One cached optimal path with a node -> position index, for exact sub-path reuse.
+/// `res` is the same allocation the route cache holds (T3.6).
 pub struct PathRecord {
-    pub res: navpath_core::SearchResult,
+    pub res: Arc<SearchResult>,
     pub pos: FxHashMap<u32, u32>,
+}
+
+impl PathRecord {
+    /// Index a fresh, proven-optimal, on-graph-start result for sub-path reuse (virtual
+    /// starts are excluded by the caller: their `path[0]` is a teleport landing, not a
+    /// requestable start). None when the result does not qualify. Built in the search's
+    /// blocking task, so the reactor only links the finished record into the cache.
+    pub fn new(res: Arc<SearchResult>) -> Option<Arc<PathRecord>> {
+        if !(res.found && res.status == SearchStatus::Found)
+            || res.path.len() < 2
+            || res.path_g.len() != res.path.len()
+        {
+            return None;
+        }
+        let mut pos = FxHashMap::with_capacity_and_hasher(res.path.len(), Default::default());
+        for (i, &n) in res.path.iter().enumerate() {
+            pos.entry(n).or_insert(i as u32);
+        }
+        Some(Arc::new(PathRecord { res, pos }))
+    }
+}
+
+/// A sub-path served from a [`PathRecord`]: positions `ps..=pg` of its path. Nothing is
+/// copied — the response serializes the slice straight out of the shared record.
+pub struct SubpathHit {
+    pub rec: Arc<PathRecord>,
+    pub ps: usize,
+    pub pg: usize,
+}
+
+impl SubpathHit {
+    pub fn path(&self) -> &[u32] {
+        &self.rec.res.path[self.ps..=self.pg]
+    }
+
+    /// Exact cost of the slice: a sub-path of a shortest path is a shortest path, and
+    /// `path_g` holds the cumulative costs along it.
+    pub fn cost(&self) -> f32 {
+        self.rec.res.path_g[self.pg] - self.rec.res.path_g[self.ps]
+    }
+
+    /// Cumulative costs along the slice, rebased to start at 0 (diagnostics/tests; the
+    /// response never carries `path_g`).
+    pub fn path_g(&self) -> Vec<f32> {
+        let g0 = self.rec.res.path_g[self.ps];
+        self.rec.res.path_g[self.ps..=self.pg].iter().map(|g| g - g0).collect()
+    }
 }
 
 /// Exact sub-path reuse for re-plans (docs/route_latency_improvements_2026-09-17.md
@@ -131,10 +205,14 @@ pub struct PathRecord {
 /// (`NAVPATH_SUBPATH_CACHE`, default 64; 0 disables); lookup is N hash probes.
 pub type SubpathCache = Mutex<lru::LruCache<ProfileKey, std::collections::VecDeque<Arc<PathRecord>>>>;
 
+/// `NAVPATH_SUBPATH_CACHE` (default 64), read once (T3.6; it was re-read per insert).
 pub fn subpath_cache_paths() -> usize {
-    std::env::var("NAVPATH_SUBPATH_CACHE").ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(64)
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("NAVPATH_SUBPATH_CACHE").ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(64)
+    })
 }
 
 pub fn new_subpath_cache() -> Option<Arc<SubpathCache>> {
@@ -152,7 +230,8 @@ pub fn new_subpath_cache() -> Option<Arc<SubpathCache>> {
 
 /// Returns the served sub-path (if any) and whether ANY cached path for this profile
 /// contains the goal — the latter counts how often a near-start variant would pay.
-pub fn subpath_lookup(cache: &SubpathCache, key: &ProfileKey, sid: u32, gid: u32) -> (Option<navpath_core::SearchResult>, bool) {
+/// Only the position probes run under the lock; the caller reads the slice afterwards.
+pub fn subpath_lookup(cache: &SubpathCache, key: &ProfileKey, sid: u32, gid: u32) -> (Option<SubpathHit>, bool) {
     let mut goal_known = false;
     let Ok(mut c) = cache.lock() else { return (None, false) };
     let Some(paths) = c.get(key) else { return (None, false) };
@@ -163,42 +242,13 @@ pub fn subpath_lookup(cache: &SubpathCache, key: &ProfileKey, sid: u32, gid: u32
         if ps > pg {
             continue;
         }
-        let (ps, pg) = (ps as usize, pg as usize);
-        let g0 = rec.res.path_g[ps];
-        let path = rec.res.path[ps..=pg].to_vec();
-        let path_g: Vec<f32> = rec.res.path_g[ps..=pg].iter().map(|g| g - g0).collect();
-        let cost = rec.res.path_g[pg] - g0;
-        return (
-            Some(navpath_core::SearchResult {
-                found: true,
-                status: navpath_core::SearchStatus::Found,
-                path,
-                path_g,
-                cost,
-                pops: 0,
-                pops_f: 0,
-                pops_b: 0,
-            }),
-            true,
-        );
+        return (Some(SubpathHit { rec: rec.clone(), ps: ps as usize, pg: pg as usize }), true);
     }
     (None, goal_known)
 }
 
-/// Remember a fresh, proven-optimal, on-graph-start result (virtual starts excluded:
-/// their `path[0]` is a teleport landing, not a requestable start).
-pub fn subpath_insert(cache: &SubpathCache, key: ProfileKey, res: &navpath_core::SearchResult) {
-    if !(res.found && res.status == navpath_core::SearchStatus::Found)
-        || res.path.len() < 2
-        || res.path_g.len() != res.path.len()
-    {
-        return;
-    }
-    let mut pos = FxHashMap::with_capacity_and_hasher(res.path.len(), Default::default());
-    for (i, &n) in res.path.iter().enumerate() {
-        pos.entry(n).or_insert(i as u32);
-    }
-    let rec = Arc::new(PathRecord { res: res.clone(), pos });
+/// Remember an indexed optimal path (see [`PathRecord::new`]) as the profile's newest.
+pub fn subpath_insert(cache: &SubpathCache, key: ProfileKey, rec: Arc<PathRecord>) {
     let cap = subpath_cache_paths();
     if let Ok(mut c) = cache.lock() {
         let paths = c.get_or_insert_mut(key, std::collections::VecDeque::new);
@@ -244,16 +294,15 @@ pub struct SnapshotState {
     /// Reversed macro adjacency for bidirectional searches.
     pub neighbors_rev: Option<Arc<NeighborProvider>>,
     pub globals: Arc<Vec<GlobalTeleport>>, // dst, cost, reqs (indices)
-    pub macro_lookup: Arc<FxHashMap<(u32, u32), Vec<u32>>>,
-    /// Requirement id -> tag index, derived from the snapshot's `req_tags` section once
-    /// at load (previously rebuilt on every payload).
-    pub req_tag_index: Arc<FxHashMap<u32, usize>>,
+    /// Macro edges by (src, dst) plus each edge's requirement list and metadata, decoded
+    /// once at load (the payload builder no longer parses metadata per request).
+    pub macro_lookup: Arc<MacroLookup>,
     pub loaded_at_unix: u64,
     pub snapshot_hash_hex: Option<String>,
     /// Per-snapshot route result cache (None = disabled). Dropped on snapshot swap.
     pub route_cache: Option<Arc<RouteCache>>,
     /// Seed-blind miss attribution for [`route_cache`](Self::route_cache); see
-    /// [`SeedShadow`]. None whenever the route cache is disabled.
+    /// [`SeedShadow`]. None whenever the route cache is disabled or seed-blind.
     pub seed_shadow: Option<Arc<SeedShadow>>,
     // Fairy Ring data
     pub fairy_rings: Arc<Vec<FairyRing>>,
@@ -267,6 +316,91 @@ pub struct SnapshotState {
     /// Per-profile artifact cache (roadmap 5.4). Dropped on snapshot swap.
     pub profile_cache: Arc<ProfileCache>,
     pub subpath_cache: Option<Arc<SubpathCache>>,
+    /// What [`warm_snapshot`] pinned for this mapping ([`WarmState`] as u8), read by the
+    /// keep-warm loop.
+    pub warm_state: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl SnapshotState {
+    pub fn set_warm_state(&self, w: WarmState) {
+        self.warm_state.store(w as u8, Ordering::Relaxed);
+    }
+
+    pub fn warm_state(&self) -> WarmState {
+        match self.warm_state.load(Ordering::Relaxed) {
+            1 => WarmState::LockedHead,
+            2 => WarmState::LockedAll,
+            _ => WarmState::Unlocked,
+        }
+    }
+
+    /// Everything derived from one opened snapshot, with fresh (empty) caches. The
+    /// independent load-time builders run concurrently (T3.15): the canonical grid (plus
+    /// JPS tables, the slowest) and the fairy rings each on a scoped thread while this
+    /// thread parses the macro metadata; only the component graph waits for both.
+    pub fn build(path: PathBuf, snapshot: Snapshot, snapshot_hash_hex: Option<String>) -> SnapshotState {
+        let snap = &snapshot;
+        let ((neighbors, neighbors_rev, globals, macro_lookup), (fairy_rings, node_to_fairy_ring), canonical_grid) =
+            std::thread::scope(|s| {
+                let canonical = std::thread::Builder::new()
+                    .name("navpath-load-canon".into())
+                    .spawn_scoped(s, || engine_adapter::build_canonical_grid(snap))
+                    .expect("spawn canonical-grid builder");
+                let fairy = std::thread::Builder::new()
+                    .name("navpath-load-fairy".into())
+                    .spawn_scoped(s, || engine_adapter::build_fairy_rings(snap))
+                    .expect("spawn fairy-ring builder");
+                let provider = engine_adapter::build_neighbor_provider(snap);
+                (
+                    provider,
+                    fairy.join().expect("fairy-ring builder panicked"),
+                    canonical.join().expect("canonical-grid builder panicked"),
+                )
+            });
+        let comp_graph = engine_adapter::build_component_graph(snap, &globals, &fairy_rings, &macro_lookup);
+        SnapshotState {
+            path,
+            snapshot: Some(Arc::new(snapshot)),
+            neighbors: Some(Arc::new(neighbors)),
+            neighbors_rev: Some(Arc::new(neighbors_rev)),
+            globals: Arc::new(globals),
+            macro_lookup: Arc::new(macro_lookup),
+            loaded_at_unix: now_unix(),
+            snapshot_hash_hex,
+            route_cache: new_route_cache(),
+            seed_shadow: new_seed_shadow(),
+            fairy_rings: Arc::new(fairy_rings),
+            node_to_fairy_ring: Arc::new(node_to_fairy_ring),
+            comp_graph: Some(Arc::new(comp_graph)),
+            canonical_grid,
+            profile_cache: new_profile_cache(),
+            subpath_cache: new_subpath_cache(),
+            warm_state: Arc::new(std::sync::atomic::AtomicU8::new(WarmState::Unlocked as u8)),
+        }
+    }
+
+    /// Not-ready state for a snapshot that failed to open: `/route` answers 503.
+    pub fn unloaded(path: PathBuf, snapshot_hash_hex: Option<String>) -> SnapshotState {
+        SnapshotState {
+            path,
+            snapshot: None,
+            neighbors: None,
+            neighbors_rev: None,
+            globals: Arc::new(Vec::new()),
+            macro_lookup: Arc::new(engine_adapter::MacroLookup::default()),
+            loaded_at_unix: now_unix(),
+            snapshot_hash_hex,
+            route_cache: new_route_cache(),
+            seed_shadow: new_seed_shadow(),
+            fairy_rings: Arc::new(Vec::new()),
+            node_to_fairy_ring: Arc::new(FxHashMap::default()),
+            comp_graph: None,
+            canonical_grid: None,
+            profile_cache: new_profile_cache(),
+            subpath_cache: new_subpath_cache(),
+            warm_state: Arc::new(std::sync::atomic::AtomicU8::new(WarmState::Unlocked as u8)),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -275,10 +409,10 @@ pub struct AppState {
     /// Bounds concurrent searches (and therefore live node-sized SearchContexts and
     /// blocking-pool threads). Sized from NAVPATH_MAX_CONCURRENT_SEARCHES, default =
     /// available parallelism.
-    pub search_permits: Arc<tokio::sync::Semaphore>,
+    pub search_permits: Arc<SearchPermits>,
     /// Process-lifetime counters/histograms; relaxed atomics, never on the search loop.
     pub metrics: Arc<Metrics>,
-    /// Bounded checkout pool for per-search context pairs (see [`ContextPool`]).
+    /// Bounded checkout pool for per-search contexts (see [`ContextPool`]).
     pub ctx_pool: Arc<ContextPool>,
     /// False until the startup warm-up (snapshot populate + context pre-warm) has run;
     /// `/route` answers 503 and `/health` reports `ready: false` meanwhile, so an
@@ -288,87 +422,231 @@ pub struct AppState {
 
 /// Page the snapshot in (default on; `NAVPATH_MMAP_POPULATE=0` disables) and optionally
 /// `mlock` it (`NAVPATH_MLOCK=1`). Used at startup and before every `/admin/reload`
-/// swap, so no request ever runs against a cold mapping.
-pub fn warm_snapshot(snapshot: &Snapshot) {
+/// swap, so no request ever runs against a cold mapping. Returns whether the mapping
+/// (or at least its non-ALT head) is locked, in which case keep-warm is unnecessary
+/// for the locked part.
+///
+/// When the whole mapping cannot be locked (`RLIMIT_MEMLOCK` below the snapshot size —
+/// 8 MB on a default desktop), the ~45 MB of per-pop hot sections (coords, walk CSR,
+/// component ids, metadata) are locked instead when the limit allows: those are touched
+/// on every pop, and after 18 h of uptime the live service had only 0.8 MB of them
+/// resident. Raise the limit (systemd `LimitMEMLOCK=`, or `CAP_IPC_LOCK`) to lock all.
+pub fn warm_snapshot(snapshot: &Snapshot) -> WarmState {
     let populate = !matches!(std::env::var("NAVPATH_MMAP_POPULATE").ok().as_deref().map(str::trim), Some("0") | Some("false"));
-    if populate {
-        let t = std::time::Instant::now();
-        let bytes = snapshot.populate();
-        tracing::info!(mib = bytes / (1024 * 1024), elapsed_ms = t.elapsed().as_millis() as u64, "populated snapshot mapping");
-    }
-    if matches!(std::env::var("NAVPATH_MLOCK").ok().as_deref().map(str::trim), Some("1") | Some("true")) {
+    let mlock = matches!(std::env::var("NAVPATH_MLOCK").ok().as_deref().map(str::trim), Some("1") | Some("true"));
+    let mut locked = WarmState::Unlocked;
+    if mlock {
+        // mlock populates too, so a successful full lock makes the populate pass moot.
         match snapshot.lock_memory() {
-            Ok(()) => tracing::info!("mlock'd snapshot mapping"),
-            Err(e) => tracing::warn!(error = %e, "mlock failed (raise RLIMIT_MEMLOCK); continuing without it"),
+            Ok(()) => {
+                tracing::info!("mlock'd the whole snapshot mapping");
+                return WarmState::LockedAll;
+            }
+            Err(e) => match snapshot.lock_head() {
+                Ok(()) => {
+                    tracing::warn!(error = %e, "mlock of the whole snapshot failed (raise RLIMIT_MEMLOCK); locked the non-ALT head only");
+                    locked = WarmState::LockedHead;
+                }
+                Err(e2) => tracing::warn!(error = %e, head_error = %e2, "mlock failed (raise RLIMIT_MEMLOCK); continuing without it"),
+            },
         }
     }
+    if populate {
+        let t = std::time::Instant::now();
+        let bytes = if locked == WarmState::LockedHead { snapshot.populate_alt() } else { snapshot.populate() };
+        tracing::info!(mib = bytes / (1024 * 1024), elapsed_ms = t.elapsed().as_millis() as u64, "populated snapshot mapping");
+    }
+    locked
 }
 
-/// Checkout pool for the node-sized per-search context pair.
+/// What [`warm_snapshot`] managed to pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WarmState {
+    Unlocked = 0,
+    LockedHead = 1,
+    LockedAll = 2,
+}
+
+/// `NAVPATH_MMAP_POPULATE=0` (a deliberately cold mapping, e.g. for cold-cache
+/// studies) also disables the keep-warm loop.
+pub fn keep_warm_disabled_by_populate() -> bool {
+    matches!(std::env::var("NAVPATH_MMAP_POPULATE").ok().as_deref().map(str::trim), Some("0") | Some("false"))
+}
+
+/// Keep-warm interval (`NAVPATH_KEEP_WARM_S`, default 60 s; 0 disables).
+pub fn keep_warm_interval() -> Option<std::time::Duration> {
+    let s = std::env::var("NAVPATH_KEEP_WARM_S").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    (s > 0).then(|| std::time::Duration::from_secs(s))
+}
+
+/// Background keep-warm loop for mappings that could not be (fully) locked: the
+/// startup populate only protects the first minutes on a host under memory pressure
+/// (measured: 18 h in, 58 MB of the 330 MB mapping was still resident and cold rows cost
+/// 50-90 µs per pop). Every interval it re-populates whatever is not locked with
+/// MADV_POPULATE_READ — page-table walks when resident (milliseconds), disk reads for
+/// pages the kernel evicted, off the request path. Follows `/admin/reload` swaps.
+pub fn spawn_keep_warm(current: Arc<ArcSwap<SnapshotState>>, interval: std::time::Duration) {
+    let _ = std::thread::Builder::new().name("navpath-keep-warm".into()).spawn(move || loop {
+        std::thread::sleep(interval);
+        let cur = current.load_full();
+        let Some(snap) = cur.snapshot.as_ref() else { continue };
+        let t = std::time::Instant::now();
+        let bytes = match cur.warm_state() {
+            WarmState::LockedAll => continue,
+            WarmState::LockedHead => snap.populate_alt(),
+            WarmState::Unlocked => snap.populate(),
+        };
+        tracing::debug!(mib = bytes / (1024 * 1024), elapsed_ms = t.elapsed().as_millis() as u64, "keep-warm pass");
+    });
+}
+
+/// Checkout pool of node-sized search contexts, pooled ONE context at a time (T3.4).
 ///
 /// Replaces blocking-pool `thread_local!` contexts: tokio's blocking pool grows to 512
 /// threads and reaps idle ones after ~10 s, so thread-locals both pinned multi-MB state
 /// on arbitrary threads (worst case threads x 2 x nodes x 16 B) and re-paid the
 /// allocation on every fresh thread at low QPS — a recurring p99 spike. The search
-/// semaphore bounds concurrent checkouts, so the pool never holds more pairs than the
-/// concurrency limit; contexts survive snapshot swaps via `SearchContext::reset`.
+/// semaphore bounds concurrent checkouts, so the pool never holds more contexts than
+/// the concurrency limit can use at once; contexts survive snapshot swaps via
+/// `SearchContext::reset`.
+///
+/// A lease ([`PooledContexts`]) takes a context from the pool only when the search
+/// asks for it: unidirectional, JPS and virtual-start searches use one, bidirectional
+/// searches two. Pooling pairs used to pin the idle half of every unidirectional
+/// checkout (~19 MB each at 1.1M nodes) and drained the pre-warmed pool twice as fast.
 pub struct ContextPool {
-    stack: Mutex<Vec<Box<(SearchContext, SearchContext)>>>,
+    stack: Mutex<Vec<SearchContext>>,
+    /// Contexts handed out that the pool could not supply (allocated, and page-faulted,
+    /// inside a request). Reported by `/stats`; a rising count means the pre-warm is
+    /// smaller than the concurrent demand.
+    fresh: AtomicU64,
 }
 
 impl ContextPool {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<Self> {
-        Arc::new(ContextPool { stack: Mutex::new(Vec::new()) })
+        Arc::new(ContextPool { stack: Mutex::new(Vec::new()), fresh: AtomicU64::new(0) })
     }
 
-    /// Check out a context pair (fresh and empty if the pool has none spare); it
-    /// returns to the pool when the guard drops.
-    /// Pre-allocate and page in `pairs` context pairs for `nodes` nodes so no request
-    /// pays the ~36 MB first-touch fault storm (docs/route_latency_improvements_2026-09-17.md
-    /// §2.2). Sized to the search permits (x2 with the engine race on) at startup.
-    pub fn prewarm(&self, pairs: usize, nodes: usize) {
-        let mut warmed = Vec::with_capacity(pairs);
-        for _ in 0..pairs {
-            let mut pair = Box::new((SearchContext::new(nodes), SearchContext::new(nodes)));
-            pair.0.prefault();
-            pair.1.prefault();
-            warmed.push(pair);
+    /// Pre-allocate and page in `contexts` search contexts for `nodes` nodes so no
+    /// request pays the ~19 MB first-touch fault storm per context
+    /// (docs/route_latency_improvements_2026-09-17.md §2.2). A bidirectional search
+    /// uses two, anything else one.
+    pub fn prewarm(&self, contexts: usize, nodes: usize) {
+        let mut warmed = Vec::with_capacity(contexts);
+        for _ in 0..contexts {
+            let mut ctx = SearchContext::new(nodes);
+            ctx.prefault();
+            warmed.push(ctx);
         }
         if let Ok(mut s) = self.stack.lock() {
             s.extend(warmed);
         }
     }
 
+    /// A lease that checks contexts out on first use and returns them to the pool when
+    /// dropped.
     pub fn checkout(self: &Arc<Self>) -> PooledContexts {
-        let pair = self
-            .stack
-            .lock()
-            .ok()
-            .and_then(|mut s| s.pop())
-            .unwrap_or_else(|| Box::new((SearchContext::new(0), SearchContext::new(0))));
-        PooledContexts { pool: self.clone(), pair: Some(pair) }
+        PooledContexts { pool: self.clone(), fwd: None, bwd: None }
+    }
+
+    /// Contexts currently idle in the pool.
+    pub fn idle(&self) -> usize {
+        self.stack.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Contexts allocated inside requests because the pool was empty.
+    pub fn fresh_allocations(&self) -> u64 {
+        self.fresh.load(Ordering::Relaxed)
+    }
+
+    fn take(&self) -> SearchContext {
+        if let Some(ctx) = self.stack.lock().ok().and_then(|mut s| s.pop()) {
+            return ctx;
+        }
+        self.fresh.fetch_add(1, Ordering::Relaxed);
+        // Sized lazily by the search's `reset(nodes)`.
+        SearchContext::new(0)
     }
 }
 
+/// A checkout from [`ContextPool`]: holds at most two contexts, each taken on first use.
 pub struct PooledContexts {
     pool: Arc<ContextPool>,
-    pair: Option<Box<(SearchContext, SearchContext)>>,
+    fwd: Option<SearchContext>,
+    bwd: Option<SearchContext>,
 }
 
-impl PooledContexts {
-    pub fn pair(&mut self) -> &mut (SearchContext, SearchContext) {
-        self.pair.as_mut().expect("context pair checked out")
+impl SearchContexts for PooledContexts {
+    fn one(&mut self) -> &mut SearchContext {
+        let pool = &self.pool;
+        self.fwd.get_or_insert_with(|| pool.take())
+    }
+
+    fn two(&mut self) -> (&mut SearchContext, &mut SearchContext) {
+        let pool = &self.pool;
+        let fwd = self.fwd.get_or_insert_with(|| pool.take());
+        let bwd = self.bwd.get_or_insert_with(|| pool.take());
+        (fwd, bwd)
     }
 }
 
 impl Drop for PooledContexts {
     fn drop(&mut self) {
-        if let Some(pair) = self.pair.take() {
-            if let Ok(mut s) = self.pool.stack.lock() {
-                s.push(pair);
-            }
+        let (fwd, bwd) = (self.fwd.take(), self.bwd.take());
+        if fwd.is_none() && bwd.is_none() {
+            return;
         }
+        if let Ok(mut s) = self.pool.stack.lock() {
+            s.extend(fwd);
+            s.extend(bwd);
+        }
+    }
+}
+
+/// Search admission: a semaphore plus its size, so hedges can be admitted only with
+/// headroom (T3.1).
+pub struct SearchPermits {
+    sem: Arc<tokio::sync::Semaphore>,
+    total: usize,
+}
+
+impl SearchPermits {
+    pub fn new(total: usize) -> Arc<Self> {
+        Arc::new(SearchPermits { sem: Arc::new(tokio::sync::Semaphore::new(total)), total })
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    pub fn available(&self) -> usize {
+        self.sem.available_permits()
+    }
+
+    /// A primary search permit; None = at capacity (the request gets a 503).
+    pub fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.sem.clone().try_acquire_owned().ok()
+    }
+
+    /// A permit for a race hedge (the second engine), granted only while more than a
+    /// quarter of all permits would remain free. A hedge shares the primaries'
+    /// semaphore, so without this reserve every running race held two permits and
+    /// pushed later primaries into 503s; with it, hedges only ever use spare capacity.
+    pub fn try_acquire_hedge(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let reserve = self.total / 4;
+        if self.sem.available_permits() <= reserve {
+            return None;
+        }
+        let permit = self.sem.clone().try_acquire_owned().ok()?;
+        // Another request may have taken permits between the check and the acquire.
+        if self.sem.available_permits() < reserve {
+            return None; // dropping `permit` returns it
+        }
+        Some(permit)
     }
 }
 
@@ -404,10 +682,18 @@ pub struct Metrics {
     /// Requests answered found=false by the component reachability precheck — each one
     /// is a budget-capped flood that never ran.
     pub precheck_rejects: AtomicU64,
-    /// Hedged-race accounting (`NAVPATH_RACE=1`): races started, and which engine won.
+    /// Hedged-race accounting (`NAVPATH_RACE=1`): races actually run (both engines
+    /// searching), and which engine won them.
     pub race_runs: AtomicU64,
     pub race_wins_uni: AtomicU64,
     pub race_wins_bidir: AtomicU64,
+    /// Race-eligible misses that ran the primary engine alone: the predictive gate
+    /// (`NAVPATH_RACE_GATE`) judged the route not worth a second engine ...
+    pub race_gated: AtomicU64,
+    /// ... the primary finished inside the hedge delay (`NAVPATH_RACE_HEDGE_MS`) ...
+    pub race_hedge_skipped: AtomicU64,
+    /// ... or no permit could be spared for the hedge (admission reserve, T3.1).
+    pub race_hedge_denied: AtomicU64,
     /// log2 histogram of heap pops per fresh search (bucket i>0 covers [2^(i-1), 2^i)).
     pub pops_log2: [AtomicU64; 26],
     /// log2 histogram of search wall time in ms (same bucket scheme).
@@ -482,6 +768,9 @@ impl Metrics {
             "race_runs": c(&self.race_runs),
             "race_wins_uni": c(&self.race_wins_uni),
             "race_wins_bidir": c(&self.race_wins_bidir),
+            "race_gated": c(&self.race_gated),
+            "race_hedge_skipped": c(&self.race_hedge_skipped),
+            "race_hedge_denied": c(&self.race_hedge_denied),
             "pops_log2": hist(&self.pops_log2),
             "search_ms_log2": hist(&self.search_ms_log2),
             "search_us_log2": hist(&self.search_us_log2),
@@ -490,13 +779,13 @@ impl Metrics {
     }
 }
 
-/// Semaphore sized from `NAVPATH_MAX_CONCURRENT_SEARCHES` (default: available cores).
-pub fn default_search_permits() -> Arc<tokio::sync::Semaphore> {
+/// Permits sized from `NAVPATH_MAX_CONCURRENT_SEARCHES` (default: available cores).
+pub fn default_search_permits() -> Arc<SearchPermits> {
     let n = std::env::var("NAVPATH_MAX_CONCURRENT_SEARCHES").ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
-    Arc::new(tokio::sync::Semaphore::new(n))
+    SearchPermits::new(n)
 }
 
 pub fn env_var(name: &str, default: &str) -> String {
@@ -516,7 +805,12 @@ pub fn read_tail_hash_hex(path: &PathBuf) -> Option<String> {
     let _ = f.seek(SeekFrom::Start(len.saturating_sub(32))) .ok()?;
     let mut buf = [0u8; 32];
     let _ = f.read_exact(&mut buf).ok()?;
-    Some(buf.iter().map(|b| format!("{:02x}", b)).collect())
+    let mut hex = String::with_capacity(64);
+    for b in buf {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Some(hex)
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -534,30 +828,34 @@ pub fn build_router(state: AppState) -> Router {
 #[cfg(test)]
 mod subpath_tests {
     use super::*;
-    use navpath_core::{SearchResult, SearchStatus};
 
     fn res(path: Vec<u32>, path_g: Vec<f32>) -> SearchResult {
         let cost = *path_g.last().unwrap();
         SearchResult { found: true, status: SearchStatus::Found, path, path_g, cost, pops: 7, pops_f: 7, pops_b: 0 }
     }
 
+    fn insert(cache: &SubpathCache, key: &ProfileKey, r: SearchResult) {
+        if let Some(rec) = PathRecord::new(Arc::new(r)) {
+            subpath_insert(cache, key.clone(), rec);
+        }
+    }
+
     #[test]
     fn subpath_cache_serves_exact_slices_and_reports_goal_known() {
         let cache = new_subpath_cache().expect("enabled by default");
-        let key: ProfileKey = (vec![0b101], false);
-        subpath_insert(&cache, key.clone(), &res(vec![10, 11, 12, 13], vec![0.0, 300.0, 600.0, 1024.0]));
+        let key: ProfileKey = (Arc::from([0b101u64]), false);
+        insert(&cache, &key, res(vec![10, 11, 12, 13], vec![0.0, 300.0, 600.0, 1024.0]));
 
         // suffix
         let (hit, known) = subpath_lookup(&cache, &key, 11, 13);
         let hit = hit.expect("suffix hit");
         assert!(known);
-        assert_eq!(hit.path, vec![11, 12, 13]);
-        assert_eq!(hit.path_g, vec![0.0, 300.0, 724.0]);
-        assert_eq!(hit.cost, 724.0);
-        assert_eq!(hit.pops, 0);
+        assert_eq!(hit.path(), &[11, 12, 13]);
+        assert_eq!(hit.path_g(), vec![0.0, 300.0, 724.0]);
+        assert_eq!(hit.cost(), 724.0);
         // prefix and interior
-        assert_eq!(subpath_lookup(&cache, &key, 10, 12).0.unwrap().cost, 600.0);
-        assert_eq!(subpath_lookup(&cache, &key, 11, 12).0.unwrap().path, vec![11, 12]);
+        assert_eq!(subpath_lookup(&cache, &key, 10, 12).0.unwrap().cost(), 600.0);
+        assert_eq!(subpath_lookup(&cache, &key, 11, 12).0.unwrap().path(), &[11, 12]);
         // wrong direction: goal known, no hit
         let (hit, known) = subpath_lookup(&cache, &key, 13, 11);
         assert!(hit.is_none() && known);
@@ -568,11 +866,48 @@ mod subpath_tests {
         let (hit, known) = subpath_lookup(&cache, &key, 10, 99);
         assert!(hit.is_none() && !known);
         // other profile sees nothing
-        assert!(subpath_lookup(&cache, &(vec![0b111], false), 11, 13).0.is_none());
+        assert!(subpath_lookup(&cache, &(Arc::from([0b111u64]), false), 11, 13).0.is_none());
         // truncated / not-found results are never inserted
         let mut bad = res(vec![1, 2], vec![0.0, 300.0]);
         bad.status = SearchStatus::BudgetExceeded;
-        subpath_insert(&cache, key.clone(), &bad);
+        assert!(PathRecord::new(Arc::new(bad.clone())).is_none());
+        insert(&cache, &key, bad);
         assert!(subpath_lookup(&cache, &key, 1, 2).0.is_none());
+    }
+
+    #[test]
+    fn pack_mask_bits_is_lossless_and_word_aligned() {
+        let mut bits = vec![false; 130];
+        for i in [0usize, 5, 63, 64, 127, 129] {
+            bits[i] = true;
+        }
+        let packed = pack_mask_bits(&bits);
+        assert_eq!(packed.len(), 3);
+        assert_eq!(packed[0], 1 | (1 << 5) | (1 << 63));
+        assert_eq!(packed[1], 1 | (1 << 63));
+        assert_eq!(packed[2], 1 << 1);
+        assert!(pack_mask_bits(&[]).is_empty());
+    }
+
+    #[test]
+    fn pooled_lease_takes_contexts_only_on_demand() {
+        let pool = ContextPool::new();
+        pool.prewarm(3, 16);
+        {
+            let mut lease = pool.checkout();
+            assert_eq!(pool.idle(), 3, "a lease takes nothing up front");
+            let _ = lease.one();
+            assert_eq!(pool.idle(), 2, "unidirectional searches take one context");
+        }
+        assert_eq!(pool.idle(), 3);
+        {
+            let mut lease = pool.checkout();
+            let _ = lease.two();
+            assert_eq!(pool.idle(), 1, "bidirectional searches take two");
+            let mut other = pool.checkout();
+            let _ = other.two();
+            assert_eq!(pool.fresh_allocations(), 1, "the fourth context had to be allocated");
+        }
+        assert_eq!(pool.idle(), 4);
     }
 }

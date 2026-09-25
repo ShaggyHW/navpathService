@@ -8,14 +8,16 @@ use rusqlite::{Connection, OpenFlags};
 use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 
-use navpath_core::snapshot::{pack_coord, write_snapshot_v8, SnapshotSections};
+use navpath_core::snapshot::{pack_coord, write_snapshot, AltFormat, SnapshotSections, WriteOptions};
 
-mod build;
-use build::graph::compile_walk_edges;
+use navpath_builder::build;
+use build::chains::flatten_all_chains;
+use build::components::{walk_components, Structure};
+use build::dijkstra::AltGraph;
+use build::graph::compile_walk_csr;
+use build::landmarks::{align_landmark_count, build_alt, table_stats, AltConfig, Strategy};
 use build::load_sqlite::{load_all_tiles, load_fairy_rings};
-use build::chains::{flatten_chains, flatten_global_chains};
 use build::requirements::compile_requirement_tags;
-use build::landmarks::{select_and_compute_alt, walk_component_ids};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -45,9 +47,41 @@ struct Args {
     #[arg(long = "no-walkable", default_value_t = false)] 
     no_walkable: bool,
 
-    /// Landmark count (simple selection for now)
-    #[arg(long = "landmarks", value_name = "N", default_value_t = 0)] 
+    /// Landmark count (0 = no ALT table). Rounded UP to a multiple of 16: the runtime's
+    /// AVX-512 full-row heuristic needs a row stride (2 u16 per landmark) that is a
+    /// whole number of 32-lane registers.
+    #[arg(long = "landmarks", value_name = "N", default_value_t = 0)]
     landmarks: u32,
+
+    /// Landmark placement: `scc` (default) splits the budget across strongly connected
+    /// components and places landmarks by symmetric farthest-point inside each; `legacy`
+    /// reproduces the old forward-only farthest-point selection byte for byte (A/B).
+    #[arg(long = "landmark-strategy", value_enum, default_value_t = LandmarkStrategy::Scc)]
+    landmark_strategy: LandmarkStrategy,
+
+    /// SCC strategy only: give every weakly disconnected component local landmarks,
+    /// written into the main landmarks' columns (no extra table bytes).
+    #[arg(long = "local-fill", default_value_t = true, action = clap::ArgAction::Set)]
+    local_fill: bool,
+
+    /// ALT table encoding. `packed` (default): per-16-node-cluster u16 bases plus u8
+    /// offsets, with an exact-value exception list — 35% smaller snapshot, ~1.8-2x faster
+    /// cold-cache queries, warm speed and pop counts within noise of `u16` (costs are
+    /// always optimal). `u16`: the plain interleaved table.
+    #[arg(long = "alt-format", value_enum, default_value_t = AltFormatArg::Packed)]
+    alt_format: AltFormatArg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LandmarkStrategy {
+    Legacy,
+    Scc,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum AltFormatArg {
+    U16,
+    Packed,
 }
 
 // Build a db_row JSON object for the first step of a macro-edge, depending on kind
@@ -361,11 +395,24 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     info!(?args, "starting builder");
+    let t_start = std::time::Instant::now();
+    let stage = |name: &str, t: std::time::Instant| {
+        info!(stage = name, elapsed_ms = t.elapsed().as_millis() as u64, total_ms = t_start.elapsed().as_millis() as u64, "stage done");
+    };
+
+    let landmark_count = if args.landmarks % build::landmarks::LANDMARK_ALIGN != 0 {
+        let aligned = align_landmark_count(args.landmarks);
+        tracing::warn!(requested = args.landmarks, aligned, "landmark count rounded up to a multiple of 16 (SIMD row stride)");
+        aligned
+    } else {
+        args.landmarks
+    };
 
     let conn = open_read_only(&args.sqlite_path)
         .with_context(|| format!("failed to open {:?}", args.sqlite_path))?;
 
     // Load tiles
+    let t = std::time::Instant::now();
     let tiles = load_all_tiles(&conn)?;
     if tiles.is_empty() {
         anyhow::bail!("no tiles found in DB");
@@ -396,16 +443,107 @@ fn main() -> Result<()> {
         );
     }
 
+    stage("load_tiles", t);
+
     // Coordinate -> node id resolution: binary search over the packed keys (identical
     // results to the old HashMap, minus its ~36 MB and per-probe hashing).
     let node_id_of = build::graph::NodeIndex::new(&coords_packed);
 
-    // Compile walk edges with diagonal/cardinal rules
-    let walk = compile_walk_edges(&tiles, &node_id_of);
-    let (walk_src, walk_dst, walk_w) = walk;
+    // Walk graph, emitted straight into the snapshot's CSR (+ diagonal bitmap) form.
+    let t = std::time::Instant::now();
+    let walk = compile_walk_csr(&tiles, &coords_packed);
+    let walk_offsets = &walk.offsets;
+    let walk_csr_dst = &walk.dst;
+
+    // Fail fast (before the metadata and ALT stages): both structural invariants the
+    // query engine relies on are checked on the CSR as soon as it exists.
+    //
+    // Bidirectional search reuses the forward walk CSR as its reverse graph (and so does
+    // the ALT stage below), which is only sound if every walk edge has its mirror (the
+    // mirror's weight is then equal: walk weights are implied by the direction class,
+    // and the reverse of a cardinal/diagonal step is a cardinal/diagonal step). The
+    // current rules guarantee it for cardinals and it holds empirically for diagonals;
+    // assert so future map data can't silently break search correctness.
+    {
+        use rayon::prelude::*;
+        // Read-only CSR scan; sum-reduce the asymmetry count across nodes (roadmap 7.5).
+        let asym: usize = (0..node_count)
+            .into_par_iter()
+            .map(|u| {
+                let (s, e) = (walk_offsets[u] as usize, walk_offsets[u + 1] as usize);
+                let mut bad = 0usize;
+                'edge: for slot in s..e {
+                    let v = walk_csr_dst[slot] as usize;
+                    let (vs, ve) = (walk_offsets[v] as usize, walk_offsets[v + 1] as usize);
+                    for vslot in vs..ve {
+                        if walk_csr_dst[vslot] as usize == u {
+                            continue 'edge;
+                        }
+                    }
+                    bad += 1;
+                }
+                bad
+            })
+            .sum();
+        if asym > 0 {
+            anyhow::bail!("walk graph is not symmetric: {asym} edges lack a mirror; bidirectional search would be unsound");
+        }
+    }
+
+    // Canonical pruning (Phase E) resolves direction -> CSR slot via
+    // popcount(mask & ((1<<d)-1)), which requires every CSR row to be emitted in
+    // ascending direction-bit order. The emission loop guarantees it today; pin it so
+    // future edge-rule changes can't silently break query-time slot addressing.
+    {
+        use rayon::prelude::*;
+        use navpath_core::snapshot::unpack_coord;
+        const DIR_DELTAS: [(i32, i32); 8] =
+            [(-1, 0), (0, -1), (1, 0), (0, 1), (-1, 1), (-1, -1), (1, -1), (1, 1)];
+        let bad: usize = (0..node_count)
+            .into_par_iter()
+            .map(|u| {
+                let (ux, uy, up) = unpack_coord(coords_packed[u]);
+                let (s, e) = (walk_offsets[u] as usize, walk_offsets[u + 1] as usize);
+                let mut prev: i32 = -1;
+                for &v in &walk_csr_dst[s..e] {
+                    let (vx, vy, vp) = unpack_coord(coords_packed[v as usize]);
+                    let d = DIR_DELTAS
+                        .iter()
+                        .position(|&(dx, dy)| vp == up && vx - ux == dx && vy - uy == dy);
+                    match d {
+                        Some(d) if (d as i32) > prev => prev = d as i32,
+                        _ => return 1usize,
+                    }
+                }
+                0
+            })
+            .sum();
+        if bad > 0 {
+            anyhow::bail!(
+                "{bad} CSR rows violate ascending direction-bit order (or contain \
+                 non-adjacent edges); canonical slot addressing would be unsound"
+            );
+        }
+    }
+
+    // Walk components (the snapshot's reachability-precheck section). Labels are in
+    // order of each component's lowest node id, as before; the section stores u16 ids,
+    // so refuse to silently wrap them.
+    let (walk_comp, walk_comp_count) = walk_components(walk_offsets, walk_csr_dst);
+    if walk_comp_count > u16::MAX as usize + 1 {
+        anyhow::bail!(
+            "{walk_comp_count} walk components exceed the u16 component-id range of the \
+             snapshot's comp section (max 65536)"
+        );
+    }
+    let comp_ids: Vec<u16> = walk_comp.iter().map(|&c| c as u16).collect();
+    let walk_components = walk_comp_count as u32;
+    info!(walk_components, walk_edges = walk.edges(), "compiled walk CSR and components");
+    stage("walk_graph", t);
 
     // Flatten chains into macro-edges with cycle detection and deterministic ordering
-    let metas = flatten_chains(&conn, &tiles, &node_id_of)?;
+    let t = std::time::Instant::now();
+    let (metas, gmetas) = flatten_all_chains(&conn, &node_id_of)?;
     let mut macro_src = Vec::with_capacity(metas.len());
     let mut macro_dst = Vec::with_capacity(metas.len());
     let mut macro_w = Vec::with_capacity(metas.len());
@@ -488,7 +626,6 @@ fn main() -> Result<()> {
 
     // Global teleports (no concrete source): encode once in metadata under a dummy macro edge 0->0
     // Service will attach them as extra edges from the current start node at query time.
-    let gmetas = flatten_global_chains(&conn, &node_id_of)?;
     if !gmetas.is_empty() {
         macro_src.push(0);
         macro_dst.push(0);
@@ -580,22 +717,68 @@ fn main() -> Result<()> {
         }
     }
 
-    // Landmarks: farthest-point selection over that graph, plus the ALT tables
-    // (forward: LM->node, backward: node->LM via reverse graph) in one pass.
-    let alt_start = std::time::Instant::now();
-    let (landmarks, lm_tab) = select_and_compute_alt(
+    stage("metadata", t);
+
+    // Landmarks + ALT tables over the table graph: the walk CSR (symmetric, so it serves
+    // both directions) plus the macro/fairy edges above.
+    let t = std::time::Instant::now();
+    let alt_graph = AltGraph::new(
         node_count,
-        &walk_src, &walk_dst, &walk_w,
-        &alt_macro_src, &alt_macro_dst, &alt_macro_w,
-        args.landmarks,
+        walk_offsets,
+        walk_csr_dst,
+        &walk.diag,
+        &alt_macro_src,
+        &alt_macro_dst,
+        &alt_macro_w,
     );
+    let structure = Structure::new(walk_comp, walk_comp_count, alt_graph.fwd.pairs());
+    {
+        let top: Vec<(usize, u32)> = structure.scc_size.iter().take(8).enumerate().map(|(i, &s)| (s, structure.scc_wcc[i])).collect();
+        info!(
+            sccs = structure.scc_size.len(),
+            wccs = structure.wcc_size.len(),
+            main_scc = structure.scc_size[0],
+            main_wcc = structure.wcc_size[structure.scc_wcc[0] as usize],
+            top_sccs_size_wcc = ?top,
+            top_wccs = ?structure.wcc_size.iter().take(8).collect::<Vec<_>>(),
+            "table-graph structure"
+        );
+    }
+    let alt_cfg = AltConfig {
+        count: landmark_count as usize,
+        strategy: match args.landmark_strategy {
+            LandmarkStrategy::Legacy => Strategy::Legacy,
+            LandmarkStrategy::Scc => Strategy::Scc,
+        },
+        local_fill: args.local_fill,
+    };
+    let (plan, lm_tab) = build_alt(&alt_graph, &structure, &alt_cfg);
+    let landmarks = plan.landmarks;
     if !landmarks.is_empty() {
+        let lstats = table_stats(&structure, &lm_tab, landmarks.len());
+        let per_scc: std::collections::BTreeMap<u32, usize> =
+            plan.landmark_scc.iter().fold(Default::default(), |mut m, &s| {
+                *m.entry(s).or_insert(0) += 1;
+                m
+            });
         info!(
             count = landmarks.len(),
-            elapsed_ms = alt_start.elapsed().as_millis() as u64,
+            strategy = ?alt_cfg.strategy,
+            local_fill_wccs = plan.fills.len(),
+            columns_per_scc_rank = ?per_scc,
+            usable_main_scc = lstats.usable_main,
+            h0_nodes = lstats.h0_nodes,
+            h0_main_wcc = lstats.h0_main_wcc,
+            h0_other_wcc = lstats.h0_other_wcc,
+            mean_usable = lstats.mean_usable,
+            mean_usable_main = lstats.mean_usable_main,
+            saturated_entries = lstats.saturated_entries,
+            elapsed_ms = t.elapsed().as_millis() as u64,
             "selected landmarks and computed ALT tables"
         );
     }
+    drop(alt_graph);
+    stage("alt", t);
 
     // Encode Fairy Rings into snapshot sections
     let mut fairy_nodes: Vec<u32> = Vec::with_capacity(fairy_ring_rows.len());
@@ -628,105 +811,20 @@ fn main() -> Result<()> {
         fairy_meta_blob.extend_from_slice(&bytes);
     }
 
-    // v8 sections: walk CSR + diagonal bitmap (weights derived from direction), packed
-    // coords, walk-component ids, and the quantized interleaved ALT table.
-    let walk_edge_count = walk_src.len();
-    let mut walk_offsets = vec![0u32; node_count + 1];
-    for &s in &walk_src {
-        walk_offsets[s as usize + 1] += 1;
-    }
-    for i in 0..node_count {
-        walk_offsets[i + 1] += walk_offsets[i];
-    }
-    let mut cur = walk_offsets.clone();
-    let mut walk_csr_dst = vec![0u32; walk_edge_count];
-    let mut walk_diag = vec![0u8; walk_edge_count.div_ceil(8)];
-    for i in 0..walk_edge_count {
-        let slot = cur[walk_src[i] as usize] as usize;
-        walk_csr_dst[slot] = walk_dst[i];
-        // Only two weights exist: 300 (cardinal) and 300*sqrt(2) (diagonal).
-        if walk_w[i] > 350.0 {
-            walk_diag[slot / 8] |= 1 << (slot % 8);
-        }
-        cur[walk_src[i] as usize] += 1;
-    }
-
-    // Bidirectional search reuses the forward walk CSR as its reverse graph, which is
-    // only sound if every walk edge has its mirror. The current rules guarantee it for
-    // cardinals and it holds empirically for diagonals; assert so future map data can't
-    // silently break search correctness.
-    {
-        use rayon::prelude::*;
-        // Read-only CSR scan; sum-reduce the asymmetry count across nodes (roadmap 7.5).
-        let asym: usize = (0..node_count)
-            .into_par_iter()
-            .map(|u| {
-                let (s, e) = (walk_offsets[u] as usize, walk_offsets[u + 1] as usize);
-                let mut bad = 0usize;
-                'edge: for slot in s..e {
-                    let v = walk_csr_dst[slot] as usize;
-                    let (vs, ve) = (walk_offsets[v] as usize, walk_offsets[v + 1] as usize);
-                    for vslot in vs..ve {
-                        if walk_csr_dst[vslot] as usize == u {
-                            continue 'edge;
-                        }
-                    }
-                    bad += 1;
-                }
-                bad
-            })
-            .sum();
-        if asym > 0 {
-            anyhow::bail!("walk graph is not symmetric: {asym} edges lack a mirror; bidirectional search would be unsound");
-        }
-    }
-
-    // Canonical pruning (Phase E) resolves direction -> CSR slot via
-    // popcount(mask & ((1<<d)-1)), which requires every CSR row to be emitted in
-    // ascending direction-bit order. The emission loop guarantees it today; pin it so
-    // future edge-rule changes can't silently break query-time slot addressing.
-    {
-        use rayon::prelude::*;
-        use navpath_core::snapshot::unpack_coord;
-        const DIR_DELTAS: [(i32, i32); 8] =
-            [(-1, 0), (0, -1), (1, 0), (0, 1), (-1, 1), (-1, -1), (1, -1), (1, 1)];
-        let bad: usize = (0..node_count)
-            .into_par_iter()
-            .map(|u| {
-                let (ux, uy, up) = unpack_coord(coords_packed[u]);
-                let (s, e) = (walk_offsets[u] as usize, walk_offsets[u + 1] as usize);
-                let mut prev: i32 = -1;
-                for &v in &walk_csr_dst[s..e] {
-                    let (vx, vy, vp) = unpack_coord(coords_packed[v as usize]);
-                    let d = DIR_DELTAS
-                        .iter()
-                        .position(|&(dx, dy)| vp == up && vx - ux == dx && vy - uy == dy);
-                    match d {
-                        Some(d) if (d as i32) > prev => prev = d as i32,
-                        _ => return 1usize,
-                    }
-                }
-                0
-            })
-            .sum();
-        if bad > 0 {
-            anyhow::bail!(
-                "{bad} CSR rows violate ascending direction-bit order (or contain \
-                 non-adjacent edges); canonical slot addressing would be unsound"
-            );
-        }
-    }
-
-    let (comp_ids, walk_components) = walk_component_ids(node_count, &walk_src, &walk_dst);
-    info!(walk_components, "computed walk components");
-
-    let res = write_snapshot_v8(
+    let t = std::time::Instant::now();
+    let write_opts = WriteOptions {
+        alt_format: match args.alt_format {
+            AltFormatArg::U16 => AltFormat::U16,
+            AltFormatArg::Packed => AltFormat::Packed,
+        },
+    };
+    let res = write_snapshot(
         &args.out_snapshot,
         &SnapshotSections {
             coords_packed: &coords_packed,
-            walk_offsets: &walk_offsets,
-            walk_dst: &walk_csr_dst,
-            walk_diag: &walk_diag,
+            walk_offsets,
+            walk_dst: walk_csr_dst,
+            walk_diag: &walk.diag,
             comp: &comp_ids,
             walk_components,
             macro_src: &macro_src,
@@ -746,11 +844,13 @@ fn main() -> Result<()> {
             fairy_meta_lens: &fairy_meta_lens,
             fairy_meta_blob: &fairy_meta_blob,
         },
+        &write_opts,
     );
 
     match res {
         Ok(info) => {
             info!(manifest = ?info.manifest, hash = ?info.hash, "wrote snapshot");
+            stage("write", t);
         }
         Err(e) => {
             error!(error = ?e, "failed to write snapshot");

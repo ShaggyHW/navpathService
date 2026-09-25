@@ -45,3 +45,4 @@ result.json
 graph.snapshot.v6.bak
 /docs
 /docs
+__pycache__/

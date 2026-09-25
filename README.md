@@ -22,6 +22,24 @@ cargo run -p navpath-builder --release --   --sqlite /home/query/Dev/rs3cache_ex
 
 UPDATE THE PATH TO YOUR ONW
 
+Snapshot format v9 (2026-09): node ids follow a plane-major Morton (Z-order) coordinate
+key instead of raster (plane, y, x) order, and the ALT (landmark distance) table is
+stored packed by default (per-16-node-cluster u16 bases + u8 offsets, with an exact
+exception list): ~220 MB instead of ~345 MB. The service refuses older snapshots with
+an "unsupported version" error, so **rebuild `graph.snapshot` after upgrading** (the
+build is deterministic and takes ~10 s). Builder flags:
+
+- `--landmarks N` (rounded up to a multiple of 16, required by the AVX-512 heuristic)
+- `--landmark-strategy scc|legacy` (default `scc`: landmarks placed per strongly
+  connected component with a symmetric farthest-point score, so every landmark is
+  usable in both directions for its region; `legacy` reproduces the pre-2026-09 table)
+- `--local-fill true|false` (default `true`: components no landmark reaches get local
+  landmarks written into existing columns — no extra bytes)
+- `--alt-format packed|u16` (default `packed`: 35% smaller, ~2x faster on a cold page
+  cache, within noise warm; `u16` keeps the plain table)
+
+`tiles.bin` holds one walk-flag byte per node in node-id order (Morton order since v9).
+
 Every build also writes `walkableTiles.bin` next to the snapshot (`--out-walkable PATH`
 to move it, `--no-walkable` to skip): a ~400 KB coordinate-keyed presence bitmap of the
 same tile set `/tile/exists` answers from — `"WTIL"`, version u8, chunk count u32 LE, then
@@ -36,9 +54,10 @@ export RUST_LOG=info
 
 # Recommended for latency (docs/route_latency_improvements_2026-09-17.md):
 export NAVPATH_JPS=1             # jump-point expansion for the unidirectional engine (1.4-3x on walk-dominated routes)
-export NAVPATH_RACE=1            # hedged JPS-uni/bidir race per cache miss (3-7x on teleport-heavy routes)
-# export NAVPATH_MLOCK=1         # also mlock the mapping so memory pressure cannot evict it (needs RLIMIT_MEMLOCK >= snapshot size)
-# export NAVPATH_CTX_PREWARM=32  # raise the startup context pre-warm on a dedicated box (default 8 pairs, ~36 MB each)
+export NAVPATH_RACE=1            # hedged JPS-uni/bidir race on the cache misses the gate picks (3-7x on teleport-heavy routes)
+# export NAVPATH_MLOCK=1         # also mlock the mapping so memory pressure cannot evict it (needs RLIMIT_MEMLOCK >= snapshot size;
+#                                # falls back to locking the ~45 MB per-pop head; a keep-warm loop re-populates the rest)
+# export NAVPATH_CTX_PREWARM=64  # raise the startup context pre-warm on a dedicated box (default 16 contexts, ~19 MB each)
 
 cargo run -p navpath-service --release
 # --no-seed: ignore client seeds (no jitter, no seeded retry ladder; same optimal path).
@@ -59,9 +78,14 @@ cargo run --release -p navpath-service --example replay
 # ... after an INTENDED cost/pops change, re-bless the expectations:
 cargo run --release -p navpath-service --example replay -- --regen
 
-# Cross-snapshot invariance: costs must be identical across landmark counts (24/64)
+# Cross-snapshot invariance: costs must be identical across landmark counts (32/64)
 # and NAVPATH_ACTIVE_LANDMARKS (4/8). Builds fresh snapshots from the tile DB.
 tools/invariance_check.sh
+
+# Race tuning: per-pair uni-vs-bidir wall times through the production adapter, the race
+# hint per pair, and simulated hedge policies (latency percentiles + CPU). The harnesses
+# page the snapshot in first; NAVPATH_HARNESS_COLD=1 measures a cold page cache instead.
+NAVPATH_JPS=1 cargo run --release -p navpath-service --example race_sweep -- 400 [--seeded] [--profile=none]
 
 # Payload invariants: the action list must faithfully describe the returned path
 # (ability origins, ability reach, no skipped/replayed tiles). Needs a running service.
@@ -73,6 +97,26 @@ scripts/perf-gate.sh check          # bench + compare
 scripts/perf-gate.sh bless          # bench + save as the new baseline
 scripts/perf-gate.sh bless --reuse  # re-bless the last run without re-benching
 scripts/perf-gate.sh install-hook   # optional git pre-push hook (PERF_GATE_SKIP=1 to skip)
+```
+
+Engine regression oracle (in-process): records status / cost bits / path / pops and
+best-of-3 wall time for 600 fixed coordinate pairs x 9 engine configurations, then
+compares two recordings (strict: bit-identical results; `--loose`: same found/cost —
+for heuristic or numbering changes). `--pack-alt` evaluates an in-memory packed table,
+`--cold` pages the ALT table out before each timed run.
+
+```sh
+cargo run --release -p navpath-core --example engine_oracle -- record base.tsv
+cargo run --release -p navpath-core --example engine_oracle -- record new.tsv
+cargo run --release -p navpath-core --example engine_oracle -- compare base.tsv new.tsv [--loose]
+```
+
+End-to-end HTTP comparison of two builds (startup, cache-off latency per route class,
+cache hits, 16-client concurrency, RSS; also checks both return the same costs):
+
+```sh
+python3 tools/latency_compare.py --base-bin OLD/navpath-service --base-snapshot old.snapshot \
+    --new-bin target/release/navpath-service --new-snapshot graph.snapshot --out docs/latency_comparison.md
 ```
 
 The DB producer must ship the `tiles_regions` table (run `migrate_tiles_regions.py`
@@ -200,7 +244,9 @@ Results are cached per snapshot in an LRU keyed on
 `(start, goal, exact eligibility bits, hasQuickTele, seed)`. A hit skips the search
 entirely (sub-millisecond responses); the actions/geometry payload is still rebuilt per
 request, so one entry serves every `options`/`surge`/`dive` combination. The cache is
-dropped whenever the snapshot is swapped (`/admin/reload`).
+dropped whenever the snapshot is swapped (`/admin/reload`). A reload whose snapshot file
+has the same tail hash as the one being served is a no-op that keeps the warm caches
+(`{"reloaded": false, "unchanged": true}`); `POST /admin/reload?force=1` rebuilds anyway.
 
 ### Sub-path reuse (re-plans)
 
@@ -248,19 +294,32 @@ same path.
 | `NAVPATH_CACHE_IGNORE_SEED` | `1` | Seed-blind cache keys (default since 2026-08-06): any seed is served the cached path — recovers the hit rate for varying-seed traffic. `0` restores per-seed keys (per-seed tie variety on repeats; the paths only ever differed in equal-cost tie selection). |
 | `NAVPATH_IGNORE_SEED` | `0` | `1` (or the `--no-seed` flag) ignores client seeds entirely: all searches run unseeded (no jitter, canonical pruning engages); seeded requests are answered with `degraded: "seed_ignored"`. |
 | `NAVPATH_ROUTE_TIMEOUT_MS` | `10000` | Per-request wall-clock deadline (`0` = effectively none); a breach returns 504. |
-| `NAVPATH_MAX_CONCURRENT_SEARCHES` | CPU count | Concurrent searches; excess requests get 503 rather than queueing. |
-| `NAVPATH_MMAP_POPULATE` | `1` | Page the whole snapshot in during the startup warm-up (and before every `/admin/reload` swap). `0` disables; a cold page then costs 50-90 µs per pop on first touch. |
-| `NAVPATH_MLOCK` | `0` | `1` also `mlock`s the mapping (334 MB) so the page cache cannot evict it; needs `RLIMIT_MEMLOCK` at least that large, otherwise it warns and continues. |
-| `NAVPATH_CTX_PREWARM` | min(permits, 8) (x2 permits with `NAVPATH_RACE=1`, same cap) | Search-context pairs allocated and paged in at startup (~36 MB each at 1.1M nodes). Removes the 100-400 ms first-touch stall a fresh blocking thread otherwise pays inside a request; `0` disables. Raise it on a dedicated box with more than ~4 concurrent cache misses; on a host under memory pressure a large idle pre-warm gets swapped out again and the first requests pay to fault it back in. |
+| `NAVPATH_MAX_CONCURRENT_SEARCHES` | CPU count | Concurrent searches; excess requests get 503 rather than queueing. A race hedge counts as a search but only takes a permit while more than a quarter of them stays free. |
+| `NAVPATH_WORKER_THREADS` | min(4, cores) | Tokio reactor threads (request parsing, cache hits, response writing); searches run on the blocking pool. |
+| `NAVPATH_MAX_BLOCKING_THREADS` | max(2 x permits, 8) | Tokio blocking-pool cap (searches, race arms, large payload builds). |
+| `NAVPATH_BLOCKING_KEEP_ALIVE_S` | `300` | Idle blocking threads are kept this long (tokio's 10 s default made low-QPS misses start on a fresh thread). |
+| `RUST_LOG` | `info` | Log filter (`tracing` `EnvFilter` syntax, e.g. `warn` drops the per-request lines). Lines are written by a background thread, never on a request thread. |
+| `NAVPATH_MMAP_POPULATE` | `1` | Page the whole snapshot in during the startup warm-up (and before every `/admin/reload` swap), with parallel `MADV_POPULATE_READ`. `0` disables it (and the keep-warm loop); a cold page then costs 50-90 µs per pop on first touch. |
+| `NAVPATH_MLOCK` | `0` | `1` also `mlock`s the mapping (~220 MB) so the page cache cannot evict it; needs `RLIMIT_MEMLOCK` at least that large (systemd `LimitMEMLOCK=` or `CAP_IPC_LOCK`). If the whole mapping cannot be locked it locks the ~45 MB of per-pop sections (coords, walk CSR, components, metadata) instead, and warns. |
+| `NAVPATH_KEEP_WARM_S` | `60` | Interval of the background keep-warm loop, which re-populates whatever is not locked (`MADV_POPULATE_READ`: page-table walks when resident, disk reads for evicted pages — off the request path). Measured on a swapping host: 18 h after startup only 58 MB of the mapping was still resident, and a query whose ALT rows are cold costs ~435 ms instead of ~1 ms. `0` disables. |
+| `NAVPATH_CTX_PREWARM` | min(2 x permits, 16) (3 x permits with `NAVPATH_RACE=1`, same cap) | Search **contexts** allocated and paged in at startup (~19 MB each at 1.1M nodes; a bidirectional search uses two, a JPS/unidirectional or virtual-start search one). Counted in context pairs before 2026-09-25 — halve an old value's memory meaning, or double the number to keep it. Removes the 100-400 ms first-touch stall a request otherwise pays for a fresh context; `0` disables. `/stats` `ctx_pool.fresh_allocations` counts the contexts requests had to allocate themselves; raise it if that keeps growing. On a host under memory pressure a large idle pre-warm gets swapped out again and the first requests pay to fault it back in. |
 | `NAVPATH_MAX_POPS` | `max(1.5M, nodes/2)` | First-attempt pop budget (`0` = unbounded). |
-| `NAVPATH_RETRY_MAX_POPS` | `4x` the above | Budget for the retry rung (`0` disables the retry). |
+| `NAVPATH_RETRY_MAX_POPS` | `4x` the above | Budget for the retry rung (`0` disables the retry). The same-seed retry CONTINUES the stopped search instead of re-running it (bit-identical to a fresh run with the larger budget), so a route that needs 1.6M pops no longer pays 3.1M; the response `pops` is the cumulative count. |
 | `NAVPATH_BIDIR` | `1` | `0` forces the unidirectional engine. |
 | `NAVPATH_JPS` | `0` | `1` enables jump-point expansion (JPS+ with precomputed jump tables, +54 MB, +100 ms at load) in the unidirectional engine for unseeded searches: straight runs on the uniform-cost walk grid are jumped instead of expanded node by node, 5-26x fewer expansions, cost-exact (a sub-path of a shortest path is a shortest path; jumps stop at the goal, at any node with a door/teleport/fairy edge, and at forced turns). Bidirectional searches keep plain expansion, so with the race on the JPS racer is the one that wins walk-dominated routes. Log lines report `engine=jps`. Ties among equal-cost paths resolve diagonal-first, so served paths can differ from plain expansion at identical cost. |
-| `NAVPATH_RACE` | `0` | `1` runs the hedged engine race on every cache miss: unidirectional and bidirectional searches start concurrently on two blocking threads, the first stable result (found / genuine not-found) is served and the loser is cancelled. Same exact cost either way; buys the per-pair minimum of two engines whose relative speed swings 3-5x both ways (walk- vs teleport-dominated routes). Needs a second search permit while both run; falls back to the single-engine path when none is free. `/stats` reports `race_runs`, `race_wins_uni`, `race_wins_bidir`; every route log line carries `engine=uni|bidir|cache`. Note: the two engines break equal-cost ties differently, so with the race on the served path among several **equal-cost** alternatives depends on which engine finished first (cost is identical either way; `tools/payload_baseline.json` is captured with the race off). |
+| `NAVPATH_RACE` | `0` | `1` runs the hedged engine race on cache misses: a primary engine starts at once and the other engine (the hedge) runs alongside it when the gate below judges the route worth it; the first stable result (found / genuine not-found) is served and the loser is cancelled. Same exact cost either way. The hedge needs a spare search permit: it is only granted while more than a quarter of `NAVPATH_MAX_CONCURRENT_SEARCHES` stays free, so hedges never push primaries into 503s; otherwise the primary runs alone. `/stats` reports `race_runs` (hedges started), `race_wins_uni`, `race_wins_bidir`, `race_gated`, `race_hedge_skipped`, `race_hedge_denied` and the `race` config; every route log line carries `engine=uni|jps|bidir|cache`. Note: the two engines break equal-cost ties differently, so with the race on the served path among several **equal-cost** alternatives depends on which engine finished first (cost is identical either way; `tools/payload_baseline.json` is captured with the race off). |
+| `NAVPATH_RACE_PRIMARY` | `auto` | Engine a race starts first (and runs alone when there is no hedge): `auto` = JPS/uni when jump-point expansion applies (`NAVPATH_JPS=1`, unseeded), else bidir; `uni` / `bidir` force one. Measured with `examples/race_sweep`: JPS beats bidir on ~96% of random pairs; without JPS bidir is the better single engine. |
+| `NAVPATH_RACE_GATE` | `1` | Hedge only routes the second engine can plausibly win: with a bidir primary, teleport-dominated routes or ones with `h(start)` >= 20 s; with a JPS primary, heuristic-blind routes (`h = 0`, goal outside landmark coverage). Measured: latency sum within 0-2% of racing every miss, identical p99/max, 15-49% less race CPU; with JPS the hedge runs on ~3% of misses. Over HTTP (gated profile, interleaved A/B): same latency, -48% CPU. `0` hedges every miss. |
+| `NAVPATH_RACE_HEDGE_MS` | `0` | Start the hedge only if the primary is still running after this many ms (tokio timer, 1 ms granularity). `0` starts it together with the primary. A delay trades latency for CPU only where the gate lets a route race; measured at 1 ms: -6..-11% CPU for +0..11% latency sum. |
 | `NAVPATH_BIDIR_MIN_HB_RATIO` | `0` | Backward-bound strength below which a route is demoted to unidirectional; `0` (default since 2026-09-17) always runs bidirectional. Measured over 300 random pairs: always-bidir is 1.3-3x faster on long walk routes and within 5% of per-pair best overall, but 3-5x slower on teleport-dominated pairs (`lum_to_falador`, virtual starts) — see `docs/route_latency_improvements_2026-09-17.md`. `0.5` restores the old demotion policy. |
 | `NAVPATH_TIEBREAK_BUCKET_MS` | `0` (off) | Bucketed f-comparison for seeded searches. **Measured harmful on the current snapshot** (2-20x more pops on both engines); leave off. |
 | `NAVPATH_CANONICAL` | `1` | `0` disables canonical successor pruning (unseeded searches only). |
 | `NAVPATH_ACTIVE_LANDMARKS` | all | Landmarks evaluated per heuristic call; for A/B runs only. |
+| `NAVPATH_ALT_ONE_SIDED` | `1` | Use each landmark as far as the goal's entries allow (forward term, backward term and the two unreachability rules independently) instead of requiring both goal entries exact. Measured: 16-34% fewer pops, 1.35-1.9x faster on 600 random pairs, costs bit-identical. `0` restores the old rule for A/B runs. |
+| `NAVPATH_PREFETCH_ROWS` | `1` | Prefetch the landmark rows of the successors a forward expansion keeps (canonical / jump-point branches). Measured +10-17% on unidirectional and virtual-start searches, +3-8% bidirectional. `0` disables. |
+| `NAVPATH_REV_ANCHOR_FILTER` | `0` | `1` drops backward-bound anchors (the origin and global-teleport landings) that provably cannot reach the goal before aggregating the backward heuristic. It restores backward landmark columns (with all globals eligible, one-way-pocket landings otherwise leave h_b = 0) and cuts bidirectional pops ~9%, but measured 15-30% slower wall time because a blind backward half never gathers landmark rows; kept as an opt-in. |
+| `NAVPATH_H_SIMD` | `1` | `0` disables the explicit AVX-512 heuristic kernels (portable/scalar paths return identical values). |
+| `NAVPATH_ALT_HEAP` | — | Retired (ignored with a warning): the file-backed ALT range is already huge-page mapped, so the anonymous copy only doubled its memory. |
 | `NAVPATH_DUMP_RESULT` | unset | Path to overwrite with each `/route` response as pretty JSON (also `--dump-result <path>`). |
 | `NAVPATH_DEBUG_REQS` | `0` | Per-request requirement-matching diagnostics. |
 

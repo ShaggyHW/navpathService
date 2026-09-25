@@ -5,10 +5,32 @@
 //! edges exist, and the re-costed path equals the reported cost.
 //!
 //!   cargo run --release -p navpath-core --example diff_jps -- 300
+//!
+//! The three engines run in a per-pair rotated order so none is systematically timed
+//! with a cache the others warmed.
 use navpath_core::engine::canonical::CanonicalGrid;
 use navpath_core::engine::neighbors::NeighborProvider;
 use navpath_core::engine::search::{BidirParams, SearchContext, SearchParams};
-use navpath_core::{EngineView, Snapshot};
+use navpath_core::{EngineView, SearchResult, Snapshot};
+use std::collections::HashMap;
+
+// Production allocator (the service and builder both run on mimalloc; efficiency audit
+// T5.14) so allocation-heavy paths are timed as they run in production.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Pre-fault the snapshot like the service does at load, so timings measure the engine
+/// rather than disk reads (efficiency audit T5.9). `NAVPATH_HARNESS_COLD=1` skips it for
+/// cold-cache studies.
+fn warm_snapshot(snap: &Snapshot) {
+    if std::env::var("NAVPATH_HARNESS_COLD").ok().as_deref() == Some("1") {
+        eprintln!("NAVPATH_HARNESS_COLD=1: snapshot not pre-faulted");
+        return;
+    }
+    let t = std::time::Instant::now();
+    let bytes = snap.populate();
+    eprintln!("snapshot pre-faulted: {:.0} MiB in {:?}", bytes as f64 / (1 << 20) as f64, t.elapsed());
+}
 
 fn parse_globals(snap: &Snapshot) -> Vec<(u32, f32)> {
     let msrc = snap.macro_src();
@@ -38,6 +60,7 @@ fn main() {
     let path = std::env::var("NAVPATH_BENCH_SNAPSHOT")
         .unwrap_or_else(|_| format!("{}/../../graph.snapshot", env!("CARGO_MANIFEST_DIR")));
     let snap = Snapshot::open(&path).expect("open snapshot");
+    warm_snapshot(&snap);
     let nodes = snap.counts().nodes as usize;
     let mut view = EngineView::from_snapshot(&snap);
     view.extra.global = parse_globals(&snap).into();
@@ -52,7 +75,7 @@ fn main() {
     ).expect("canonical grid");
     cg.add_stop_nodes(snap.fairy_nodes());
     let t = std::time::Instant::now();
-    cg.build_jump_tables(snap.walk_offsets(), snap.walk_dst());
+    cg.build_jump_tables(snap.walk_offsets(), snap.walk_dst(), snap.coords_packed());
     eprintln!("jump tables built in {:?}", t.elapsed());
     view.canonical = Some(std::sync::Arc::new(cg));
     let macros_rev = NeighborProvider::new(nodes, snap.macro_dst(), snap.macro_src(), snap.macro_w());
@@ -60,19 +83,35 @@ fn main() {
     let mut ctx = SearchContext::new(nodes);
     let mut cf = SearchContext::new(nodes);
     let mut cb = SearchContext::new(nodes);
-    let macro_w = |u: u32, v: u32| -> Option<f32> {
+    // Edge lookups for path validation, indexed once instead of linear scans per hop
+    // (efficiency audit T5.15). Same answers as the scans they replace: the minimum
+    // weight over parallel macro edges (folded in index order), and the FIRST
+    // (dst, cost) entry in array order for globals / fairy destinations.
+    let macro_min: HashMap<(u32, u32), f32> = {
         let (ms, md, mw) = (snap.macro_src(), snap.macro_dst(), snap.macro_w());
-        let mut best: Option<f32> = None;
-        for i in 0..ms.len() { if ms[i] == u && md[i] == v { best = Some(best.map_or(mw[i], |b: f32| b.min(mw[i]))); } }
-        best
+        let mut m = HashMap::with_capacity(ms.len());
+        for i in 0..ms.len() {
+            m.entry((ms[i], md[i])).and_modify(|b: &mut f32| *b = b.min(mw[i])).or_insert(mw[i]);
+        }
+        m
     };
+    let first_by_dst = |entries: &[(u32, f32)]| -> HashMap<u32, f32> {
+        let mut m = HashMap::with_capacity(entries.len());
+        for &(d, c) in entries {
+            m.entry(d).or_insert(c);
+        }
+        m
+    };
+    let global_cost = first_by_dst(&view.extra.global);
+    let fairy_cost = first_by_dst(&view.extra.fairy_dests);
+    let macro_w = |u: u32, v: u32| -> Option<f32> { macro_min.get(&(u, v)).copied() };
     let recost = |p: &[u32]| -> Option<f32> {
         let mut t = 0f32;
         for w in p.windows(2) {
             let c = snap.walk_edge_weight(w[0], w[1])
                 .or_else(|| macro_w(w[0], w[1]))
-                .or_else(|| view.extra.global.iter().find(|(d, _)| *d == w[1]).map(|(_, c)| *c))
-                .or_else(|| view.extra.fairy_dests.iter().find(|(d, _)| *d == w[1]).map(|(_, c)| *c))?;
+                .or_else(|| global_cost.get(&w[1]).copied())
+                .or_else(|| fairy_cost.get(&w[1]).copied())?;
             t += c;
         }
         Some(t)
@@ -87,26 +126,36 @@ fn main() {
     // per bucket: n, t_uni, t_jps, t_bi, pops_uni, pops_jps, pops_bi, jps_beats_bi
     let mut agg = [[0f64; 8]; 4];
     let (mut checked, mut mismatches, mut bad_paths) = (0usize, 0usize, 0usize);
+    let mut pair_idx = 0usize; // every attempted pair, for the engine-order rotation
     let t0 = std::time::Instant::now();
     while checked < n_pairs {
         let s = next(nodes);
         let g = next(nodes);
         if s == g { continue; }
         let params = || SearchParams { start: s, goal: g, macro_filter: None, seed: None, max_pops: Some(3_000_000), cancel: None, bucket_ms: 0.0 };
-        // Untimed warm-up so the first timed engine does not pay the page-cache cost.
+        // Rotate the engine order per pair (efficiency audit T5.10): whichever engine
+        // runs later finds more of the pair's working set cached, so a fixed order
+        // flatters it. Engine e: 0 = uni, 1 = JPS, 2 = bidir. The untimed warm-up (so
+        // the first timed engine does not pay the page-cache cost) is done by the
+        // engine that runs last, so it rotates too and no engine is favoured.
+        let order = [pair_idx % 3, (pair_idx + 1) % 3, (pair_idx + 2) % 3];
+        let mut runs: [Option<(SearchResult, f64)>; 3] = [None, None, None];
+        for (k, e) in std::iter::once(order[2]).chain(order).enumerate() {
+            view.jps = e == 1;
+            let t = std::time::Instant::now();
+            let r = if e == 2 {
+                view.astar_bidir(&bp, params(), &mut cf, &mut cb)
+            } else {
+                view.astar(params(), &mut ctx)
+            };
+            if k > 0 {
+                runs[e] = Some((r, t.elapsed().as_secs_f64() * 1e6));
+            }
+        }
         view.jps = false;
-        let _ = view.astar(params(), &mut ctx);
-        let t = std::time::Instant::now();
-        let uni = view.astar(params(), &mut ctx);
-        let tu = t.elapsed().as_secs_f64() * 1e6;
-        view.jps = true;
-        let t = std::time::Instant::now();
-        let jps = view.astar(params(), &mut ctx);
-        let tj = t.elapsed().as_secs_f64() * 1e6;
-        view.jps = false;
-        let t = std::time::Instant::now();
-        let bi = view.astar_bidir(&bp, params(), &mut cf, &mut cb);
-        let tb = t.elapsed().as_secs_f64() * 1e6;
+        pair_idx += 1;
+        let [uni, jps, bi] = runs.map(|r| r.expect("every engine ran"));
+        let ((uni, tu), (jps, tj), (bi, tb)) = (uni, jps, bi);
         if uni.found != jps.found || uni.found != bi.found {
             mismatches += 1;
             eprintln!("FOUND MISMATCH {s}->{g}: uni {} jps {} bidir {}", uni.found, jps.found, bi.found);
@@ -124,7 +173,7 @@ fn main() {
         let ok_len = jps.path_g.len() == jps.path.len() && (jps.path_g.last().copied().unwrap_or(f32::NAN) - jps.cost).abs() < 1e-3;
         let ok_edges = jps.path.windows(2).all(|w| {
             snap.walk_edge_weight(w[0], w[1]).is_some() || macro_w(w[0], w[1]).is_some()
-                || view.extra.global.iter().any(|(d, _)| *d == w[1]) || view.extra.fairy_dests.iter().any(|(d, _)| *d == w[1])
+                || global_cost.contains_key(&w[1]) || fairy_cost.contains_key(&w[1])
         });
         let ok_cost = recost(&jps.path).map_or(false, |c| (c - jps.cost).abs() <= 1e-4 * jps.cost.max(1.0));
         if !(ok_len && ok_edges && ok_cost && jps.path[0] == s && *jps.path.last().unwrap() == g) {

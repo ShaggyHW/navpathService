@@ -28,9 +28,14 @@
 //!
 //! Snapshot from SNAPSHOT_PATH or NAVPATH_BENCH_SNAPSHOT (default ../../graph.snapshot).
 //! Exits 0 with a notice when no snapshot exists (so CI without the data skips).
+//! The snapshot is paged in before the timed region, as the service's warm-up does
+//! (`NAVPATH_HARNESS_COLD=1` skips that for cold-cache studies), and the per-profile
+//! setup (artifacts, re-coster) is built once per (profile, quick_tele) up front.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use navpath_core::eligibility::EligibilityMask;
 use navpath_core::engine::heuristics::{active_landmarks, LandmarkHeuristic};
@@ -40,10 +45,15 @@ use navpath_service::engine_adapter::{
     build_canonical_grid, build_component_graph, build_fairy_rings, build_neighbor_provider,
     build_profile_artifacts, goal_reachable, run_route_with_requirements_and_fairy_rings,
     run_route_with_requirements_virtual_start, EngineChoice, FairyRing, GlobalTeleport,
+    ProfileArtifacts,
 };
 use serde::{Deserialize, Serialize};
 
 const SEEDS: [Option<u64>; 3] = [None, Some(1), Some(12345)];
+
+// Same allocator as the service binary (T5.14).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Serialize, Deserialize)]
 struct Corpus {
@@ -93,18 +103,18 @@ struct Ctx {
 /// Per-(profile, quick_tele) eligible-edge maps for the independent path re-coster.
 struct Recoster {
     /// dst -> min eligible global teleport cost (quick-tele effective).
-    global_cost: HashMap<u32, f32>,
+    global_cost: FxHashMap<u32, f32>,
     /// (src, dst) -> min eligible macro effective weight.
-    macro_w: HashMap<(u32, u32), f32>,
+    macro_w: FxHashMap<(u32, u32), f32>,
     /// eligible fairy source nodes.
-    fairy_sources: std::collections::HashSet<u32>,
+    fairy_sources: FxHashSet<u32>,
     /// eligible fairy dst -> hop cost.
-    fairy_cost: HashMap<u32, f32>,
+    fairy_cost: FxHashMap<u32, f32>,
 }
 
 impl Recoster {
     fn build(ctx: &Ctx, mask: &EligibilityMask, quick_tele: bool) -> Self {
-        let mut global_cost: HashMap<u32, f32> = HashMap::new();
+        let mut global_cost: FxHashMap<u32, f32> = FxHashMap::default();
         for g in ctx.globals.iter() {
             if g.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
                 continue;
@@ -118,10 +128,10 @@ impl Recoster {
         // Walk the forward macro adjacency slot by slot (slot order matches the
         // provider the searches use, but this map is keyed on (src, dst) so it is
         // independent of slot bookkeeping).
-        let mut macro_w: HashMap<(u32, u32), f32> = HashMap::new();
+        let mut macro_w: FxHashMap<(u32, u32), f32> = FxHashMap::default();
         let adj = &ctx.provider.macro_edges;
         for u in 0..adj.nodes as u32 {
-            let (s, e) = (adj.offsets[u as usize], adj.offsets[u as usize + 1]);
+            let (s, e) = (adj.offsets[u as usize] as usize, adj.offsets[u as usize + 1] as usize);
             for slot in s..e {
                 let data = &ctx.provider.macro_data[slot];
                 if data.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
@@ -135,8 +145,8 @@ impl Recoster {
                 }
             }
         }
-        let mut fairy_sources = std::collections::HashSet::new();
-        let mut fairy_cost = HashMap::new();
+        let mut fairy_sources = FxHashSet::default();
+        let mut fairy_cost = FxHashMap::default();
         for ring in ctx.fairy_rings.iter() {
             if ring.req_tag_idxs.iter().any(|&idx| !mask.is_satisfied(idx)) {
                 continue;
@@ -256,8 +266,14 @@ fn main() {
     }
 
     let snap = Snapshot::open(&snap_path).expect("open snapshot");
+    if !matches!(std::env::var("NAVPATH_HARNESS_COLD").ok().as_deref().map(str::trim), Some("1") | Some("true")) {
+        // Page the mapping in (T5.9) so the timed region measures searches, not disk.
+        let t = std::time::Instant::now();
+        let bytes = snap.populate();
+        println!("replay: populated {} MiB in {:?}", bytes >> 20, t.elapsed());
+    }
     let snap_hash = navpath_service::read_tail_hash_hex(&std::path::PathBuf::from(&snap_path));
-    let (provider, provider_rev, globals, _lookup) = build_neighbor_provider(&snap);
+    let (provider, provider_rev, globals, lookup) = build_neighbor_provider(&snap);
     let (fairy_rings, _node_to_ring) = build_fairy_rings(&snap);
     let ctx = Ctx {
         snap: Arc::new(snap),
@@ -266,12 +282,7 @@ fn main() {
         globals: Arc::new(globals),
         fairy_rings: Arc::new(fairy_rings),
     };
-    let lm = LandmarkHeuristic {
-        nodes: ctx.snap.counts().nodes as usize,
-        landmarks: ctx.snap.counts().landmarks as usize,
-        tab: ctx.snap.lm_tab(),
-        quantum: ctx.snap.manifest().alt_quantum_ms,
-    };
+    let lm = LandmarkHeuristic::from_snapshot(&ctx.snap);
 
     let raw = std::fs::read_to_string(&corpus_path)
         .unwrap_or_else(|e| panic!("cannot read corpus {corpus_path}: {e}"));
@@ -291,9 +302,30 @@ fn main() {
     let mut ctxs = (SearchContext::new(0), SearchContext::new(0));
     // The component precheck is an EXACT reachability decision, and replay searches are
     // budget-free — so its verdict must equal the engine's found flag on every entry.
-    let comp_graph = build_component_graph(&ctx.snap, &ctx.globals, &ctx.fairy_rings);
+    let comp_graph = build_component_graph(&ctx.snap, &ctx.globals, &ctx.fairy_rings, &lookup);
     // Production default: canonical pruning on (NAVPATH_CANONICAL=0 for A/B runs).
     let canonical = build_canonical_grid(&ctx.snap);
+    // Per-(profile, quick_tele) setup, memoized and built before the timed region
+    // (T5.15): the mask, the independent re-coster, and the per-profile artifacts built
+    // exactly as the service builds/caches them (roadmap 5.4). One set serves both
+    // engines: the "uni" runs pass no reversed provider, so the pre-built reversed
+    // filter is simply unused there.
+    let mut profiles: HashMap<(String, bool), (EligibilityMask, Recoster, ProfileArtifacts)> = HashMap::new();
+    for entry in corpus.entries.iter() {
+        profiles.entry((entry.profile.clone(), entry.quick_tele)).or_insert_with(|| {
+            let mask = profile_mask(&ctx.snap, &entry.profile);
+            let recoster = Recoster::build(&ctx, &mask, entry.quick_tele);
+            let artifacts = build_profile_artifacts(
+                &ctx.provider,
+                Some(&ctx.provider_rev),
+                &ctx.globals,
+                &ctx.fairy_rings,
+                &mask,
+                entry.quick_tele,
+            );
+            (mask, recoster, artifacts)
+        });
+    }
     let t0 = std::time::Instant::now();
 
     for entry in corpus.entries.iter_mut() {
@@ -306,21 +338,7 @@ fn main() {
         };
         let sid = ctx.snap.find_node(entry.start[0], entry.start[1], entry.start[2]);
         let virtual_start = sid.is_none();
-        let mask = profile_mask(&ctx.snap, &entry.profile);
-
-        let recoster = Recoster::build(&ctx, &mask, entry.quick_tele);
-
-        // Per-profile artifacts, built exactly as the service builds/caches them
-        // (roadmap 5.4). One set serves both engines: the "uni" runs pass no reversed
-        // provider, so the pre-built reversed filter is simply unused there.
-        let artifacts = build_profile_artifacts(
-            &ctx.provider,
-            Some(&ctx.provider_rev),
-            &ctx.globals,
-            &ctx.fairy_rings,
-            &mask,
-            entry.quick_tele,
-        );
+        let (mask, recoster, artifacts) = &profiles[&(entry.profile.clone(), entry.quick_tele)];
 
         // --- run every engine x seed ---
         let mut runs: Vec<RunOut> = Vec::new();
@@ -336,10 +354,10 @@ fn main() {
                         rev,
                         sid,
                         gid,
-                        &mask,
+                        mask,
                         seed,
                         None,
-                        &artifacts,
+                        artifacts,
                         canonical.clone(),
                         EngineChoice::Policy,
                         &mut ctxs,
@@ -358,7 +376,7 @@ fn main() {
                         gid,
                         seed,
                         None,
-                        &artifacts,
+                        artifacts,
                         canonical.clone(),
                         EngineChoice::Policy,
                         &mut ctxs,
@@ -377,7 +395,7 @@ fn main() {
         {
             let comps = ctx.snap.comp_ids();
             let start_comp = sid.map(|s| comps[s as usize]);
-            let reachable = goal_reachable(&comp_graph, &mask, start_comp, comps[gid as usize]);
+            let reachable = goal_reachable(&comp_graph, mask, start_comp, comps[gid as usize]);
             if reachable != found {
                 fail(format!(
                     "component precheck verdict ({reachable}) != engine found ({found}) — \

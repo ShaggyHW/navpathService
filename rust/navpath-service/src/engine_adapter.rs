@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::collections::HashMap;
 use rustc_hash::FxHashMap;
 
 use navpath_core::{EngineView, SearchParams, SearchResult, SearchStatus, Snapshot, NeighborProvider};
@@ -15,8 +14,30 @@ fn not_found_result() -> SearchResult {
 }
 use serde_json::Value as JsonValue;
 use navpath_core::eligibility::{fnv1a32, EligibilityMask};
-use navpath_core::engine::heuristics::{active_landmarks, LandmarkHeuristic};
+use navpath_core::engine::heuristics::{active_landmarks, LandmarkHeuristic, RevAnchorBase};
 use tracing::{info, warn};
+
+/// Search-context source for the adapter entry points (T3.4). A unidirectional search
+/// (plain, JPS, or multi-source virtual start) needs ONE node-sized context; only a
+/// bidirectional search needs two. The service implements this on its pooled lease
+/// ([`crate::PooledContexts`]), which checks each context out of the pool on first use
+/// — so a unidirectional search never pins an idle second context. Harnesses pass a
+/// plain `(SearchContext, SearchContext)` pair.
+pub trait SearchContexts {
+    /// The forward (or only) context.
+    fn one(&mut self) -> &mut SearchContext;
+    /// Forward and backward contexts for a bidirectional search.
+    fn two(&mut self) -> (&mut SearchContext, &mut SearchContext);
+}
+
+impl SearchContexts for (SearchContext, SearchContext) {
+    fn one(&mut self) -> &mut SearchContext {
+        &mut self.0
+    }
+    fn two(&mut self) -> (&mut SearchContext, &mut SearchContext) {
+        (&mut self.0, &mut self.1)
+    }
+}
 
 /// Weak-backward demotion ratio (roadmap 4.2): a route runs bidirectional only when
 /// the backward ALT bound at the goal is at least this fraction of the forward bound
@@ -102,7 +123,10 @@ pub fn build_canonical_grid(snapshot: &Snapshot) -> Option<Arc<CanonicalGrid>> {
         return None;
     }
     let t = std::time::Instant::now();
-    match CanonicalGrid::build(
+    let jps = navpath_core::engine::search::jps_enabled();
+    // The jump-point tie-pruned table (8 B/node plus fill time) is only built when JPS
+    // can use it.
+    match CanonicalGrid::build_opts(
         snapshot.counts().nodes as usize,
         snapshot.coords_packed(),
         snapshot.walk_offsets(),
@@ -110,12 +134,13 @@ pub fn build_canonical_grid(snapshot: &Snapshot) -> Option<Arc<CanonicalGrid>> {
         snapshot.macro_src(),
         snapshot.macro_dst(),
         snapshot.macro_w(),
+        jps,
     ) {
         Ok(mut g) => {
             // Fairy rings carry non-grid edges too: jumps must stop on them.
             g.add_stop_nodes(snapshot.fairy_nodes());
-            if navpath_core::engine::search::jps_enabled() {
-                g.build_jump_tables(snapshot.walk_offsets(), snapshot.walk_dst());
+            if jps {
+                g.build_jump_tables(snapshot.walk_offsets(), snapshot.walk_dst(), snapshot.coords_packed());
             }
             info!(elapsed_ms = t.elapsed().as_millis() as u64, jps = navpath_core::engine::search::jps_enabled(), "built canonical pruning grid");
             Some(Arc::new(g))
@@ -215,6 +240,81 @@ pub enum EngineChoice {
     Bidir,
 }
 
+/// Forward ALT bounds that predict which engine a route favours (T3.2b), computed the
+/// way the weak-backward policy below computes them.
+///
+/// - Bidirectional search loses 3-5x on teleport-dominated routes: its backward bound
+///   is anchored on the start plus every eligible global landing, so it is weak
+///   everywhere near a landing and the backward side floods
+///   (docs/route_latency_improvements §1.2). A route is teleport-dominated when some
+///   eligible teleport's bound `w + h(dst)` undercuts the walk bound `h(start)`.
+/// - The unidirectional engine (JPS in production) wins almost everything else, except
+///   heuristic-blind routes: with `h = 0` (goal outside landmark coverage) it degrades to
+///   a Dijkstra flood that bidirectional search halves by meeting in the middle.
+///
+/// Measured with `examples/race_sweep` (2026-09-25; 300-400 LCG pairs each, JPS on and
+/// off, seeded, all-eligible and gated profiles): with a bidir primary, racing only
+/// [`worth_racing`](Self::worth_racing) routes left latency unchanged (sum and p99) and
+/// cut race CPU 4-16%; with a JPS primary, racing only blind routes (2-3% of pairs)
+/// kept p99/max identical and the latency sum within 0-2% while cutting CPU 20-49%.
+#[derive(Clone, Copy, Debug)]
+pub struct RaceHint {
+    /// `h(start)`; `INFINITY` for a virtual start (no on-graph origin to walk from).
+    pub h_start: f32,
+    /// `min over eligible globals (w + h(dst))`; `INFINITY` when none is eligible.
+    pub h_teleport: f32,
+    /// The forward heuristic is zero where the search begins: at the start, or (virtual
+    /// start) at every eligible teleport landing.
+    pub blind: bool,
+}
+
+impl RaceHint {
+    pub fn teleport_dominated(&self) -> bool {
+        self.h_teleport < self.h_start
+    }
+
+    /// Whether the route is worth hedging with the second engine, given which engine
+    /// runs first. Bidirectional primary: teleport-dominated (where uni wins 3-5x), or
+    /// long enough (`h(start)` at least [`BIDIR_POLICY_MIN_H_MS`]) that a slow pick
+    /// costs milliseconds. Unidirectional primary: heuristic-blind routes only.
+    pub fn worth_racing(&self, uni_primary: bool) -> bool {
+        if uni_primary {
+            self.blind
+        } else {
+            self.teleport_dominated() || self.h_start >= BIDIR_POLICY_MIN_H_MS
+        }
+    }
+}
+
+/// The snapshot's landmark heuristic (only the race hint builds one outside the
+/// adapter entry points).
+fn landmark_heuristic(snap: &Snapshot) -> LandmarkHeuristic<'_> {
+    LandmarkHeuristic::from_snapshot(snap)
+}
+
+/// [`RaceHint`] for one request: one landmark selection plus ~125 forward heuristic
+/// rows (the start and every eligible global landing) — microseconds.
+pub fn race_hint(snapshot: &Snapshot, artifacts: &ProfileArtifacts, start: Option<u32>, goal: u32) -> RaceHint {
+    let lm = landmark_heuristic(snapshot);
+    let active = lm.select_active(start.unwrap_or(goal), goal, active_landmarks());
+    let h_start = match start {
+        Some(s) => lm.h_active(s, &active),
+        None => f32::INFINITY,
+    };
+    let mut h_teleport = f32::INFINITY;
+    let mut h_landing_max = 0.0f32;
+    for &(dst, w) in artifacts.eligible_globals.iter() {
+        let h = lm.h_active(dst, &active);
+        h_teleport = h_teleport.min(w + h);
+        h_landing_max = h_landing_max.max(h);
+    }
+    let blind = match start {
+        Some(_) => h_start <= 0.0,
+        None => h_landing_max <= 0.0,
+    };
+    RaceHint { h_start, h_teleport, blind }
+}
+
 /// Budget-retry ladder (roadmap 1.5). A `BudgetExceeded` first attempt earns:
 ///   1. a retry with the SAME seed at the escalated cap — jitter-inflated pop counts
 ///      usually fit 4x, and the client's path-variety contract survives;
@@ -222,23 +322,31 @@ pub enum EngineChoice {
 ///      otherwise-equal paths; a real route is worth more than that variety), with the
 ///      served result marked `seed_dropped`.
 /// Every rung shares the request deadline/cancel flag, which remains the real ceiling.
+///
+/// Rung 1 CONTINUES the stopped search (`search(.., resume = true)`, see
+/// `EngineView::astar_resume`) instead of re-running it from scratch: the search is
+/// deterministic, so a fresh rerun used to replay the first `default_max_pops` pops
+/// identically before doing anything new (a 1.6M-pop route paid 3.1M). The
+/// continuation is bit-identical to a fresh run with the larger budget, and its pop
+/// counters are cumulative; `attempts_pops[1]` reports only the new work. Rung 2 changes
+/// the pricing (seed dropped), so it always starts fresh.
 fn retry_ladder(
     first: SearchResult,
     seed: Option<u64>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     nodes: usize,
     engine: &'static str,
-    mut search: impl FnMut(Option<u64>, Option<u32>) -> SearchResult,
+    mut search: impl FnMut(Option<u64>, Option<u32>, bool) -> SearchResult,
 ) -> SearchOutcome {
     let Some(retry_pops) = budget_retry_pops(&first, seed, cancel, nodes) else {
         return SearchOutcome { attempts_pops: [first.pops, 0, 0], retried: false, seed_dropped: false, engine, res: first };
     };
     warn!(
         pops = first.pops, found = first.found, retry_pops, seeded = seed.is_some(),
-        "search exhausted its pop budget; retrying with an escalated budget"
+        "search exhausted its pop budget; continuing with an escalated budget"
     );
-    let second = search(seed, Some(retry_pops));
-    let mut attempts_pops = [first.pops, second.pops, 0];
+    let second = search(seed, Some(retry_pops), true);
+    let mut attempts_pops = [first.pops, second.pops.saturating_sub(first.pops), 0];
     if seed.is_none() || second.status == SearchStatus::Found {
         return SearchOutcome { attempts_pops, retried: true, seed_dropped: false, engine, res: better_of(first, second) };
     }
@@ -247,7 +355,7 @@ fn retry_ladder(
         return SearchOutcome { attempts_pops, retried: true, seed_dropped: false, engine, res: best2 };
     }
     warn!(retry_pops, "seeded retry also exhausted its budget; dropping the seed");
-    let third = search(None, Some(retry_pops));
+    let third = search(None, Some(retry_pops), false);
     attempts_pops[2] = third.pops;
     if third.status == SearchStatus::Found || (third.found && (!best2.found || third.cost < best2.cost)) {
         return SearchOutcome { attempts_pops, retried: true, seed_dropped: true, engine, res: third };
@@ -335,26 +443,16 @@ pub struct ComponentGraph {
     pub globals: Vec<(u16, Vec<usize>)>,
 }
 
-/// Requirement-id -> tag-index map from the snapshot's req_tags section.
-fn req_id_to_tag_idx(snapshot: &Snapshot) -> HashMap<u32, usize> {
-    let req_words: &[u32] = snapshot.req_tags();
-    let mut map = HashMap::new();
-    let mut i = 0;
-    while i + 3 < req_words.len() {
-        map.insert(req_words[i], i / 4);
-        i += 4;
-    }
-    map
-}
-
+/// `macro_lookup` supplies each edge's requirement list, decoded once at load by
+/// [`build_neighbor_provider`] (the metadata used to be parsed a second time here).
 pub fn build_component_graph(
     snapshot: &Snapshot,
     globals: &[GlobalTeleport],
     fairy_rings: &[FairyRing],
+    macro_lookup: &MacroLookup,
 ) -> ComponentGraph {
     let comp = snapshot.comp_ids();
     let components = snapshot.counts().walk_components as usize;
-    let id_to_idx = req_id_to_tag_idx(snapshot);
     let msrc = snapshot.macro_src();
     let mdst = snapshot.macro_dst();
     let mut macro_edges = Vec::new();
@@ -370,20 +468,9 @@ pub fn build_component_graph(
         if cs == cd {
             continue;
         }
-        // Same fail-closed requirement parsing as the search setup: unknown ids map to
+        // Same fail-closed requirement decoding as the search setup: unknown ids map to
         // usize::MAX, which no mask satisfies.
-        let mut reqs = Vec::new();
-        if let Some(bytes) = snapshot.macro_meta_at(idx) {
-            if let Ok(val) = serde_json::from_slice::<JsonValue>(bytes) {
-                if let Some(arr) = val.get("requirements").and_then(|v| v.as_array()) {
-                    for ridv in arr {
-                        if let Some(rid) = ridv.as_u64() {
-                            reqs.push(id_to_idx.get(&(rid as u32)).copied().unwrap_or(usize::MAX));
-                        }
-                    }
-                }
-            }
-        }
+        let reqs = macro_lookup.edge_reqs(idx).to_vec();
         macro_edges.push((cs, cd, reqs));
     }
     let fairy = fairy_rings
@@ -404,60 +491,130 @@ pub fn build_component_graph(
 /// globals). Sound and complete: a path exists iff the goal's component is reachable
 /// from the seeded set through eligible special edges, because walk edges are never
 /// requirement-gated.
+///
+/// Convenience form that builds the profile's [`ProfileReach`] on the spot; the service
+/// resolves it once per profile via [`ProfileArtifacts::reach`] instead.
 pub fn goal_reachable(
     cg: &ComponentGraph,
     mask: &EligibilityMask,
     start_comp: Option<u16>,
     goal_comp: u16,
 ) -> bool {
-    let n = cg.components.max(goal_comp as usize + 1);
-    let mut reached = vec![false; n];
-    if let Some(sc) = start_comp {
-        if (sc as usize) < n {
-            reached[sc as usize] = true;
-        }
-    }
-    for (c, reqs) in &cg.globals {
-        if reqs.iter().all(|&i| mask.is_satisfied(i)) {
-            reached[*c as usize] = true;
-        }
-    }
-    let edges: Vec<(u16, u16)> = cg
-        .macro_edges
-        .iter()
-        .filter(|(_, _, reqs)| reqs.iter().all(|&i| mask.is_satisfied(i)))
-        .map(|&(s, d, _)| (s, d))
-        .collect();
-    let ring_comps: Vec<u16> = cg
-        .fairy
-        .iter()
-        .filter(|(_, reqs)| reqs.iter().all(|&i| mask.is_satisfied(i)))
-        .map(|&(c, _)| c)
-        .collect();
-    let mut fairy_joined = false;
-    loop {
-        if reached[goal_comp as usize] {
-            return true;
-        }
-        let mut changed = false;
-        for &(s, d) in &edges {
-            if reached[s as usize] && !reached[d as usize] {
-                reached[d as usize] = true;
-                changed = true;
+    ProfileReach::build(cg, mask).reachable(start_comp, goal_comp)
+}
+
+/// One profile's view of the [`ComponentGraph`] (T3.14): the eligible macro edges as a
+/// deduplicated component CSR, the eligible fairy-ring components, and the components
+/// eligible global teleports land in. Everything the per-request precheck used to
+/// re-filter from the full edge list (3 Vec allocations plus fixpoint sweeps over every
+/// edge until nothing changed) is decided once per profile; a request then runs ONE
+/// graph search over a few hundred components.
+pub struct ProfileReach {
+    /// Slots in the bitsets / CSR: every component id any edge, ring or global names
+    /// (normally the snapshot's walk-component count).
+    n: usize,
+    offsets: Vec<u32>,
+    succ: Vec<u16>,
+    /// Eligible ring components, deduplicated. Eligible rings form a clique: reaching any
+    /// of them reaches all of them.
+    rings: Vec<u16>,
+    ring_bits: Vec<u64>,
+    /// Components eligible global teleports land in (origin seeds), deduplicated.
+    globals: Vec<u16>,
+}
+
+impl ProfileReach {
+    pub fn build(cg: &ComponentGraph, mask: &EligibilityMask) -> Self {
+        let eligible = |reqs: &[usize]| reqs.iter().all(|&i| mask.is_satisfied(i));
+        let mut n = cg.components;
+        let mut edges: Vec<(u16, u16)> = Vec::new();
+        for (s, d, reqs) in &cg.macro_edges {
+            if eligible(reqs) {
+                n = n.max(*s as usize + 1).max(*d as usize + 1);
+                edges.push((*s, *d));
             }
         }
-        if !fairy_joined && ring_comps.iter().any(|&c| reached[c as usize]) {
-            for &c in &ring_comps {
-                if !reached[c as usize] {
-                    reached[c as usize] = true;
-                    changed = true;
+        edges.sort_unstable();
+        edges.dedup();
+        let mut rings: Vec<u16> = cg.fairy.iter().filter(|(_, r)| eligible(r)).map(|&(c, _)| c).collect();
+        rings.sort_unstable();
+        rings.dedup();
+        let mut globals: Vec<u16> = cg.globals.iter().filter(|(_, r)| eligible(r)).map(|&(c, _)| c).collect();
+        globals.sort_unstable();
+        globals.dedup();
+        for &c in rings.iter().chain(globals.iter()) {
+            n = n.max(c as usize + 1);
+        }
+        let mut offsets = vec![0u32; n + 1];
+        for &(s, _) in &edges {
+            offsets[s as usize + 1] += 1;
+        }
+        for i in 0..n {
+            offsets[i + 1] += offsets[i];
+        }
+        // `edges` is sorted by source, so the successor list fills in CSR order.
+        let succ: Vec<u16> = edges.iter().map(|&(_, d)| d).collect();
+        let mut ring_bits = vec![0u64; n.div_ceil(64)];
+        for &c in &rings {
+            ring_bits[c as usize / 64] |= 1u64 << (c % 64);
+        }
+        ProfileReach { n, offsets, succ, rings, ring_bits, globals }
+    }
+
+    /// Exact reachability of `goal_comp` from `start_comp` (None = virtual start: the
+    /// origin enters the world only through eligible globals). Same closure as the
+    /// original fixpoint: seeds = start + eligible global landings, closed under
+    /// eligible macro edges and the eligible-ring clique.
+    pub fn reachable(&self, start_comp: Option<u16>, goal_comp: u16) -> bool {
+        let g = goal_comp as usize;
+        if g >= self.n {
+            // No edge, ring or global touches this component: only a start already
+            // inside it reaches it.
+            return start_comp == Some(goal_comp);
+        }
+        // A few hundred components: a stack-sized bitset covers the common case.
+        let words = self.n.div_ceil(64);
+        let mut inline = [0u64; 16];
+        let mut heap: Vec<u64>;
+        let seen: &mut [u64] = if words <= inline.len() {
+            &mut inline[..words]
+        } else {
+            heap = vec![0u64; words];
+            &mut heap
+        };
+        let mut stack: Vec<u16> = Vec::with_capacity(32);
+        fn visit(c: u16, seen: &mut [u64], stack: &mut Vec<u16>) {
+            let (w, b) = (c as usize / 64, 1u64 << (c % 64));
+            if seen[w] & b == 0 {
+                seen[w] |= b;
+                stack.push(c);
+            }
+        }
+        if let Some(sc) = start_comp {
+            if (sc as usize) < self.n {
+                visit(sc, seen, &mut stack);
+            }
+        }
+        for &c in &self.globals {
+            visit(c, seen, &mut stack);
+        }
+        let mut rings_joined = false;
+        while let Some(c) = stack.pop() {
+            if c as usize == g {
+                return true;
+            }
+            if !rings_joined && self.ring_bits[c as usize / 64] & (1u64 << (c % 64)) != 0 {
+                rings_joined = true;
+                for &r in &self.rings {
+                    visit(r, seen, &mut stack);
                 }
             }
-            fairy_joined = true;
+            let (s, e) = (self.offsets[c as usize] as usize, self.offsets[c as usize + 1] as usize);
+            for &d in &self.succ[s..e] {
+                visit(d, seen, &mut stack);
+            }
         }
-        if !changed {
-            return reached[goal_comp as usize];
-        }
+        seen[g / 64] & (1u64 << (g % 64)) != 0
     }
 }
 
@@ -514,6 +671,36 @@ pub struct ProfileArtifacts {
     pub fairy_sources: Vec<u32>,
     /// Eligible fairy ring destinations, sorted by (dst, w).
     pub fairy_dests: Vec<(u32, f32)>,
+    /// This profile's reachability view of the snapshot's [`ComponentGraph`], built on
+    /// the first precheck that needs it (see [`ProfileArtifacts::reach`]).
+    pub reach: OnceLock<ProfileReach>,
+    /// Backward-heuristic aggregate of the eligible globals (the anchor set every
+    /// bidirectional search of this profile folds its origin into), built on first use
+    /// (see [`ProfileArtifacts::rev_base`]).
+    pub rev_base: OnceLock<RevAnchorBase>,
+}
+
+impl ProfileArtifacts {
+    /// The profile's [`ProfileReach`], built once. `mask` must be the mask these
+    /// artifacts were built for (the profile cache is keyed on its exact bits, and both
+    /// live per snapshot, like `cg`).
+    pub fn reach(&self, cg: &ComponentGraph, mask: &EligibilityMask) -> &ProfileReach {
+        self.reach.get_or_init(|| ProfileReach::build(cg, mask))
+    }
+
+    /// The eligible globals' backward-landmark aggregate over `lm` (the snapshot these
+    /// artifacts belong to), built once: bidirectional searches then fold only their own
+    /// origin into it instead of re-aggregating ~125 anchors x every landmark per
+    /// search (and per retry rung / race arm). The engine uses it only when its
+    /// fingerprint matches the anchor list it would aggregate, so results are
+    /// bit-identical either way.
+    pub fn rev_base(&self, lm: &LandmarkHeuristic) -> &RevAnchorBase {
+        self.rev_base.get_or_init(|| {
+            let anchors: Vec<(u32, f32)> =
+                self.eligible_globals.iter().copied().filter(|&(d, _)| (d as usize) < lm.nodes).collect();
+            lm.rev_base(&anchors)
+        })
+    }
 }
 
 /// Build one profile's artifacts, byte-for-byte identical to what the per-request code
@@ -575,6 +762,8 @@ pub fn build_profile_artifacts(
         eligible_globals,
         fairy_sources,
         fairy_dests,
+        reach: OnceLock::new(),
+        rev_base: OnceLock::new(),
     }
 }
 
@@ -592,24 +781,98 @@ fn kind_code(kind: &str) -> u32 {
     }
 }
 
-pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, NeighborProvider, Vec<GlobalTeleport>, FxHashMap<(u32, u32), Vec<u32>>) {
-    // 1. Build map of req_id -> tag_index
-    let req_words: &[u32] = snapshot.req_tags();
-    let mut id_to_idx = std::collections::HashMap::new();
-    let mut i = 0;
-    while i + 3 < req_words.len() {
-        let req_id = req_words[i];
-        id_to_idx.insert(req_id, i / 4);
-        i += 4;
+/// Per-edge macro metadata as the payload builder consumes it, decoded ONCE at load
+/// (T3.7/T3.15: the payload used to `serde_json::from_slice` every parallel candidate
+/// edge on every payload build — cache hits included — and the component graph parsed
+/// the whole blob a second time).
+pub struct MacroEdgeInfo {
+    /// Requirement tag indices from the metadata's top-level `requirements` array
+    /// (integer entries only; unknown ids decode to `usize::MAX`, which no mask
+    /// satisfies — fail-closed). Empty when the metadata is missing or unparseable,
+    /// i.e. the edge is allowed (fail-open), exactly as the per-request parse treated it.
+    pub reqs: Box<[usize]>,
+    meta: MacroMeta,
+}
+
+enum MacroMeta {
+    /// No metadata bytes, or bytes that do not parse: the payload shows `{}`.
+    Empty,
+    Parsed(JsonValue),
+    /// The synthetic global-teleport carrier (src = dst = 0): its ~113 KB document is
+    /// already held per teleport in [`GlobalTeleport::meta`], so it is re-parsed on
+    /// demand rather than kept twice (a path never contains the 0 -> 0 self-loop).
+    Carrier,
+}
+
+/// Macro edges by (src, dst), plus the per-edge decoded metadata (see
+/// [`MacroEdgeInfo`]), indexed by snapshot macro-edge index.
+#[derive(Default)]
+pub struct MacroLookup {
+    by_pair: FxHashMap<(u32, u32), Vec<u32>>,
+    edges: Vec<MacroEdgeInfo>,
+}
+
+impl MacroLookup {
+    /// Snapshot macro-edge indices from `src` to `dst`, in index order.
+    pub fn get(&self, key: &(u32, u32)) -> Option<&Vec<u32>> {
+        self.by_pair.get(key)
     }
 
-    // 2. Iterate macro edges and parse requirements
+    /// Decoded requirement list of edge `idx` (empty when out of range).
+    pub fn edge_reqs(&self, idx: usize) -> &[usize] {
+        self.edges.get(idx).map_or(&[], |e| &e.reqs)
+    }
+
+    /// Whether `mask` satisfies edge `idx`'s requirements.
+    pub fn allowed(&self, idx: usize, mask: &EligibilityMask) -> bool {
+        self.edge_reqs(idx).iter().all(|&i| mask.is_satisfied(i))
+    }
+
+    /// Owned copy of edge `idx`'s metadata for a payload action (`{}` when missing or
+    /// unparseable). Owned because the payload builder mutates it per action.
+    pub fn meta_value(&self, snap: &Snapshot, idx: usize) -> JsonValue {
+        match self.edges.get(idx).map(|e| &e.meta) {
+            Some(MacroMeta::Parsed(v)) => v.clone(),
+            Some(MacroMeta::Carrier) | None => snap
+                .macro_meta_at(idx)
+                .and_then(|b| serde_json::from_slice(b).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
+            Some(MacroMeta::Empty) => serde_json::json!({}),
+        }
+    }
+}
+
+/// Decode a metadata `requirements` array into tag indices (fail-closed on unknown ids).
+fn decode_reqs(val: &JsonValue, id_to_idx: &FxHashMap<u32, usize>, missing: &mut u64) -> Vec<usize> {
+    let mut reqs = Vec::new();
+    if let Some(arr) = val.get("requirements").and_then(|v| v.as_array()) {
+        for ridv in arr {
+            if let Some(rid) = ridv.as_u64() {
+                if let Some(&tag_idx) = id_to_idx.get(&(rid as u32)) {
+                    reqs.push(tag_idx);
+                } else {
+                    // Fail-closed: unknown requirement id means the edge can never be satisfied
+                    reqs.push(usize::MAX);
+                    *missing += 1;
+                }
+            }
+        }
+    }
+    reqs
+}
+
+pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, NeighborProvider, Vec<GlobalTeleport>, MacroLookup) {
+    // 1. Map of req_id -> tag_index
+    let id_to_idx = crate::build_req_tag_index(Some(snapshot));
+
+    // 2. Iterate macro edges and parse their metadata once
     let msrc = snapshot.macro_src();
     let len = msrc.len();
     let mut macro_reqs: Vec<Vec<usize>> = Vec::with_capacity(len);
+    let mut edges: Vec<MacroEdgeInfo> = Vec::with_capacity(len);
     let mut globals: Vec<GlobalTeleport> = Vec::new();
-    let mut macro_lookup: FxHashMap<(u32, u32), Vec<u32>> = FxHashMap::with_capacity_and_hasher(len, Default::default());
-    
+    let mut by_pair: FxHashMap<(u32, u32), Vec<u32>> = FxHashMap::with_capacity_and_hasher(len, Default::default());
+
     let msrc_vec: &[u32] = msrc;
     let mdst_vec: &[u32] = snapshot.macro_dst();
     let mw_vec: &[f32] = snapshot.macro_w();
@@ -619,18 +882,17 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Neighb
 
     for idx in 0..len {
         let mut reqs = Vec::new();
-        let mut is_global = false;
+        let is_carrier = msrc_vec[idx] == 0 && mdst_vec[idx] == 0;
+        let mut info = MacroEdgeInfo { reqs: Box::default(), meta: MacroMeta::Empty };
 
         if let Some(bytes) = snapshot.macro_meta_at(idx) {
             if let Ok(val) = serde_json::from_slice::<JsonValue>(bytes) {
                 // Check for global def
-                if msrc_vec[idx] == 0 && mdst_vec[idx] == 0 {
-                    is_global = true;
+                if is_carrier {
                     if let Some(arr) = val.get("global").and_then(|v| v.as_array()) {
                          for g in arr {
                              let dst = g.get("dst").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                              let cost = g.get("cost_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                             let mut g_reqs = Vec::new();
                              let kind_first = g
                                  .get("steps")
                                  .and_then(|v| v.as_array())
@@ -639,47 +901,29 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Neighb
                                  .and_then(|v| v.as_str())
                                  .map(kind_code)
                                  .unwrap_or(0);
-                             if let Some(r_arr) = g.get("requirements").and_then(|v| v.as_array()) {
-                                 for ridv in r_arr {
-                                     if let Some(rid) = ridv.as_u64() {
-                                         if let Some(&tag_idx) = id_to_idx.get(&(rid as u32)) {
-                                             g_reqs.push(tag_idx);
-                                         } else {
-                                             // Fail-closed: unknown requirement id means the edge can never be satisfied
-                                             g_reqs.push(usize::MAX);
-                                             missing_req_ids += 1;
-                                         }
-                                     }
-                                 }
-                             }
+                             let g_reqs = decode_reqs(g, &id_to_idx, &mut missing_req_ids);
                              if dst != 0 {
                                  globals.push(GlobalTeleport { dst, cost, reqs: g_reqs, kind_first, meta: Arc::new(g.clone()) });
                              }
                          }
                     }
-                }
-
-                if !is_global {
-                    if let Some(arr) = val.get("requirements").and_then(|v| v.as_array()) {
-                        for ridv in arr {
-                            if let Some(rid) = ridv.as_u64() {
-                                if let Some(&tag_idx) = id_to_idx.get(&(rid as u32)) {
-                                    reqs.push(tag_idx);
-                                } else {
-                                    // Fail-closed: unknown requirement id means the edge can never be satisfied
-                                    reqs.push(usize::MAX);
-                                    missing_req_ids += 1;
-                                }
-                            }
-                        }
-                    }
+                    // The carrier is not a search edge (no requirements on the provider),
+                    // but the payload decodes its top-level list like any other edge.
+                    let mut uncounted = 0;
+                    info.reqs = decode_reqs(&val, &id_to_idx, &mut uncounted).into_boxed_slice();
+                    info.meta = MacroMeta::Carrier;
+                } else {
+                    reqs = decode_reqs(&val, &id_to_idx, &mut missing_req_ids);
+                    info.reqs = reqs.clone().into_boxed_slice();
+                    info.meta = MacroMeta::Parsed(val);
                 }
             }
         }
         macro_reqs.push(reqs);
-        macro_lookup
+        edges.push(info);
+        by_pair
             .entry((msrc_vec[idx], mdst_vec[idx]))
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(idx as u32);
     }
 
@@ -705,21 +949,14 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Neighb
         &macro_reqs,
     );
 
-    (provider, provider_rev, globals, macro_lookup)
+    (provider, provider_rev, globals, MacroLookup { by_pair, edges })
 }
 
 /// Build fairy ring runtime data from snapshot.
 /// Returns: (Vec<FairyRing>, HashMap<node_id, ring_index>)
 pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, FxHashMap<u32, usize>) {
     // Build req_id -> tag_index map
-    let req_words: &[u32] = snapshot.req_tags();
-    let mut id_to_idx: HashMap<u32, usize> = HashMap::new();
-    let mut i = 0;
-    while i + 3 < req_words.len() {
-        let req_id = req_words[i];
-        id_to_idx.insert(req_id, i / 4);
-        i += 4;
-    }
+    let id_to_idx = crate::build_req_tag_index(Some(snapshot));
 
     let fairy_count = snapshot.counts().fairy_rings as usize;
     let mut rings: Vec<FairyRing> = Vec::with_capacity(fairy_count);
@@ -744,21 +981,8 @@ pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, FxHashMap<u32,
                     let code = val.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let action = val.get("action").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-                    // Parse requirements and map to tag indices
-                    let mut reqs = Vec::new();
-                    if let Some(arr) = val.get("requirements").and_then(|v| v.as_array()) {
-                        for ridv in arr {
-                            if let Some(rid) = ridv.as_u64() {
-                                if let Some(&tag_idx) = id_to_idx.get(&(rid as u32)) {
-                                    reqs.push(tag_idx);
-                                } else {
-                                    // Fail-closed: unknown requirement id
-                                    reqs.push(usize::MAX);
-                                    missing_req_ids += 1;
-                                }
-                            }
-                        }
-                    }
+                    // Parse requirements and map to tag indices (fail-closed on unknown ids)
+                    let reqs = decode_reqs(&val, &id_to_idx, &mut missing_req_ids);
 
                     (object_id, x, y, plane, code, action, reqs)
                 } else {
@@ -806,11 +1030,11 @@ pub fn run_route_with_requirements_and_fairy_rings(
     artifacts: &ProfileArtifacts,
     // Canonical pruning grid (None = full expansion); engages for unseeded rungs only.
     canonical: Option<Arc<CanonicalGrid>>,
-    // Pooled per-search state (forward, backward); reset per search, checked out for
-    // the duration of this call only.
     // Engine selection: `Policy` for normal requests, `Uni`/`Bidir` for the race.
     engine: EngineChoice,
-    ctxs: &mut (SearchContext, SearchContext),
+    // Per-search state: one context for unidirectional searches, two for bidirectional
+    // (see [`SearchContexts`]); reset per search, checked out for this call only.
+    ctxs: &mut dyn SearchContexts,
 ) -> SearchOutcome {
     // Per-request requirement diagnostics, gated behind NAVPATH_DEBUG_REQS=1 so the hot
     // path skips this scan/logging by default. Enable when debugging requirement matching.
@@ -835,12 +1059,7 @@ pub fn run_route_with_requirements_and_fairy_rings(
 
     let nodes = snapshot.counts().nodes as usize;
     let snap_ref: &Snapshot = &snapshot;
-    let lm = LandmarkHeuristic {
-        nodes,
-        landmarks: snap_ref.counts().landmarks as usize,
-        tab: snap_ref.lm_tab(),
-        quantum: snap_ref.manifest().alt_quantum_ms,
-    };
+    let lm = LandmarkHeuristic::from_snapshot(snap_ref);
 
     let mut view = EngineView {
         nodes,
@@ -902,20 +1121,25 @@ pub fn run_route_with_requirements_and_fairy_rings(
     } else {
         None
     };
+    if bidir.is_some() {
+        // Per-profile backward-anchor aggregate (T3.9): the engine folds only this
+        // request's origin into it.
+        view.extra.global_rev_base = Some(artifacts.rev_base(&view.lm));
+    }
 
-    let search = |seed: Option<u64>, max_pops: Option<u32>, ctxs: &mut (SearchContext, SearchContext)| -> SearchResult {
+    let search = |seed: Option<u64>, max_pops: Option<u32>, resume: bool, ctxs: &mut dyn SearchContexts| -> SearchResult {
         let params = SearchParams { start: start_id, goal: goal_id, macro_filter: Some(macro_filter), seed, max_pops, cancel, bucket_ms: bucket_for(seed) };
         if let Some((rev, macro_filter_rev)) = bidir.as_ref() {
             let bp = BidirParams { macros_rev: rev, macro_filter_rev: Some(macro_filter_rev) };
-            let (cf, cb) = (&mut ctxs.0, &mut ctxs.1);
-            return view.astar_bidir(&bp, params, cf, cb);
+            let (cf, cb) = ctxs.two();
+            return if resume { view.astar_bidir_resume(&bp, params, cf, cb) } else { view.astar_bidir(&bp, params, cf, cb) };
         }
-        view.astar(params, &mut ctxs.0)
+        if resume { view.astar_resume(params, ctxs.one()) } else { view.astar(params, ctxs.one()) }
     };
 
-    let res = search(seed, default_max_pops(nodes), ctxs);
+    let res = search(seed, default_max_pops(nodes), false, ctxs);
     let engine_name = if bidir.is_some() { "bidir" } else if view.jps && view.canonical.is_some() { "jps" } else { "uni" };
-    retry_ladder(res, seed, cancel, nodes, engine_name, |s, m| search(s, m, ctxs))
+    retry_ladder(res, seed, cancel, nodes, engine_name, |s, m, r| search(s, m, r, ctxs))
 }
 
 pub fn run_route_with_requirements_virtual_start(
@@ -934,7 +1158,7 @@ pub fn run_route_with_requirements_virtual_start(
     artifacts: &ProfileArtifacts,
     canonical: Option<Arc<CanonicalGrid>>,
     engine: EngineChoice,
-    ctxs: &mut (SearchContext, SearchContext),
+    ctxs: &mut dyn SearchContexts,
 ) -> (SearchOutcome, Option<u32>) {
     let eligible_globals: &[(u32, f32)] = &artifacts.eligible_globals;
     if eligible_globals.is_empty() {
@@ -946,12 +1170,7 @@ pub fn run_route_with_requirements_virtual_start(
 
     let nodes = snapshot.counts().nodes as usize;
     let snap_ref: &Snapshot = &snapshot;
-    let lm = LandmarkHeuristic {
-        nodes,
-        landmarks: snap_ref.counts().landmarks as usize,
-        tab: snap_ref.lm_tab(),
-        quantum: snap_ref.manifest().alt_quantum_ms,
-    };
+    let lm = LandmarkHeuristic::from_snapshot(snap_ref);
     let mut view = EngineView {
         nodes,
         walk: WalkGraph::from_snapshot(snap_ref),
@@ -996,25 +1215,38 @@ pub fn run_route_with_requirements_virtual_start(
     } else {
         None
     };
+    if bidir.is_some() {
+        // Per-profile backward-anchor aggregate (T3.9): the engine folds only this
+        // request's origin into it.
+        view.extra.global_rev_base = Some(artifacts.rev_base(&view.lm));
+    }
 
     // One multi-source search replaces one full A* per eligible teleport: every teleport
     // destination is seeded at g = its cost, and the winning entry is path[0]. The engine
     // leaves `extra.global` unused in multi-source mode, and this out-of-graph start has
     // no mid-route teleports by construction (a second teleport at any node u would cost
     // g(u) + c >= c, dominated by seeding it directly).
-    let search = |seed: Option<u64>, max_pops: Option<u32>, ctxs: &mut (SearchContext, SearchContext)| -> SearchResult {
+    let search = |seed: Option<u64>, max_pops: Option<u32>, resume: bool, ctxs: &mut dyn SearchContexts| -> SearchResult {
         let params = SearchParams { start: goal_id, goal: goal_id, macro_filter: Some(macro_filter), seed, max_pops, cancel, bucket_ms: bucket_for(seed) };
         if let Some((rev, macro_filter_rev)) = bidir.as_ref() {
             let bp = BidirParams { macros_rev: rev, macro_filter_rev: Some(macro_filter_rev) };
-            let (cf, cb) = (&mut ctxs.0, &mut ctxs.1);
-            return view.astar_bidir_multi(eligible_globals, &bp, params, cf, cb);
+            let (cf, cb) = ctxs.two();
+            return if resume {
+                view.astar_bidir_multi_resume(eligible_globals, &bp, params, cf, cb)
+            } else {
+                view.astar_bidir_multi(eligible_globals, &bp, params, cf, cb)
+            };
         }
-        view.astar_multi(eligible_globals, params, &mut ctxs.0)
+        if resume {
+            view.astar_multi_resume(eligible_globals, params, ctxs.one())
+        } else {
+            view.astar_multi(eligible_globals, params, ctxs.one())
+        }
     };
 
-    let res = search(seed, default_max_pops(nodes), ctxs);
+    let res = search(seed, default_max_pops(nodes), false, ctxs);
     let engine_name = if bidir.is_some() { "bidir" } else if view.jps && view.canonical.is_some() { "jps" } else { "uni" };
-    let outcome = retry_ladder(res, seed, cancel, nodes, engine_name, |s, m| search(s, m, ctxs));
+    let outcome = retry_ladder(res, seed, cancel, nodes, engine_name, |s, m, r| search(s, m, r, ctxs));
 
     let entry = if outcome.res.found { outcome.res.path.first().copied() } else { None };
     (outcome, entry)
@@ -1076,6 +1308,92 @@ mod tests {
         // No eligible entry at all: virtual start reaches nothing.
         let cg2 = ComponentGraph { components: 2, macro_edges: vec![], fairy: vec![], globals: vec![(1, vec![0])] };
         assert!(!goal_reachable(&cg2, &mask_of(&[false]), None, 1));
+    }
+
+    /// The pre-T3.14 precheck, verbatim: per-request filtering plus fixpoint sweeps.
+    fn goal_reachable_reference(cg: &ComponentGraph, mask: &EligibilityMask, start_comp: Option<u16>, goal_comp: u16) -> bool {
+        let n = cg.components.max(goal_comp as usize + 1);
+        let mut reached = vec![false; n];
+        if let Some(sc) = start_comp {
+            if (sc as usize) < n {
+                reached[sc as usize] = true;
+            }
+        }
+        for (c, reqs) in &cg.globals {
+            if reqs.iter().all(|&i| mask.is_satisfied(i)) {
+                reached[*c as usize] = true;
+            }
+        }
+        let edges: Vec<(u16, u16)> = cg.macro_edges.iter()
+            .filter(|(_, _, reqs)| reqs.iter().all(|&i| mask.is_satisfied(i)))
+            .map(|&(s, d, _)| (s, d))
+            .collect();
+        let ring_comps: Vec<u16> = cg.fairy.iter()
+            .filter(|(_, reqs)| reqs.iter().all(|&i| mask.is_satisfied(i)))
+            .map(|&(c, _)| c)
+            .collect();
+        let mut fairy_joined = false;
+        loop {
+            if reached[goal_comp as usize] {
+                return true;
+            }
+            let mut changed = false;
+            for &(s, d) in &edges {
+                if reached[s as usize] && !reached[d as usize] {
+                    reached[d as usize] = true;
+                    changed = true;
+                }
+            }
+            if !fairy_joined && ring_comps.iter().any(|&c| reached[c as usize]) {
+                for &c in &ring_comps {
+                    if !reached[c as usize] {
+                        reached[c as usize] = true;
+                        changed = true;
+                    }
+                }
+                fairy_joined = true;
+            }
+            if !changed {
+                return reached[goal_comp as usize];
+            }
+        }
+    }
+
+    #[test]
+    fn profile_reach_matches_the_fixpoint_precheck() {
+        let mut state: u64 = 0x5EED_1234_ABCD_0001;
+        let mut next = |m: u64| -> u64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % m
+        };
+        for round in 0..300 {
+            // Up to 1100 components exercises the heap-bitset branch too.
+            let comps = 2 + next(if round % 10 == 0 { 1100 } else { 60 }) as usize;
+            let tags = 1 + next(6) as usize;
+            let reqs = |next: &mut dyn FnMut(u64) -> u64| -> Vec<usize> {
+                (0..next(3)).map(|_| if next(10) == 0 { usize::MAX } else { next(tags as u64) as usize }).collect()
+            };
+            let macro_edges = (0..next(3 * comps as u64))
+                .map(|_| (next(comps as u64) as u16, next(comps as u64) as u16, reqs(&mut next)))
+                .collect();
+            let fairy = (0..next(5)).map(|_| (next(comps as u64) as u16, reqs(&mut next))).collect();
+            let globals = (0..next(4)).map(|_| (next(comps as u64) as u16, reqs(&mut next))).collect();
+            let cg = ComponentGraph { components: comps, macro_edges, fairy, globals };
+            for _ in 0..8 {
+                let mask = mask_of(&(0..tags).map(|_| next(3) != 0).collect::<Vec<_>>());
+                let reach = ProfileReach::build(&cg, &mask);
+                for _ in 0..8 {
+                    let start = if next(5) == 0 { None } else { Some(next(comps as u64) as u16) };
+                    // Occasionally a goal id past every component (reference sizes for it).
+                    let goal = if next(20) == 0 { comps as u16 + next(3) as u16 } else { next(comps as u64) as u16 };
+                    assert_eq!(
+                        reach.reachable(start, goal),
+                        goal_reachable_reference(&cg, &mask, start, goal),
+                        "round {round} start {start:?} goal {goal}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

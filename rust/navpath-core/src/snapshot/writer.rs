@@ -3,7 +3,7 @@ use std::{fs::File, io::{BufWriter, Write}, path::Path};
 #[cfg(not(target_endian = "little"))]
 use byteorder::{ByteOrder, LittleEndian};
 
-use super::manifest::{align_up, Manifest, SnapshotCounts, ALT_QUANTUM_MS, MANIFEST_OFFSET_COUNT, SNAPSHOT_VERSION};
+use super::manifest::{align_up, Manifest, SnapshotCounts, ALT_FORMAT_PACKED, ALT_FORMAT_U16, ALT_QUANTUM_MS, ALT_SECTION_ALIGN, MANIFEST_OFFSET_COUNT, SNAPSHOT_VERSION};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriterError {
@@ -38,10 +38,10 @@ impl<W: Write> HashingWriter<W> {
     /// Zero-pad up to the given absolute offset (section alignment).
     fn pad_to(&mut self, off: u64) -> Result<(), WriterError> {
         debug_assert!(off >= self.written);
-        const ZEROS: [u8; 64] = [0u8; 64];
+        const ZEROS: [u8; 4096] = [0u8; 4096];
         let mut remaining = off - self.written;
         while remaining > 0 {
-            let n = remaining.min(64) as usize;
+            let n = remaining.min(ZEROS.len() as u64) as usize;
             self.write_bytes(&ZEROS[..n])?;
             remaining -= n as u64;
         }
@@ -111,10 +111,29 @@ impl<W: Write> HashingWriter<W> {
     }
 }
 
-/// All inputs for a v8 snapshot. Coordinates are pre-packed (see `pack_coord`) and MUST
-/// be ascending (node ids are assigned in (plane,y,x) order); the walk graph is CSR with
-/// a per-slot diagonal bitmap; `lm_tab` is the interleaved quantized ALT table
-/// `[node][landmark][fw,bw]` (u16 quanta, 0xFFFF = unreachable).
+/// ALT section encoding to write (see [`super::alt_pack`]).
+#[cfg(feature = "builder")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AltFormat {
+    /// Plain interleaved u16 quanta.
+    #[default]
+    U16,
+    /// Clustered u8 offsets from per-cluster u16 bases.
+    Packed,
+}
+
+/// Writer options beyond the section data.
+#[cfg(feature = "builder")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WriteOptions {
+    pub alt_format: AltFormat,
+}
+
+/// All inputs for a snapshot (current version: [`SNAPSHOT_VERSION`]). Coordinates are
+/// pre-packed (see `pack_coord`) and MUST be strictly ascending (node ids are assigned
+/// in key order); the walk graph is CSR with a per-slot diagonal bitmap; `lm_tab` is
+/// the interleaved quantized ALT table `[node][landmark][fw,bw]` (u16 quanta, 0xFFFF =
+/// unreachable) — the writer encodes it per [`WriteOptions::alt_format`].
 #[cfg(feature = "builder")]
 pub struct SnapshotSections<'a> {
     pub coords_packed: &'a [u32],
@@ -141,8 +160,15 @@ pub struct SnapshotSections<'a> {
     pub fairy_meta_blob: &'a [u8],
 }
 
+/// Write a snapshot with the plain u16 ALT table (the historical entry point; the file
+/// is written in the CURRENT format version).
 #[cfg(feature = "builder")]
 pub fn write_snapshot_v8(path: impl AsRef<Path>, s: &SnapshotSections) -> Result<WriteResult, WriterError> {
+    write_snapshot(path, s, &WriteOptions::default())
+}
+
+#[cfg(feature = "builder")]
+pub fn write_snapshot(path: impl AsRef<Path>, s: &SnapshotSections, opts: &WriteOptions) -> Result<WriteResult, WriterError> {
     let n = s.coords_packed.len();
     let e = s.walk_dst.len();
     let m = s.macro_src.len();
@@ -166,6 +192,20 @@ pub fn write_snapshot_v8(path: impl AsRef<Path>, s: &SnapshotSections) -> Result
     if s.lm_tab.len() != n * lm * 2 {
         return Err(WriterError::LengthMismatch("lm_tab"));
     }
+    if s.coords_packed.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(WriterError::LengthMismatch("coords_packed must be strictly ascending"));
+    }
+    let (packed_alt, alt_exceptions): (Option<Vec<u8>>, u32) = match opts.alt_format {
+        AltFormat::U16 => (None, 0),
+        AltFormat::Packed => {
+            let (bytes, exc) = super::alt_pack::pack_alt(s.lm_tab, n, lm);
+            (Some(bytes), exc)
+        }
+    };
+    let lm_bytes = match &packed_alt {
+        Some(p) => p.len() as u64,
+        None => (n * lm * 4) as u64,
+    };
     if s.fairy_cost_ms.len() != fr || s.fairy_meta_offs.len() != fr || s.fairy_meta_lens.len() != fr {
         return Err(WriterError::LengthMismatch("fairy arrays"));
     }
@@ -197,7 +237,7 @@ pub fn write_snapshot_v8(path: impl AsRef<Path>, s: &SnapshotSections) -> Result
         s.macro_meta_blob.len() as u64,
         (s.req_tags.len() * 4) as u64,
         (lm * 4) as u64,              // landmarks
-        (n * lm * 4) as u64,          // lm_tab (2 u16 per entry pair)
+        lm_bytes,                     // lm_tab
         (fr * 4) as u64,              // fairy_nodes
         (fr * 4) as u64,              // fairy_cost_ms
         (fr * 4) as u64,              // fairy_meta_offs
@@ -208,6 +248,13 @@ pub fn write_snapshot_v8(path: impl AsRef<Path>, s: &SnapshotSections) -> Result
     let mut cur = Manifest::SIZE as u64;
     for i in 0..MANIFEST_OFFSET_COUNT {
         cur = align_up(cur);
+        // The ALT table (index 15) starts on a huge-page boundary and the next section
+        // starts on the following one, so every table page can be PMD-mapped (a
+        // misaligned start forces the first and last 2 MiB of the range onto 4 KiB
+        // pages). At most ~4 MiB of padding.
+        if i == 15 || i == 16 {
+            cur = (cur + ALT_SECTION_ALIGN - 1) & !(ALT_SECTION_ALIGN - 1);
+        }
         offs[i] = cur;
         cur += sizes[i];
     }
@@ -216,6 +263,8 @@ pub fn write_snapshot_v8(path: impl AsRef<Path>, s: &SnapshotSections) -> Result
         version: SNAPSHOT_VERSION,
         counts,
         alt_quantum_ms: ALT_QUANTUM_MS,
+        alt_format: if packed_alt.is_some() { ALT_FORMAT_PACKED } else { ALT_FORMAT_U16 },
+        alt_exceptions,
         off_coords: offs[0],
         off_walk_offsets: offs[1],
         off_walk_dst: offs[2],
@@ -288,7 +337,10 @@ pub fn write_snapshot_v8(path: impl AsRef<Path>, s: &SnapshotSections) -> Result
     w.pad_to(offs[14])?;
     w.write_u32s(s.landmarks)?;
     w.pad_to(offs[15])?;
-    w.write_u16s(s.lm_tab)?;
+    match &packed_alt {
+        Some(p) => w.write_bytes(p)?,
+        None => w.write_u16s(s.lm_tab)?,
+    }
     w.pad_to(offs[16])?;
     w.write_u32s(s.fairy_nodes)?;
     w.pad_to(offs[17])?;
@@ -304,6 +356,9 @@ pub fn write_snapshot_v8(path: impl AsRef<Path>, s: &SnapshotSections) -> Result
     let hash_bytes: [u8; 32] = (*hash.as_bytes()).try_into().unwrap();
     w.inner.write_all(&hash_bytes)?;
     w.inner.flush()?;
+    // Durable before it becomes visible: a crash after the rename must not leave a
+    // zero-filled or truncated snapshot under the served name.
+    w.inner.get_ref().sync_all()?;
     drop(w);
     std::fs::rename(&tmp_path, path)?;
 

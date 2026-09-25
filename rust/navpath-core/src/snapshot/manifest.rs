@@ -2,16 +2,32 @@ use byteorder::{ByteOrder, LittleEndian};
 
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"NPSS"; // NavPath SnapShot
 // v8: format overhaul for read-side speed and 4M-tile scale:
-//  - node coords packed into one u32 section (plane<<30 | y<<15 | x), ascending in node
-//    id order, so coordinate->id lookup is a binary search over the mmap (no heap index);
+//  - node coords packed into one u32 section, ascending in node id order, so
+//    coordinate->id lookup is a binary search over the mmap (no heap index);
 //  - walk graph stored CSR-native (offsets + dst + per-edge diagonal bitmap; weights are
 //    derived: 300ms cardinal / 300*sqrt(2) diagonal) — no load-time CSR rebuild;
 //  - ALT tables quantized to u16 in ALT_QUANTUM_MS units and interleaved
 //    [node][landmark][fw,bw] so one heuristic call reads one contiguous row;
 //  - per-node walk-component ids (u16) for reachability prechecks;
 //  - every section start is 64-byte aligned, enabling zero-copy typed slices.
+// v9 (2026-09): locality overhaul —
+//  - the coordinate key (and therefore node numbering) is plane-major MORTON order
+//    (x/y bits interleaved) instead of raster (plane, y, x): spatial neighbours get
+//    nearby ids, so a search corridor's ALT rows / CSR rows / search-state records
+//    share pages and cache lines (measured 72% -> 23% of walk edges crossing a 4 KiB
+//    ALT page; 2.6x fewer 2 MiB folios per corridor);
+//  - the ALT section may use the clustered u8 encoding (`alt_format` = 1, see
+//    `alt_pack`), and starts and ends on 2 MiB boundaries so every table page can be
+//    PMD-mapped.
 // Snapshots must be rebuilt.
-pub const SNAPSHOT_VERSION: u32 = 8;
+pub const SNAPSHOT_VERSION: u32 = 9;
+
+/// ALT section encodings (`Manifest::alt_format`).
+pub const ALT_FORMAT_U16: u32 = 0;
+pub const ALT_FORMAT_PACKED: u32 = 1;
+
+/// Alignment of the ALT section's start and of the section following it (huge page).
+pub const ALT_SECTION_ALIGN: u64 = 2 << 20;
 
 /// Quantum for the u16 ALT tables, in milliseconds. Stored values are
 /// floor(distance_ms / quantum); 0xFFFF marks unreachable and 0xFFFE saturation
@@ -40,17 +56,63 @@ pub fn walk_diagonal_ms() -> f32 {
     2f32.sqrt() * WALK_CARDINAL_MS
 }
 
-/// Pack node coordinates into the v8 key: plane<<30 | y<<15 | x. Key order equals
-/// (plane, y, x) lexicographic order, which is also node-id assignment order.
+/// Spread the low 15 bits of `v` to the even bit positions.
+#[inline(always)]
+fn spread15(v: u32) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // SAFETY: the bmi2 target feature is enabled at compile time.
+        unsafe { core::arch::x86_64::_pdep_u32(v, 0x5555_5555) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut x = v & 0x7FFF;
+        x = (x | (x << 8)) & 0x00FF_00FF;
+        x = (x | (x << 4)) & 0x0F0F_0F0F;
+        x = (x | (x << 2)) & 0x3333_3333;
+        (x | (x << 1)) & 0x5555_5555
+    }
+}
+
+/// Inverse of [`spread15`]: gather the even bit positions.
+#[inline(always)]
+fn gather15(k: u32) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // SAFETY: the bmi2 target feature is enabled at compile time.
+        unsafe { core::arch::x86_64::_pext_u32(k, 0x1555_5555) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut x = k & 0x1555_5555;
+        x = (x | (x >> 1)) & 0x3333_3333;
+        x = (x | (x >> 2)) & 0x0F0F_0F0F;
+        x = (x | (x >> 4)) & 0x00FF_00FF;
+        (x | (x >> 8)) & 0x7FFF
+    }
+}
+
+/// Pack node coordinates into the v9 key: `plane << 30 | morton(x, y)` (x on the even
+/// bits, y on the odd bits, 15 bits each). Key order is plane-major Z-order, which is
+/// also node-id assignment order. Monotone in x for fixed (y, plane) and in y for fixed
+/// (x, plane), but NOT raster order: code that needs a raster sweep must sort by
+/// [`raster_key`].
 #[inline]
 pub fn pack_coord(x: i32, y: i32, plane: i32) -> u32 {
     debug_assert!((0..32768).contains(&x) && (0..32768).contains(&y) && (0..4).contains(&plane));
-    ((plane as u32) << 30) | ((y as u32) << 15) | (x as u32)
+    ((plane as u32) << 30) | spread15(x as u32) | (spread15(y as u32) << 1)
 }
 
 #[inline]
 pub fn unpack_coord(key: u32) -> (i32, i32, i32) {
-    ((key & 0x7FFF) as i32, ((key >> 15) & 0x7FFF) as i32, (key >> 30) as i32)
+    (gather15(key) as i32, gather15(key >> 1) as i32, (key >> 30) as i32)
+}
+
+/// Raster (plane, y, x) order key of a v9 packed coordinate — the pre-v9 key.
+#[inline]
+pub fn raster_key(key: u32) -> u32 {
+    let (x, y, p) = unpack_coord(key);
+    ((p as u32) << 30) | ((y as u32) << 15) | (x as u32)
 }
 
 /// Alignment for every section start (and the header size), so mmap'd sections can be
@@ -82,6 +144,10 @@ pub struct Manifest {
     /// every heuristic value (observed in production as weak-h budget exhaustion).
     /// 0.0 in legacy v8 files (header padding) decodes as 64.0.
     pub alt_quantum_ms: f32,
+    /// ALT section encoding: [`ALT_FORMAT_U16`] or [`ALT_FORMAT_PACKED`].
+    pub alt_format: u32,
+    /// Packed format: number of exact-value exception entries after the records.
+    pub alt_exceptions: u32,
     pub off_coords: u64,
     pub off_walk_offsets: u64,
     pub off_walk_dst: u64,
@@ -158,12 +224,20 @@ impl Manifest {
         for (i, o) in offs.iter_mut().enumerate() {
             *o = LittleEndian::read_u64(&header[o0 + i * 8..o0 + i * 8 + 8]);
         }
-        let q = LittleEndian::read_f32(&header[o0 + MANIFEST_OFFSET_COUNT * 8..o0 + MANIFEST_OFFSET_COUNT * 8 + 4]);
+        let q0 = o0 + MANIFEST_OFFSET_COUNT * 8;
+        let q = LittleEndian::read_f32(&header[q0..q0 + 4]);
         let alt_quantum_ms = if q > 0.0 && q.is_finite() { q } else { ALT_QUANTUM_MS };
+        let alt_format = LittleEndian::read_u32(&header[q0 + 4..q0 + 8]);
+        let alt_exceptions = LittleEndian::read_u32(&header[q0 + 8..q0 + 12]);
+        if alt_format != ALT_FORMAT_U16 && alt_format != ALT_FORMAT_PACKED {
+            return Err(ManifestError::Invalid("unknown ALT table format"));
+        }
         Ok(Manifest {
             version,
             counts,
             alt_quantum_ms,
+            alt_format,
+            alt_exceptions,
             off_coords: offs[0],
             off_walk_offsets: offs[1],
             off_walk_dst: offs[2],
@@ -204,8 +278,22 @@ impl Manifest {
         for (i, o) in self.offsets().iter().enumerate() {
             LittleEndian::write_u64(&mut header[o0 + i * 8..o0 + i * 8 + 8], *o);
         }
-        LittleEndian::write_f32(&mut header[o0 + MANIFEST_OFFSET_COUNT * 8..o0 + MANIFEST_OFFSET_COUNT * 8 + 4], self.alt_quantum_ms);
+        let q0 = o0 + MANIFEST_OFFSET_COUNT * 8;
+        LittleEndian::write_f32(&mut header[q0..q0 + 4], self.alt_quantum_ms);
+        LittleEndian::write_u32(&mut header[q0 + 4..q0 + 8], self.alt_format);
+        LittleEndian::write_u32(&mut header[q0 + 8..q0 + 12], self.alt_exceptions);
         header
+    }
+
+    /// Byte `(offset, length)` of the ALT table section.
+    pub fn lm_tab_range(&self) -> (usize, usize) {
+        let (n, l) = (self.counts.nodes as usize, self.counts.landmarks as usize);
+        let len = if self.alt_format == ALT_FORMAT_PACKED {
+            super::alt_pack::packed_bytes(n, l) + self.alt_exceptions as usize * super::alt_pack::EXCEPTION_BYTES
+        } else {
+            n.saturating_mul(l).saturating_mul(4)
+        };
+        (self.off_lm_tab as usize, len)
     }
 
     pub fn validate_layout(&self, file_len: usize) -> Result<(), ManifestError> {
@@ -230,7 +318,7 @@ impl Manifest {
             ("macro_w", self.off_macro_w, m * 4),
             ("req_tags", self.off_req_tags, self.counts.req_tags as usize * 4),
             ("landmarks", self.off_landmarks, lm * 4),
-            ("lm_tab", self.off_lm_tab, n.saturating_mul(lm) * 4), // 2 u16 per (node, lm)
+            ("lm_tab", self.off_lm_tab, self.lm_tab_range().1),
             ("fairy_nodes", self.off_fairy_nodes, fr * 4),
         ];
         for (name, off, bytes) in checks {
@@ -250,14 +338,29 @@ impl Manifest {
         // blobs are variable length; ensure starts are within the file
         if (self.off_macro_meta_blob as usize) > file_len { return Err(ManifestError::OutOfBounds("macro_meta_blob")); }
         if (self.off_fairy_meta_blob as usize) > file_len { return Err(ManifestError::OutOfBounds("fairy_meta_blob")); }
-        // alignment: hot typed sections must sit on SECTION_ALIGN boundaries
+        // alignment: EVERY typed section is reinterpreted as a slice of its element
+        // type (Snapshot::section), so each must be aligned; the writer puts all of them
+        // on SECTION_ALIGN boundaries. (Checking only the hot ones left misaligned
+        // macro/fairy sections of a malformed file as undefined behaviour.)
         for (name, off) in [
             ("coords", self.off_coords),
             ("walk_offsets", self.off_walk_offsets),
             ("walk_dst", self.off_walk_dst),
             ("comp", self.off_comp),
+            ("macro_src", self.off_macro_src),
+            ("macro_dst", self.off_macro_dst),
+            ("macro_w", self.off_macro_w),
+            ("macro_kind_first", self.off_macro_kind_first),
+            ("macro_id_first", self.off_macro_id_first),
+            ("macro_meta_offs", self.off_macro_meta_offs),
+            ("macro_meta_lens", self.off_macro_meta_lens),
             ("req_tags", self.off_req_tags),
+            ("landmarks", self.off_landmarks),
             ("lm_tab", self.off_lm_tab),
+            ("fairy_nodes", self.off_fairy_nodes),
+            ("fairy_cost_ms", self.off_fairy_cost_ms),
+            ("fairy_meta_offs", self.off_fairy_meta_offs),
+            ("fairy_meta_lens", self.off_fairy_meta_lens),
         ] {
             if off % SECTION_ALIGN != 0 { return Err(ManifestError::Misaligned(name)); }
         }
@@ -277,4 +380,6 @@ pub enum ManifestError {
     OutOfBounds(&'static str),
     #[error("section misaligned: {0}")]
     Misaligned(&'static str),
+    #[error("invalid snapshot: {0}")]
+    Invalid(&'static str),
 }

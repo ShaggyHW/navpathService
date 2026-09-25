@@ -161,10 +161,40 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
             Ok(row)
         }
         NodeKind::Lodestone => {
+            // Production DBs carry the lodestone's name column: fetch it in the same
+            // query (it used to be a second per-step query). Minimal/older schemas
+            // without the column fail this prepare and take the name-less path below,
+            // exactly as the old best-effort second query did. A name that can't be read
+            // as text stays None, also as before.
+            if let Ok(mut st) = conn.prepare_cached(
+                "SELECT dest_x, dest_y, dest_plane, next_node_type, next_node_id, cost, requirements, lodestone FROM teleports_lodestone_nodes WHERE id = ?1",
+            ) {
+                let row = st.query_row(params![id], |r: &Row| {
+                    let dx: Option<i64> = r.get(0)?;
+                    let dy: Option<i64> = r.get(1)?;
+                    let dp: Option<i64> = r.get(2)?;
+                    let ntype: Option<String> = r.get(3)?;
+                    let nid: Option<i64> = r.get(4)?;
+                    let cost: f64 = r.get(5)?;
+                    let req: Option<String> = r.get(6)?;
+                    Ok(StepRow {
+                        dest: match (dx, dy, dp) {
+                            (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
+                            _ => None,
+                        },
+                        next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
+                        next_id: nid,
+                        cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
+                        requirements: parse_requirements(req),
+                        lodestone: r.get::<_, Option<String>>(7).ok().flatten(),
+                    })
+                }).optional()?;
+                return Ok(row);
+            }
             let mut st = conn.prepare_cached(
                 "SELECT dest_x, dest_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_lodestone_nodes WHERE id = ?1",
             )?;
-            let mut row = st.query_row(params![id], |r: &Row| {
+            let row = st.query_row(params![id], |r: &Row| {
                 let dx: Option<i64> = r.get(0)?;
                 let dy: Option<i64> = r.get(1)?;
                 let dp: Option<i64> = r.get(2)?;
@@ -184,13 +214,6 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                     lodestone: None,
                 })
             }).optional()?;
-            // Best-effort: fetch lodestone name if the column exists in this DB
-            if let Some(ref mut sr) = row {
-                if let Ok(mut st_name) = conn.prepare_cached("SELECT lodestone FROM teleports_lodestone_nodes WHERE id = ?1") {
-                    let name_res: std::result::Result<Option<String>, _> = st_name.query_row(params![id], |r: &Row| r.get::<_, Option<String>>(0));
-                    if let Ok(name_opt) = name_res { sr.lodestone = name_opt; }
-                }
-            }
             Ok(row)
         }
         NodeKind::Npc => {
@@ -383,8 +406,10 @@ fn collect_incoming_pairs(conn: &Connection) -> Result<HashSet<(NodeKind, i64)>>
     Ok(set)
 }
 
-fn enumerate_chain_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64, (i32, i32, i32))>> {
-    let incoming = collect_incoming_pairs(conn)?;
+/// Chains that some other node points at are continuations, not starts.
+type Incoming = HashSet<(NodeKind, i64)>;
+
+fn enumerate_chain_starts(conn: &Connection, incoming: &Incoming) -> Result<Vec<(NodeKind, i64, (i32, i32, i32))>> {
     // Collect starting rows with concrete source positions (door, npc, object)
     let mut out: Vec<(NodeKind, i64, (i32, i32, i32))> = Vec::new();
 
@@ -464,9 +489,32 @@ pub fn flatten_chains(
     _tiles: &[Tile],
     node_id_of: &NodeIndex,
 ) -> Result<Vec<MacroEdgeMeta>> {
+    let incoming = collect_incoming_pairs(conn)?;
+    flatten_chains_with(conn, node_id_of, &incoming)
+}
+
+/// Positional (macro-edge) and global chains together, scanning the incoming-pair set
+/// once instead of once per flatten (the results are identical to calling
+/// [`flatten_chains`] and [`flatten_global_chains`]).
+pub fn flatten_all_chains(
+    conn: &Connection,
+    node_id_of: &NodeIndex,
+) -> Result<(Vec<MacroEdgeMeta>, Vec<GlobalChainMeta>)> {
+    let incoming = collect_incoming_pairs(conn)?;
+    Ok((
+        flatten_chains_with(conn, node_id_of, &incoming)?,
+        flatten_global_chains_with(conn, node_id_of, &incoming)?,
+    ))
+}
+
+fn flatten_chains_with(
+    conn: &Connection,
+    node_id_of: &NodeIndex,
+    incoming: &Incoming,
+) -> Result<Vec<MacroEdgeMeta>> {
     let mut result: Vec<MacroEdgeMeta> = Vec::new();
 
-    let starts = enumerate_chain_starts(conn)?;
+    let starts = enumerate_chain_starts(conn, incoming)?;
 
     for (start_kind, start_id, (sx, sy, sp)) in starts {
         // Map source tile to node id; skip if not present
@@ -562,8 +610,7 @@ pub struct GlobalChainMeta {
     pub steps: Vec<ChainStepMeta>,
 }
 
-fn enumerate_global_starts(conn: &Connection) -> Result<Vec<(NodeKind, i64)>> {
-    let incoming = collect_incoming_pairs(conn)?;
+fn enumerate_global_starts(conn: &Connection, incoming: &Incoming) -> Result<Vec<(NodeKind, i64)>> {
     let mut out: Vec<(NodeKind, i64)> = Vec::new();
     // Lodestones
     {
@@ -620,8 +667,17 @@ pub fn flatten_global_chains(
     conn: &Connection,
     node_id_of: &NodeIndex,
 ) -> Result<Vec<GlobalChainMeta>> {
+    let incoming = collect_incoming_pairs(conn)?;
+    flatten_global_chains_with(conn, node_id_of, &incoming)
+}
+
+fn flatten_global_chains_with(
+    conn: &Connection,
+    node_id_of: &NodeIndex,
+    incoming: &Incoming,
+) -> Result<Vec<GlobalChainMeta>> {
     let mut result: Vec<GlobalChainMeta> = Vec::new();
-    let starts = enumerate_global_starts(conn)?;
+    let starts = enumerate_global_starts(conn, incoming)?;
     for (start_kind, start_id) in starts {
         let mut visited: HashSet<(NodeKind, i64)> = HashSet::new();
         let mut steps: Vec<ChainStepMeta> = Vec::new();

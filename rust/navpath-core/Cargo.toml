@@ -7,12 +7,17 @@ edition = "2021"
 memmap2 = "0.9"
 byteorder = "1"
 thiserror = "1"
+libc = "0.2"
 blake3 = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-criterion = "0.5"
+# Plotting is unused (perf-gate passes --noplot and reads estimates.json), so skip the
+# plotters dependency tree.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "rayon"] }
 serde_json = "1"
+# Harnesses (bench + examples) run under the production allocator, not glibc malloc.
+mimalloc = { version = "0.1", default-features = false }
 
 [features]
 default = []

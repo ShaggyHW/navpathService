@@ -185,7 +185,6 @@ async fn reachable_is_walk_only_and_range_bounded() {
     let (neighbors, neighbors_rev, globals, macro_lookup) =
         navpath_service::engine_adapter::build_neighbor_provider(&opened);
     let snapshot = Some(Arc::new(opened));
-    let req_tag_index = Arc::new(navpath_service::build_req_tag_index(snapshot.as_deref()));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
         snapshot,
@@ -193,7 +192,6 @@ async fn reachable_is_walk_only_and_range_bounded() {
         neighbors_rev: Some(Arc::new(neighbors_rev)),
         globals: Arc::new(globals),
         macro_lookup: Arc::new(macro_lookup),
-        req_tag_index,
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
         route_cache: navpath_service::new_route_cache(),
@@ -203,6 +201,7 @@ async fn reachable_is_walk_only_and_range_bounded() {
         comp_graph: None,
         canonical_grid: None,
         profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache(),
+        warm_state: Default::default(),
     })), search_permits: navpath_service::default_search_permits(), metrics: Arc::new(navpath_service::Metrics::default()), ctx_pool: navpath_service::ContextPool::new(), ready: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
 
     let app = build_router(state);
@@ -265,7 +264,6 @@ async fn health_and_route_and_reload() {
     let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
     let (neighbors, neighbors_rev, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
     let snapshot = Some(Arc::new(opened));
-    let req_tag_index = Arc::new(navpath_service::build_req_tag_index(snapshot.as_deref()));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
         snapshot,
@@ -273,7 +271,6 @@ async fn health_and_route_and_reload() {
         neighbors_rev: Some(Arc::new(neighbors_rev)),
         globals: Arc::new(globals),
         macro_lookup: Arc::new(macro_lookup),
-        req_tag_index,
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
         route_cache: navpath_service::new_route_cache(),
@@ -283,6 +280,7 @@ async fn health_and_route_and_reload() {
         comp_graph: None,
         canonical_grid: None,
         profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache(),
+        warm_state: Default::default(),
     })), search_permits: navpath_service::default_search_permits(), metrics: Arc::new(navpath_service::Metrics::default()), ctx_pool: navpath_service::ContextPool::new(), ready: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
 
     let app = build_router(state.clone());
@@ -327,7 +325,6 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
     let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
     let (neighbors, neighbors_rev, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
     let snapshot = Some(Arc::new(opened));
-    let req_tag_index = Arc::new(navpath_service::build_req_tag_index(snapshot.as_deref()));
     let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
         path: snap_path.to_path_buf(),
         snapshot,
@@ -335,7 +332,6 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
         neighbors_rev: Some(Arc::new(neighbors_rev)),
         globals: Arc::new(globals),
         macro_lookup: Arc::new(macro_lookup),
-        req_tag_index,
         loaded_at_unix: 123,
         snapshot_hash_hex: None,
         route_cache: navpath_service::new_route_cache(),
@@ -345,6 +341,7 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
         comp_graph: None,
         canonical_grid: None,
         profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache(),
+        warm_state: Default::default(),
     })), search_permits: navpath_service::default_search_permits(), metrics: Arc::new(navpath_service::Metrics::default()), ctx_pool: navpath_service::ContextPool::new(), ready: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
 
     let app = build_router(state.clone());

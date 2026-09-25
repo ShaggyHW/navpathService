@@ -2,10 +2,10 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use crate::snapshot::{walk_diagonal_ms, Snapshot, WALK_CARDINAL_MS};
+use crate::snapshot::{unpack_coord, walk_diagonal_ms, Snapshot, WALK_CARDINAL_MS};
 
-use super::canonical::CanonicalGrid;
-use super::heuristics::{active_landmarks, LandmarkHeuristic};
+use super::canonical::{arrival_code, CanonicalGrid};
+use super::heuristics::{active_landmarks, LandmarkHeuristic, RevAnchorBase};
 use super::neighbors::{MacroFilter, NeighborProvider, WalkGraph};
 
 /// Inputs specific to the backward half of a bidirectional search.
@@ -26,9 +26,12 @@ pub struct SearchParams<'a> {
     pub seed: Option<u64>,
     /// Optional cap on heap pops. When exceeded the search stops and reports
     /// [`SearchStatus::BudgetExceeded`] so callers can distinguish "gave up" from "no path".
+    /// A budget-stopped search can be CONTINUED with a larger cap through the `*_resume`
+    /// entry points (see [`EngineView::astar_resume`]).
     pub max_pops: Option<u32>,
-    /// Cooperative cancellation, checked every 1024 pops. Set it from a request deadline
-    /// or client-disconnect guard; a cancelled search reports [`SearchStatus::Cancelled`].
+    /// Cooperative cancellation, checked every [`CANCEL_CHECK_POPS`] pops. Set it from a
+    /// request deadline or client-disconnect guard; a cancelled search reports
+    /// [`SearchStatus::Cancelled`].
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
     /// Opt-in plateau tie-break (roadmap 3.4): 0.0 = exact ordering (default). When
     /// positive, the heap compares f at this bucket granularity (then HIGH g), so the
@@ -39,6 +42,12 @@ pub struct SearchParams<'a> {
     /// which only understates the frontier minimum — the same bound holds.
     pub bucket_ms: f32,
 }
+
+/// Cancellation poll interval in pops. A relaxed load of an uncontended flag costs ~1 ns;
+/// at the cold-cache 50-90 µs/pop the old 1024-pop interval let a cancelled race loser
+/// keep its permit, contexts and memory bandwidth for 50-90 ms.
+pub const CANCEL_CHECK_POPS: u32 = 128;
+const CANCEL_CHECK_MASK: u32 = CANCEL_CHECK_POPS - 1;
 
 /// Deterministic per-edge jitter in [0, 0.1) ms, keyed on (seed, from, to).
 ///
@@ -140,17 +149,22 @@ impl SearchResult {
 /// comparison a single integer compare — measured cheaper than the float chains on
 /// plateau-heavy searches (where the f-tie chain ran constantly) AND on cache-warm
 /// short searches (where per-compare packing was a measured 30-45% regression).
+///
+/// 12 bytes: g is NOT stored separately — the low half of `k` is always `g.to_bits()`
+/// (both constructors), so [`Key::g`] recovers it exactly. `packed(4)` drops the
+/// 4 padding bytes a `{u64, u32}` would carry, cutting heap memory and sift traffic by
+/// a quarter. Fields are only ever read by value (never borrowed), as packed requires.
 #[derive(Clone, Copy)]
+#[repr(C, packed(4))]
 pub struct Key {
     k: u64,
-    pub g: f32,
-    pub id: u32,
+    id: u32,
 }
 
 impl Key {
     #[inline(always)]
     pub fn new(f: f32, g: f32, id: u32) -> Self {
-        Key { k: ((!f.to_bits() as u64) << 32) | g.to_bits() as u64, g, id }
+        Key { k: ((!f.to_bits() as u64) << 32) | g.to_bits() as u64, id }
     }
 
     /// Bucketed ordering key (roadmap 3.4): with `bucket_ms > 0` the high half is the
@@ -159,14 +173,27 @@ impl Key {
     #[inline(always)]
     pub fn new_bucketed(f: f32, g: f32, id: u32, bucket_ms: f32) -> Self {
         let hi = if bucket_ms > 0.0 { !((f / bucket_ms) as u32) } else { !f.to_bits() };
-        Key { k: ((hi as u64) << 32) | g.to_bits() as u64, g, id }
+        Key { k: ((hi as u64) << 32) | g.to_bits() as u64, id }
+    }
+
+    /// The entry's g (exact: the low half of the packed key).
+    #[inline(always)]
+    pub fn g(&self) -> f32 {
+        let k = self.k;
+        f32::from_bits(k as u32)
+    }
+
+    #[inline(always)]
+    pub fn id(&self) -> u32 {
+        self.id
     }
 
     /// A LOWER bound on this entry's f: exact when unbucketed, the bucket's lower edge
     /// otherwise. Understating the frontier minimum keeps MM's stop rule conservative.
     #[inline(always)]
     pub fn f_lower(&self, bucket_ms: f32) -> f32 {
-        let hi = !((self.k >> 32) as u32);
+        let k = self.k;
+        let hi = !((k >> 32) as u32);
         if bucket_ms > 0.0 { hi as f32 * bucket_ms } else { f32::from_bits(hi) }
     }
 }
@@ -180,9 +207,11 @@ impl Ord for Key {
         // BinaryHeap is a max-heap: Greater = popped first. The (g, id) pair is unique
         // per heap (pushes require strictly smaller g), so this total order — and hence
         // the pop sequence — is identical to the original two-float-chain comparator.
-        let a = self.k.cmp(&other.k);
-        if a != Ordering::Equal { return a; }
-        self.id.cmp(&other.id).reverse()
+        let (a, b) = (self.k, other.k);
+        let c = a.cmp(&b);
+        if c != Ordering::Equal { return c; }
+        let (ia, ib) = (self.id, other.id);
+        ia.cmp(&ib).reverse()
     }
 }
 
@@ -201,6 +230,34 @@ fn prefetch_node<T>(nodes: &[T], id: u32) {
     {
         let _ = (nodes, id);
     }
+}
+
+/// Backward-anchor reachability filter (see `EngineView::select_rev`), OFF by default:
+/// `NAVPATH_REV_ANCHOR_FILTER=1` enables it. MEASURED (2026-09-26, v9 SCC-64 packed
+/// snapshot, 600 random pairs, all globals eligible): it restores backward landmark
+/// columns and cuts bidirectional pops ~9%, but bidirectional wall time got 15-30%
+/// WORSE — with h_b = 0 the backward half never gathers a landmark row, which is worth
+/// more than the pops it saves. Kept as an opt-in for profiles/snapshots where the
+/// trade differs.
+fn rev_anchor_filter_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("NAVPATH_REV_ANCHOR_FILTER").ok().as_deref().map(str::trim), Some("1") | Some("true"))
+    })
+}
+
+/// Prefetch the landmark (ALT) rows of the successors a forward expansion is about to
+/// relax, together with their search-state records (T4.1), so a fresh node's row gather
+/// overlaps the other successors' work instead of stalling its relaxation. Default on;
+/// `NAVPATH_PREFETCH_ROWS=0` disables. MEASURED (2026-09-26, v9 SCC-64 packed, 600
+/// pairs, 3 interleaved rounds): canonical uni +13-17% total, virtual starts +10%,
+/// bidir +3-8%, no configuration slower — once the BACKWARD side stopped prefetching
+/// rows its h_b = 0 bound never reads (that version cost bidir 5-9%).
+fn prefetch_rows_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(std::env::var("NAVPATH_PREFETCH_ROWS").ok().as_deref().map(str::trim), Some("0") | Some("false"))
+    })
 }
 
 /// `NAVPATH_JPS=1`: jump-point expansion in the unidirectional engine (Phase E Stage
@@ -244,22 +301,49 @@ pub struct HotState {
     pub gen: u32,
 }
 
-/// Cold half: written only on improvements, read on expansion (canonical parent
-/// recovery), h-cache hits, and reconstruction. `h` caches the ALT heuristic for the
-/// node, valid for the same `gen` as the hot record — a grid node can be relaxed from
-/// up to 8 predecessors, but pays the landmark gather only once per query.
+/// Cold half: written only on improvements, read on expansion (arrival direction),
+/// h-cache hits, and reconstruction. `h` caches the ALT heuristic for the node, valid
+/// for the same `gen` as the hot record — a grid node can be relaxed from up to 8
+/// predecessors, but pays the landmark gather only once per query.
+///
+/// `link` packs the parent id (low [`LINK_ID_BITS`] bits; all ones = no parent) with the
+/// ARRIVAL DIRECTION CODE (high 4 bits: 0 = entry arrival, else grid direction + 1).
+/// The code is written together with the parent on every improvement, so canonical
+/// pruning and jump-point expansion read their successor-table row straight from the
+/// popped node's own record — no parent-coordinate loads, no separate direction array.
 #[derive(Clone, Copy)]
 pub struct ColdState {
-    pub parent: u32,
+    pub link: u32,
     pub h: f32,
 }
 
+/// Parent-id bits of [`ColdState::link`]; snapshots are limited to 2^28 - 1 nodes.
+pub const LINK_ID_BITS: u32 = 28;
+const LINK_ID_MASK: u32 = (1 << LINK_ID_BITS) - 1;
+/// "No parent" link (id field all ones, direction code 0).
+const LINK_NONE: u32 = LINK_ID_MASK;
+
+/// Pack a parent link. `u32::MAX` (no parent) maps to [`LINK_NONE`] with code 0.
+#[inline(always)]
+fn link(parent: u32, dcode: u8) -> u32 {
+    if parent == u32::MAX {
+        LINK_NONE
+    } else {
+        (parent & LINK_ID_MASK) | ((dcode as u32) << LINK_ID_BITS)
+    }
+}
+
 const EMPTY_HOT: HotState = HotState { g: f32::INFINITY, gen: 0 };
-const EMPTY_COLD: ColdState = ColdState { parent: u32::MAX, h: 0.0 };
+const EMPTY_COLD: ColdState = ColdState { link: LINK_NONE, h: 0.0 };
+
+/// Heap capacity (entries) a pooled context may keep across searches. A 1.5M-pop flood
+/// grows the heap to tens of MB; without a cap every pooled context would pin its
+/// largest-ever heap for the life of the process.
+const HEAP_RETAIN_ENTRIES: usize = 1 << 20;
 
 /// All-zero bytes are valid, semantically-empty state for BOTH halves: `gen == 0`
 /// never matches the live generation (which starts at 1 and the wrap path re-fills),
-/// so `g`/`parent` read as INFINITY/unset through the generation guards, and `h` is
+/// so `g`/`link` read as INFINITY/unset through the generation guards, and `h` is
 /// only ever read after `set_g`/relax stamp the record (writing the NAN sentinel
 /// first). Allocating zeroed lets the allocator hand back untouched kernel zero
 /// pages: no multi-MB memset on context creation (the recurring cold-thread p99
@@ -278,26 +362,78 @@ fn zeroed_vec<T>(n: usize) -> Vec<T> {
     }
 }
 
+/// Identity of a budget-stopped search, checked before a `*_resume` call continues it:
+/// the continuation is only bit-identical to a fresh run with the larger budget when
+/// every input except `max_pops` is unchanged.
+#[derive(Clone, Copy, PartialEq)]
+struct QueryTag {
+    bidir: bool,
+    origin: Option<u32>,
+    goal: u32,
+    seed: Option<u64>,
+    bucket_bits: u32,
+    seeds_fp: u64,
+    canon: bool,
+    jps: bool,
+    /// Bidir: the backward context's generation, so a backward context reused for
+    /// another search in between is detected.
+    other_gen: u32,
+}
+
+/// Loop state of a budget-stopped search (see [`EngineView::astar_resume`]).
+#[derive(Clone, Copy)]
+struct ResumeState {
+    tag: QueryTag,
+    pops: u32,
+    pops_f: u32,
+    pops_b: u32,
+    /// Uni: the incumbent g(goal); bidir: the best meeting cost mu.
+    bound: f32,
+    /// Bidir meeting node (u32::MAX = none).
+    meet: u32,
+    /// The live entry the budget break popped (it was charged but not expanded).
+    pending: Key,
+    pending_forward: bool,
+}
+
+fn seeds_fingerprint(seeds: &[(u32, f32)]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325 ^ seeds.len() as u64;
+    for &(n, g) in seeds {
+        h = (h ^ n as u64).wrapping_mul(0x100000001b3);
+        h = (h ^ g.to_bits() as u64).wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 pub struct SearchContext {
     pub hot: Vec<HotState>,
     pub cold: Vec<ColdState>,
     pub generation: u32,
     pub open: BinaryHeap<Key>,
-    /// Jump-point expansion only: the grid direction (index + 1; 0 = none, i.e. a
-    /// seed or a macro/teleport/fairy arrival) the node's current parent link travels
-    /// along. Written together with `parent` on every improvement, so it is valid
-    /// exactly when `parent` is; read only for the popped node and at reconstruction.
-    pub dirs: Vec<u8>,
+    /// Per-64-node-block generation stamp: `blk[v >> 6] == generation` whenever ANY node
+    /// of the block has been stamped this search. Bidirectional relaxations probe the
+    /// OTHER side's g on every improvement; this 1/64-size array (~73 KB per 1.17M nodes,
+    /// L2-resident) answers "certainly unvisited" for the vast majority of probes
+    /// without the random DRAM read of the other side's hot record. A pure filter, so
+    /// results are bit-identical.
+    pub blk: Vec<u32>,
+    /// Continuation state of the last search when it stopped on its pop budget.
+    resume: Option<ResumeState>,
 }
 
 impl SearchContext {
     pub fn new(nodes: usize) -> Self {
+        assert!(
+            nodes < LINK_NONE as usize,
+            "search state packs parent ids into {LINK_ID_BITS} bits; {nodes} nodes is too many"
+        );
         Self {
             hot: zeroed_vec(nodes),
             cold: zeroed_vec(nodes),
             generation: 1,
             open: BinaryHeap::with_capacity(1024),
-            dirs: zeroed_vec(nodes),
+            blk: zeroed_vec(nodes.div_ceil(64)),
+            resume: None,
         }
     }
 
@@ -324,7 +460,7 @@ impl SearchContext {
         }
         touch(&mut self.hot);
         touch(&mut self.cold);
-        touch(&mut self.dirs);
+        touch(&mut self.blk);
     }
 
     pub fn reset(&mut self, nodes: usize) {
@@ -333,13 +469,24 @@ impl SearchContext {
         } else {
             self.generation = self.generation.wrapping_add(1);
             if self.generation == 0 {
-                 self.hot.fill(EMPTY_HOT);
-                 self.cold.fill(EMPTY_COLD);
-                 self.dirs.fill(0);
-                 self.generation = 1;
+                self.hot.fill(EMPTY_HOT);
+                self.cold.fill(EMPTY_COLD);
+                self.blk.fill(0);
+                self.generation = 1;
             }
-            self.open.clear();
+            if self.open.capacity() > HEAP_RETAIN_ENTRIES {
+                self.open = BinaryHeap::with_capacity(1024);
+            } else {
+                self.open.clear();
+            }
+            self.resume = None;
         }
+    }
+
+    /// Whether the last search on this context stopped on its pop budget and can be
+    /// continued with a `*_resume` call.
+    pub fn resumable(&self) -> bool {
+        self.resume.is_some()
     }
 
     #[inline(always)]
@@ -354,21 +501,38 @@ impl SearchContext {
         if self.hot[u].gen != gen {
             self.hot[u].gen = gen;
             self.cold[u].h = f32::NAN; // h not yet computed this query
+            self.blk[u >> 6] = gen;
         }
         self.hot[u].g = val;
         // Seeds have no grid parent (used by seeding paths only, never the hot loop).
-        self.dirs[u] = 0;
+        self.cold[u].link = LINK_NONE;
     }
 
     #[inline(always)]
     pub fn set_parent(&mut self, u: usize, p: u32) {
         // Assume set_g was called first to init generation
-        self.cold[u].parent = p;
+        self.cold[u].link = link(p, 0);
+    }
+
+    /// Parent plus arrival direction code (see [`ColdState::link`]).
+    #[inline(always)]
+    fn set_link(&mut self, u: usize, p: u32, dcode: u8) {
+        self.cold[u].link = link(p, dcode);
     }
 
     #[inline(always)]
     pub fn get_parent(&self, u: usize) -> u32 {
-        if self.hot[u].gen == self.generation { self.cold[u].parent } else { u32::MAX }
+        if self.hot[u].gen != self.generation {
+            return u32::MAX;
+        }
+        let id = self.cold[u].link & LINK_ID_MASK;
+        if id == LINK_ID_MASK { u32::MAX } else { id }
+    }
+
+    /// Arrival direction code of a node stamped this search (0 = entry arrival).
+    #[inline(always)]
+    fn link_code(&self, u: usize) -> u8 {
+        (self.cold[u].link >> LINK_ID_BITS) as u8
     }
 
     /// Cached heuristic for a node already stamped by `set_g` this query; computes and
@@ -401,6 +565,15 @@ pub struct ExtraEdges<'a> {
     pub fairy_sources: std::borrow::Cow<'a, [u32]>,
     /// Sorted (dst, cost) fairy destinations shared by all sources.
     pub fairy_dests: std::borrow::Cow<'a, [(u32, f32)]>,
+    /// Optional precomputed backward-heuristic aggregate of the global-teleport anchor
+    /// set (see [`LandmarkHeuristic::rev_base`]). A pure function of the profile's
+    /// eligible globals, so the service builds it once per profile instead of the
+    /// bidirectional engine re-aggregating ~125 anchors x all landmarks per search. Used
+    /// only when its fingerprint matches the anchor list the search would aggregate
+    /// (origin mode: `global`; multi-source mode: the seed list), so a stale or
+    /// mismatched base silently falls back to the per-search aggregation (identical
+    /// result either way — min/AND aggregation is order-independent).
+    pub global_rev_base: Option<&'a RevAnchorBase>,
 }
 
 impl Default for ExtraEdges<'_> {
@@ -409,7 +582,38 @@ impl Default for ExtraEdges<'_> {
             global: std::borrow::Cow::Borrowed(&[]),
             fairy_sources: std::borrow::Cow::Borrowed(&[]),
             fairy_dests: std::borrow::Cow::Borrowed(&[]),
+            global_rev_base: None,
         }
+    }
+}
+
+/// 1024-bit membership prefilter over the (few dozen) fairy-source ids, built per
+/// search: the per-pop "is this a fairy ring?" test becomes one L1 bit probe, and the
+/// branchy binary search runs only on the ~4% of filter hits. Exact (a filter miss
+/// proves absence).
+struct FairyFilter {
+    bits: [u64; 16],
+}
+
+impl FairyFilter {
+    #[inline(always)]
+    fn slot(id: u32) -> u32 {
+        id.wrapping_mul(0x9E37_79B1) >> 22
+    }
+
+    fn new(sources: &[u32]) -> Self {
+        let mut bits = [0u64; 16];
+        for &s in sources {
+            let h = Self::slot(s);
+            bits[(h >> 6) as usize] |= 1 << (h & 63);
+        }
+        FairyFilter { bits }
+    }
+
+    #[inline(always)]
+    fn contains(&self, sources: &[u32], id: u32) -> bool {
+        let h = Self::slot(id);
+        (self.bits[(h >> 6) as usize] >> (h & 63)) & 1 != 0 && sources.binary_search(&id).is_ok()
     }
 }
 
@@ -419,7 +623,7 @@ impl Default for ExtraEdges<'_> {
 fn expand_jumps(
     path: &[u32],
     path_g: &[f32],
-    dirs: &[u8],
+    cold: &[ColdState],
     cg: &CanonicalGrid,
     offsets: &[u32],
     dst: &[u32],
@@ -434,7 +638,7 @@ fn expand_jumps(
     out_g.push(path_g[0]);
     for i in 1..path.len() {
         let (a, b) = (path[i - 1], path[i]);
-        let dcode = dirs[b as usize];
+        let dcode = (cold[b as usize].link >> LINK_ID_BITS) as u8;
         if dcode == 0 {
             out.push(b);
             out_g.push(path_g[i]);
@@ -467,7 +671,7 @@ pub struct EngineView<'a> {
     pub macros: Arc<NeighborProvider>,
     pub lm: LandmarkHeuristic<'a>,
     pub extra: ExtraEdges<'a>,
-    /// Packed (plane,y,x) coordinates in node-id order — parent-direction recovery for
+    /// Packed (plane,y,x) coordinates in node-id order — arrival-direction recovery for
     /// canonical pruning. Set by [`EngineView::from_snapshot`]; None disables pruning.
     pub coords: Option<&'a [u32]>,
     /// Canonical strict-domination successor grid (roadmap Phase E Stage 2a), built
@@ -484,12 +688,11 @@ impl<'a> EngineView<'a> {
     pub fn from_snapshot(s: &'a Snapshot) -> Self {
         let nodes = s.counts().nodes as usize;
         let macros = NeighborProvider::new(nodes, s.macro_src(), s.macro_dst(), s.macro_w());
-        let lm = LandmarkHeuristic { nodes, landmarks: s.counts().landmarks as usize, tab: s.lm_tab(), quantum: s.manifest().alt_quantum_ms };
         EngineView {
             nodes,
             walk: WalkGraph::from_snapshot(s),
             macros: Arc::new(macros),
-            lm,
+            lm: LandmarkHeuristic::from_snapshot(s),
             extra: ExtraEdges::default(),
             coords: Some(s.coords_packed()),
             canonical: None,
@@ -499,7 +702,7 @@ impl<'a> EngineView<'a> {
 
     pub fn from_parts(nodes: usize, walk_src: &'a [u32], walk_dst: &'a [u32], walk_w: &'a [f32], macro_src: &'a [u32], macro_dst: &'a [u32], macro_w: &'a [f32], lm_tab: &'a [u16], landmarks: usize) -> Self {
         let macros = NeighborProvider::new(nodes, macro_src, macro_dst, macro_w);
-        let lm = LandmarkHeuristic { nodes, landmarks, tab: lm_tab, quantum: crate::snapshot::ALT_QUANTUM_MS };
+        let lm = LandmarkHeuristic::new(nodes, landmarks, lm_tab, crate::snapshot::ALT_QUANTUM_MS);
         EngineView {
             nodes,
             walk: WalkGraph::from_edges(nodes, walk_src, walk_dst, walk_w),
@@ -513,7 +716,19 @@ impl<'a> EngineView<'a> {
     }
 
     pub fn astar(&self, params: SearchParams, ctx: &mut SearchContext) -> SearchResult {
-        self.search_core(Some(params.start), &[], params.goal, &params, ctx)
+        self.search_core(Some(params.start), &[], params.goal, &params, ctx, false)
+    }
+
+    /// Continue a search that stopped on its pop budget (`ctx` still holding its state,
+    /// see [`SearchContext::resumable`]) under the new `params.max_pops`, with every
+    /// other input unchanged. The result — path, cost, status and the CUMULATIVE `pops`
+    /// counters — is bit-identical to a fresh search run with the larger budget: heap
+    /// keys are unique and totally ordered, so the continued pop sequence is exactly the
+    /// fresh one's; the only state a budget break loses (the live entry it had just
+    /// popped) is re-pushed. Falls back to a fresh search when `ctx` holds no matching
+    /// stopped search (different query, seed, bucket or pruning mode, or a reset since).
+    pub fn astar_resume(&self, params: SearchParams, ctx: &mut SearchContext) -> SearchResult {
+        self.search_core(Some(params.start), &[], params.goal, &params, ctx, true)
     }
 
     /// Multi-source search with no on-graph origin: every `(node, initial_g)` seed enters
@@ -522,7 +737,12 @@ impl<'a> EngineView<'a> {
     /// the world through any eligible global teleport — one search replaces one full
     /// search per teleport. `extra.global` is NOT auto-seeded here; pass it as `seeds`.
     pub fn astar_multi(&self, seeds: &[(u32, f32)], params: SearchParams, ctx: &mut SearchContext) -> SearchResult {
-        self.search_core(None, seeds, params.goal, &params, ctx)
+        self.search_core(None, seeds, params.goal, &params, ctx, false)
+    }
+
+    /// [`EngineView::astar_multi`] continuation; see [`EngineView::astar_resume`].
+    pub fn astar_multi_resume(&self, seeds: &[(u32, f32)], params: SearchParams, ctx: &mut SearchContext) -> SearchResult {
+        self.search_core(None, seeds, params.goal, &params, ctx, true)
     }
 
     /// Dispatch once on the seed so both loop bodies compile without the per-edge
@@ -534,13 +754,15 @@ impl<'a> EngineView<'a> {
         goal_id: u32,
         params: &SearchParams,
         ctx: &mut SearchContext,
+        resume: bool,
     ) -> SearchResult {
         match params.seed {
-            Some(s) => self.search_core_impl(origin, seeds, goal_id, params, ctx, SeededJitter(s)),
-            None => self.search_core_impl(origin, seeds, goal_id, params, ctx, NoJitter),
+            Some(s) => self.search_core_impl(origin, seeds, goal_id, params, ctx, SeededJitter(s), resume),
+            None => self.search_core_impl(origin, seeds, goal_id, params, ctx, NoJitter, resume),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_core_impl<J: JitterPolicy>(
         &self,
         origin: Option<u32>,
@@ -549,12 +771,25 @@ impl<'a> EngineView<'a> {
         params: &SearchParams,
         ctx: &mut SearchContext,
         jit: J,
+        resume: bool,
     ) -> SearchResult {
         let n = self.nodes;
         let goal = goal_id as usize;
         let bucket = params.bucket_ms;
-
-        ctx.reset(n);
+        let canon = canonical_ctx(self, params.seed);
+        let jps = self.jps && canon.is_some_and(|(cg, ..)| cg.has_jps());
+        let tag = QueryTag {
+            bidir: false,
+            origin,
+            goal: goal_id,
+            seed: params.seed,
+            bucket_bits: bucket.to_bits(),
+            seeds_fp: seeds_fingerprint(seeds),
+            canon: canon.is_some(),
+            jps,
+            other_gen: 0,
+        };
+        let resumed = if resume { ctx.resume.filter(|r| r.tag == tag) } else { None };
 
         // Pick the best landmarks for this query once, and cache the goal's landmark row
         // inside the returned selection. Every heuristic call below evaluates only these
@@ -576,70 +811,106 @@ impl<'a> EngineView<'a> {
         // plateau, where tie-breaking degrades into DFS-like mass reopenings.
         let h = |u: u32| -> f32 { self.lm.h_active(u, &active) };
 
-        if let Some(start_id) = origin {
-            let start = start_id as usize;
-            ctx.set_g(start, 0.0);
-            ctx.set_parent(start, u32::MAX);
-            let h_start = ctx.h_cached(start, || h(start_id));
-            if h_start.is_finite() {
-                ctx.open.push(Key::new_bucketed(h_start, 0.0, start_id, bucket));
+        // Arrival direction code of a NON-walk relaxation (macro / fairy / global) for
+        // canonical pruning — the direction the pop-time successor table would recover
+        // from the parent's coordinates. Jump-point mode keeps entry semantics (0) for
+        // every non-walk arrival, exactly as before.
+        let arr = |parent: u32, v: u32| -> u8 {
+            match canon {
+                Some((_, coords, _, _)) if !jps => arrival_code(coords, parent, v),
+                _ => 0,
             }
+        };
+        let fairy = FairyFilter::new(&self.extra.fairy_sources);
+        let prefetch_rows = prefetch_rows_enabled();
+        // Goal coordinates for jump-point goal checks, unpacked once per search.
+        let goal_xy = match canon {
+            Some((_, coords, _, _)) if jps && goal < coords.len() => unpack_coord(coords[goal]),
+            _ => (i32::MIN, i32::MIN, -1),
+        };
 
-            // Global teleports cost the same from every node, so taking one at the start
-            // (g = 0) dominates taking it anywhere later. Relax them all exactly once
-            // here instead of merging them into every pop's neighbor stream.
-            for &(dst, w) in self.extra.global.iter() {
-                if dst as usize >= n { continue; }
-                let w_jittered = jit.w(start_id, dst, w);
-                if w_jittered < ctx.get_g(dst as usize) {
-                    ctx.set_g(dst as usize, w_jittered);
-                    ctx.set_parent(dst as usize, start_id);
-                    let hv = ctx.h_cached(dst as usize, || h(dst));
-                    if hv.is_finite() {
-                        ctx.open.push(Key::new_bucketed(w_jittered + hv, w_jittered, dst, bucket));
-                    }
-                }
-            }
-        }
-
-        for &(node, g0) in seeds {
-            if node as usize >= n { continue; }
-            if g0 < ctx.get_g(node as usize) {
-                ctx.set_g(node as usize, g0);
-                ctx.set_parent(node as usize, u32::MAX);
-                let hv = ctx.h_cached(node as usize, || h(node));
-                if hv.is_finite() {
-                    ctx.open.push(Key::new_bucketed(g0 + hv, g0, node, bucket));
-                }
-            }
-        }
-
-        let mut pops: u32 = 0;
-        let max_pops = params.max_pops.unwrap_or(u32::MAX);
-        let mut ended: Option<SearchStatus> = None;
+        let mut pops: u32;
         // Incumbent-bound push pruning: g(goal) can be finite from pop zero (a global
         // teleport seed) and only decreases; an entry pushed with f strictly above the
         // current incumbent can never pop before the goal does (the goal's own key has
         // f = g(goal) exactly, since h(goal) == 0), so the push is dead work. Pruning
         // is pop-sequence-invariant — bit-exact for path, cost, and the pops counter.
-        let mut incumbent = ctx.get_g(goal);
-        let canon = canonical_ctx(self, params.seed);
-        let jps = self.jps && canon.is_some();
+        let mut incumbent: f32;
+        if let Some(r) = resumed {
+            ctx.resume = None;
+            // The budget break had popped (and charged) this live entry without
+            // expanding it: put it back and un-charge it; it is the heap maximum again,
+            // so it is popped (and charged) first — exactly the fresh run's next step.
+            ctx.open.push(r.pending);
+            pops = r.pops - 1;
+            incumbent = r.bound;
+        } else {
+            ctx.reset(n);
+
+            if let Some(start_id) = origin {
+                let start = start_id as usize;
+                ctx.set_g(start, 0.0);
+                ctx.set_parent(start, u32::MAX);
+                let h_start = ctx.h_cached(start, || h(start_id));
+                if h_start.is_finite() {
+                    ctx.open.push(Key::new_bucketed(h_start, 0.0, start_id, bucket));
+                }
+
+                // Global teleports cost the same from every node, so taking one at the
+                // start (g = 0) dominates taking it anywhere later. Relax them all exactly
+                // once here instead of merging them into every pop's neighbor stream.
+                for &(dst, w) in self.extra.global.iter() {
+                    if dst as usize >= n { continue; }
+                    let w_jittered = jit.w(start_id, dst, w);
+                    if w_jittered < ctx.get_g(dst as usize) {
+                        ctx.set_g(dst as usize, w_jittered);
+                        ctx.set_link(dst as usize, start_id, arr(start_id, dst));
+                        let hv = ctx.h_cached(dst as usize, || h(dst));
+                        if hv.is_finite() {
+                            ctx.open.push(Key::new_bucketed(w_jittered + hv, w_jittered, dst, bucket));
+                        }
+                    }
+                }
+            }
+
+            for &(node, g0) in seeds {
+                if node as usize >= n { continue; }
+                if g0 < ctx.get_g(node as usize) {
+                    ctx.set_g(node as usize, g0);
+                    ctx.set_parent(node as usize, u32::MAX);
+                    let hv = ctx.h_cached(node as usize, || h(node));
+                    if hv.is_finite() {
+                        ctx.open.push(Key::new_bucketed(g0 + hv, g0, node, bucket));
+                    }
+                }
+            }
+            pops = 0;
+            incumbent = ctx.get_g(goal);
+        }
+
+        let max_pops = params.max_pops.unwrap_or(u32::MAX);
+        let mut ended: Option<SearchStatus> = None;
+        let mut pending: Option<Key> = None;
         let diag_w = walk_diagonal_ms();
 
-        while let Some(Key { g: gcur, id, .. }) = ctx.open.pop() {
+        while let Some(key) = ctx.open.pop() {
+            let (gcur, id) = (key.g(), key.id());
             let u = id as usize;
             // Overlap the NEXT iteration's stale-check load with this expansion.
             if let Some(k) = ctx.open.peek() {
-                prefetch_node(&ctx.hot, k.id);
+                prefetch_node(&ctx.hot, k.id());
             }
             // Lazy-deletion: skip heap entries that were superseded by a better g.
             if gcur > ctx.get_g(u) { continue; }
             if u == goal { break; }
 
             pops += 1;
-            if pops > max_pops { ended = Some(SearchStatus::BudgetExceeded); break; }
-            if pops & 1023 == 0 {
+            if pops > max_pops {
+                ended = Some(SearchStatus::BudgetExceeded);
+                pending = Some(key);
+                break;
+            }
+            if pops & CANCEL_CHECK_MASK == 0 {
                 if let Some(c) = params.cancel {
                     if c.load(std::sync::atomic::Ordering::Relaxed) {
                         ended = Some(SearchStatus::Cancelled);
@@ -648,24 +919,23 @@ impl<'a> EngineView<'a> {
                 }
             }
 
-            // Fairy hops exist for only a handful of nodes; membership is a binary search
-            // over a small sorted slice, and hits borrow the shared destination slice.
+            // Fairy hops exist for only a handful of nodes; membership is a bit probe
+            // (plus a binary search on filter hits), and hits borrow the shared
+            // destination slice.
             let extra_slice: &[(u32, f32)] =
-                if !self.extra.fairy_sources.is_empty()
-                    && self.extra.fairy_sources.binary_search(&id).is_ok()
-                {
+                if !self.extra.fairy_sources.is_empty() && fairy.contains(&self.extra.fairy_sources, id) {
                     &self.extra.fairy_dests
                 } else {
                     &[]
                 };
 
             // One fused NodeState access per relaxation: the generation check, g
-            // compare, g/parent/h writes, and the h cache all touch the same 16-byte
-            // record through a single borrow instead of four accessor round-trips.
-            // `ng` is the full tentative cost (callers add the — possibly jittered —
-            // edge weight, or a whole jump's worth of steps); `dir` is the grid
-            // direction code of the link (jump-point mode only, 0 otherwise).
-            let mut relax = |v_id: u32, ng: f32, dir: u8, ctx: &mut SearchContext| {
+            // compare, g/link/h writes, and the h cache all touch the node's records
+            // through a single borrow instead of four accessor round-trips. `ng` is the
+            // full tentative cost (callers add the — possibly jittered — edge weight, or
+            // a whole jump's worth of steps); `dir` is the arrival direction code stored
+            // with the parent link (see [`ColdState::link`]).
+            let relax = |v_id: u32, ng: f32, dir: u8, ctx: &mut SearchContext, incumbent: &mut f32| {
                 let v = v_id as usize;
                 let gen = ctx.generation;
                 let hot = &mut ctx.hot[v];
@@ -678,9 +948,13 @@ impl<'a> EngineView<'a> {
                     if fresh {
                         cold.h = f32::NAN;
                     }
-                    cold.parent = id;
-                    if jps {
-                        ctx.dirs[v] = dir;
+                    cold.link = link(id, dir);
+                    // f = ng + h >= ng > incumbent (h >= 0): the push below would be
+                    // pruned whatever h is, so skip the landmark row gather. h stays
+                    // NAN (computed lazily if a later relaxation needs it). The goal
+                    // itself is never skipped: an improvement has ng < g(goal) = incumbent.
+                    if ng > *incumbent {
+                        return;
                     }
                     let hv = if cold.h.is_nan() {
                         let hh = h(v_id);
@@ -691,10 +965,10 @@ impl<'a> EngineView<'a> {
                     };
                     if hv.is_finite() {
                         if v == goal {
-                            incumbent = ng;
+                            *incumbent = ng;
                         }
                         let f = ng + hv;
-                        if f <= incumbent {
+                        if f <= *incumbent {
                             ctx.open.push(Key::new_bucketed(f, ng, v_id, bucket));
                         }
                     }
@@ -707,34 +981,53 @@ impl<'a> EngineView<'a> {
                 // jump point with the run's cost accumulated step by step (the same f32
                 // sequence plain expansion would produce along that run).
                 let (cg, coords, offsets, dst) = canon.unwrap();
-                let mut bits = cg.jps_succ(u, ctx.dirs[u]);
+                let mut bits = cg.jps_succ(u, ctx.link_code(u));
+                let tables = !cg.jump_dist.is_empty();
+                let u_xy = unpack_coord(coords[u]);
                 while bits != 0 {
                     let d = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    if let Some((j, k)) = cg.jump(u, d, goal, offsets, dst, coords) {
+                    let jumped = if tables {
+                        cg.jump_from(u, u_xy, d, goal, goal_xy, coords)
+                    } else {
+                        cg.jump_walk(u, d, goal, offsets, dst)
+                    };
+                    if let Some((j, k)) = jumped {
                         let w = if d < 4 { WALK_CARDINAL_MS } else { diag_w };
                         let mut ng = gcur;
                         for _ in 0..k {
                             ng += w;
                         }
-                        relax(j as u32, ng, (d + 1) as u8, ctx);
+                        relax(j as u32, ng, (d + 1) as u8, ctx, &mut incumbent);
                     }
                 }
-            } else if let Some((cg, coords, offsets, dst)) = canon {
+            } else if let Some((cg, _coords, offsets, dst)) = canon {
                 // Canonical strict-domination pruning: relax only the successor bits
-                // for the stored parent's incoming direction, resolved to CSR slots in
-                // O(1); weights derive from the direction bit (0-3 cardinal).
-                let parent = ctx.cold[u].parent;
+                // for the node's stored arrival direction, resolved to CSR slots in
+                // O(1); weights derive from the direction bit (0-3 cardinal). The kept
+                // successors' hot records are prefetched together before the
+                // data-dependent relax branches serialize the misses.
                 let mask = cg.masks[u];
-                let mut bits = cg.succ_bits(id, parent, coords) & mask;
+                let mut bits = cg.succ_for(u, ctx.link_code(u)) & mask;
                 let s0 = offsets[u] as usize;
+                let mut tv = [0u32; 8];
+                let mut td = [0u8; 8];
+                let mut k = 0usize;
                 while bits != 0 {
-                    let d = bits.trailing_zeros() as usize;
+                    let d = bits.trailing_zeros();
                     bits &= bits - 1;
                     let slot = s0 + (mask & ((1u8 << d) - 1)).count_ones() as usize;
-                    let w = if d < 4 { WALK_CARDINAL_MS } else { diag_w };
                     let v_id = dst[slot];
-                    relax(v_id, gcur + jit.w(id, v_id, w), 0, ctx);
+                    prefetch_node(&ctx.hot, v_id);
+                    if prefetch_rows { self.lm.prefetch_row(v_id); }
+                    tv[k] = v_id;
+                    td[k] = d as u8;
+                    k += 1;
+                }
+                for i in 0..k {
+                    let (v_id, d) = (tv[i], td[i]);
+                    let w = if d < 4 { WALK_CARDINAL_MS } else { diag_w };
+                    relax(v_id, gcur + jit.w(id, v_id, w), d + 1, ctx, &mut incumbent);
                 }
             } else {
                 // Issue all neighbor hot-state loads up front: the relax loop's
@@ -743,18 +1036,30 @@ impl<'a> EngineView<'a> {
                 for &d in self.walk.neighbor_ids(id) {
                     prefetch_node(&ctx.hot, d);
                 }
-                self.walk.for_each_neighbor(id, |v_id, w| relax(v_id, gcur + jit.w(id, v_id, w), 0, ctx));
+                self.walk.for_each_neighbor(id, |v_id, w| relax(v_id, gcur + jit.w(id, v_id, w), 0, ctx, &mut incumbent));
             }
             if self.macros.has_macro(id) {
                 for (v_id, w) in self.macros.macro_neighbors(id, params.macro_filter) {
-                    relax(v_id, gcur + jit.w(id, v_id, w), 0, ctx);
+                    relax(v_id, gcur + jit.w(id, v_id, w), arr(id, v_id), ctx, &mut incumbent);
                 }
             }
             for &(v_id, w) in extra_slice {
                 if v_id != id {
-                    relax(v_id, gcur + jit.w(id, v_id, w), 0, ctx);
+                    relax(v_id, gcur + jit.w(id, v_id, w), arr(id, v_id), ctx, &mut incumbent);
                 }
             }
+        }
+        if let (Some(SearchStatus::BudgetExceeded), Some(pk)) = (ended, pending) {
+            ctx.resume = Some(ResumeState {
+                tag,
+                pops,
+                pops_f: pops,
+                pops_b: 0,
+                bound: incumbent,
+                meet: u32::MAX,
+                pending: pk,
+                pending_forward: true,
+            });
         }
         if ctx.get_g(goal) == f32::INFINITY {
             return SearchResult::not_found(ended.unwrap_or(SearchStatus::NotFound), pops, 0);
@@ -782,7 +1087,7 @@ impl<'a> EngineView<'a> {
             // Parent links are jump points; expand each straight run back into tiles
             // so the returned path is tile-adjacent exactly as plain expansion yields.
             let (cg, _coords, offsets, dst) = canon.unwrap();
-            let (p, g) = expand_jumps(&path, &path_g, &ctx.dirs, cg, offsets, dst, diag_w);
+            let (p, g) = expand_jumps(&path, &path_g, &ctx.cold, cg, offsets, dst, diag_w);
             path = p;
             path_g = g;
         }
@@ -818,7 +1123,20 @@ impl<'a> EngineView<'a> {
         ctx_f: &mut SearchContext,
         ctx_b: &mut SearchContext,
     ) -> SearchResult {
-        self.bidir_core(Some(params.start), &[], bp, params, ctx_f, ctx_b)
+        self.bidir_core(Some(params.start), &[], bp, params, ctx_f, ctx_b, false)
+    }
+
+    /// Continue a budget-stopped [`EngineView::astar_bidir`] (state lives in `ctx_f`;
+    /// `ctx_b` must be the same backward context, untouched since). Same contract as
+    /// [`EngineView::astar_resume`].
+    pub fn astar_bidir_resume(
+        &self,
+        bp: &BidirParams,
+        params: SearchParams,
+        ctx_f: &mut SearchContext,
+        ctx_b: &mut SearchContext,
+    ) -> SearchResult {
+        self.bidir_core(Some(params.start), &[], bp, params, ctx_f, ctx_b, true)
     }
 
     /// Multi-source bidirectional MM: every `(node, initial_g)` seed enters the
@@ -834,10 +1152,23 @@ impl<'a> EngineView<'a> {
         ctx_f: &mut SearchContext,
         ctx_b: &mut SearchContext,
     ) -> SearchResult {
-        self.bidir_core(None, seeds, bp, params, ctx_f, ctx_b)
+        self.bidir_core(None, seeds, bp, params, ctx_f, ctx_b, false)
+    }
+
+    /// [`EngineView::astar_bidir_multi`] continuation; see [`EngineView::astar_bidir_resume`].
+    pub fn astar_bidir_multi_resume(
+        &self,
+        seeds: &[(u32, f32)],
+        bp: &BidirParams,
+        params: SearchParams,
+        ctx_f: &mut SearchContext,
+        ctx_b: &mut SearchContext,
+    ) -> SearchResult {
+        self.bidir_core(None, seeds, bp, params, ctx_f, ctx_b, true)
     }
 
     /// Dispatch once on the seed (see [`JitterPolicy`] / `search_core`).
+    #[allow(clippy::too_many_arguments)]
     fn bidir_core(
         &self,
         origin: Option<u32>,
@@ -846,11 +1177,73 @@ impl<'a> EngineView<'a> {
         params: SearchParams,
         ctx_f: &mut SearchContext,
         ctx_b: &mut SearchContext,
+        resume: bool,
     ) -> SearchResult {
         match params.seed {
-            Some(s) => self.bidir_core_impl(origin, seeds, bp, params, ctx_f, ctx_b, SeededJitter(s)),
-            None => self.bidir_core_impl(origin, seeds, bp, params, ctx_f, ctx_b, NoJitter),
+            Some(s) => self.bidir_core_impl(origin, seeds, bp, params, ctx_f, ctx_b, SeededJitter(s), resume),
+            None => self.bidir_core_impl(origin, seeds, bp, params, ctx_f, ctx_b, NoJitter, resume),
         }
+    }
+
+    /// Backward-bound landmark selection for this search's anchor set (origin at 0 plus
+    /// every in-range global at its cost, or the in-range seed list), reusing the
+    /// profile's precomputed global aggregate when its fingerprint matches.
+    ///
+    /// With `NAVPATH_REV_ANCHOR_FILTER=1`, anchors that provably cannot reach the goal
+    /// (forward h = INF) are dropped first (see [`rev_anchor_filter_enabled`] for why it
+    /// is off by default). The backward search only ever touches
+    /// nodes that reach the goal, and an anchor that could reach such a node could
+    /// reach the goal too — so for every node the bound is evaluated on, the dropped
+    /// anchors contribute nothing to d(anchor_set, v): the bound stays admissible and
+    /// gets tighter. It matters a lot: one global landing in a one-way pocket makes an
+    /// anchor's landmark entries UNREACHABLE, which invalidates that landmark's
+    /// aggregate for the whole anchor set — with all globals eligible, 15 pocket
+    /// landings left 0 of 64 backward columns usable (h_b = 0, a blind backward half).
+    fn select_rev(
+        &self,
+        origin: Option<u32>,
+        seeds: &[(u32, f32)],
+        goal_id: u32,
+        h_f: &dyn Fn(u32) -> f32,
+    ) -> super::heuristics::ActiveLandmarksRev {
+        let n = self.nodes;
+        let filter = rev_anchor_filter_enabled();
+        let reach = |a: u32| !filter || h_f(a).is_finite();
+        let in_range = |&&(node, _): &&(u32, f32)| (node as usize) < n;
+        if let Some(base) = self.extra.global_rev_base {
+            // The base covers exactly one anchor list: `global` in origin mode, or the
+            // seed list in multi-source mode (the service seeds virtual starts with the
+            // eligible globals).
+            let (covered, rest): (&[(u32, f32)], &[(u32, f32)]) = if origin.is_some() {
+                (self.extra.global.as_ref(), seeds)
+            } else {
+                (seeds, &[])
+            };
+            if base.landmarks() == self.lm.landmarks && base.matches(covered.iter().filter(in_range)) {
+                let mut extra: Vec<(u32, f32)> = Vec::with_capacity(1 + rest.len());
+                if let Some(o) = origin {
+                    if reach(o) {
+                        extra.push((o, 0.0));
+                    }
+                }
+                extra.extend(rest.iter().filter(in_range).copied().filter(|&(a, _)| reach(a)));
+                let keep: Vec<bool> = base.anchors().iter().map(|&(a, _)| reach(a)).collect();
+                if keep.iter().all(|&k| k) {
+                    return self.lm.select_active_rev_based(Some(base), &extra, goal_id, active_landmarks());
+                }
+                return self.lm.select_active_rev_subset(base, &keep, &extra, goal_id, active_landmarks());
+            }
+        }
+        let mut anchors: Vec<(u32, f32)> = Vec::with_capacity(1 + self.extra.global.len() + seeds.len());
+        if let Some(o) = origin {
+            anchors.push((o, 0.0));
+            anchors.extend(self.extra.global.iter().filter(in_range).copied());
+        }
+        anchors.extend(seeds.iter().filter(in_range).copied());
+        if filter {
+            anchors.retain(|&(a, _)| reach(a));
+        }
+        self.lm.select_active_rev(&anchors, goal_id, active_landmarks())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -863,6 +1256,7 @@ impl<'a> EngineView<'a> {
         ctx_f: &mut SearchContext,
         ctx_b: &mut SearchContext,
         jit: J,
+        resume: bool,
     ) -> SearchResult {
         let n = self.nodes;
         let goal_id = params.goal;
@@ -870,82 +1264,123 @@ impl<'a> EngineView<'a> {
         let bucket = params.bucket_ms;
 
         if origin == Some(goal_id) {
+            ctx_f.resume = None;
             return SearchResult { found: true, status: SearchStatus::Found, path: vec![goal_id], path_g: vec![0.0], cost: 0.0, pops: 0, pops_f: 0, pops_b: 0 };
         }
 
-        ctx_f.reset(n);
-        ctx_b.reset(n);
+        let canon = canonical_ctx(self, params.seed);
+        let mut tag = QueryTag {
+            bidir: true,
+            origin,
+            goal: goal_id,
+            seed: params.seed,
+            bucket_bits: bucket.to_bits(),
+            seeds_fp: seeds_fingerprint(seeds),
+            canon: canon.is_some(),
+            jps: false,
+            other_gen: ctx_b.generation,
+        };
+        let resumed = if resume { ctx_f.resume.filter(|r| r.tag == tag) } else { None };
 
         let active_f = self.lm.select_active(origin.unwrap_or(goal_id), goal_id, active_landmarks());
         let h_f = |u: u32| -> f32 { self.lm.h_active(u, &active_f) };
 
         // Backward bound anchors: the forward origins — start at 0 plus globals at
         // their cost, or (multi-source) the seed set itself.
-        let mut anchors: Vec<(u32, f32)> = Vec::with_capacity(1 + self.extra.global.len() + seeds.len());
-        if let Some(o) = origin {
-            anchors.push((o, 0.0));
-            for &(dst, w) in self.extra.global.iter() {
-                if (dst as usize) < n {
-                    anchors.push((dst, w));
-                }
-            }
-        }
-        for &(node, g0) in seeds {
-            if (node as usize) < n {
-                anchors.push((node, g0));
-            }
-        }
-        let active_b = self.lm.select_active_rev(&anchors, goal_id, active_landmarks());
+        let active_b = self.select_rev(origin, seeds, goal_id, &h_f);
         let h_b = |u: u32| -> f32 { self.lm.h_active_rev(u, &active_b) };
 
-        let mut mu = f32::INFINITY;
-        let mut meet: Option<u32> = None;
-
-        // --- forward seeding (mirrors the unidirectional path) ---
-        if let Some(origin_id) = origin {
-            let start = origin_id as usize;
-            ctx_f.set_g(start, 0.0);
-            ctx_f.set_parent(start, u32::MAX);
-            let hs = ctx_f.h_cached(start, || h_f(origin_id));
-            if hs.is_finite() {
-                ctx_f.open.push(Key::new_bucketed(hs.max(0.0), 0.0, origin_id, bucket));
+        // Non-walk arrival direction codes for canonical pruning (see search_core_impl).
+        let arr = |parent: u32, v: u32| -> u8 {
+            match canon {
+                Some((_, coords, _, _)) => arrival_code(coords, parent, v),
+                None => 0,
             }
-            for &(dst, w) in self.extra.global.iter() {
-                if dst as usize >= n { continue; }
-                let w_j = jit.w(origin_id, dst, w);
-                if w_j < ctx_f.get_g(dst as usize) {
-                    ctx_f.set_g(dst as usize, w_j);
-                    ctx_f.set_parent(dst as usize, origin_id);
-                    let hv = ctx_f.h_cached(dst as usize, || h_f(dst));
-                    if hv.is_finite() {
-                        ctx_f.open.push(Key::new_bucketed((w_j + hv).max(2.0 * w_j), w_j, dst, bucket));
+        };
+        let fairy = FairyFilter::new(&self.extra.fairy_sources);
+        let prefetch_rows = prefetch_rows_enabled();
+        // The backward bound reads rows only when it has usable landmark columns (with
+        // h_b = 0 prefetching them is pure waste).
+        let prefetch_rows_b = prefetch_rows && !active_b.indices.is_empty();
+
+        let mut mu: f32;
+        let mut meet: Option<u32>;
+        let mut pops: u32;
+        let mut pops_f: u32;
+        let mut pops_b: u32;
+
+        if let Some(r) = resumed {
+            ctx_f.resume = None;
+            // Re-push the charged-but-unexpanded entry of the budget break (see
+            // search_core_impl) on its own side and un-charge it.
+            pops = r.pops - 1;
+            pops_f = r.pops_f;
+            pops_b = r.pops_b;
+            if r.pending_forward {
+                ctx_f.open.push(r.pending);
+                pops_f -= 1;
+            } else {
+                ctx_b.open.push(r.pending);
+                pops_b -= 1;
+            }
+            mu = r.bound;
+            meet = if r.meet == u32::MAX { None } else { Some(r.meet) };
+        } else {
+            ctx_f.reset(n);
+            ctx_b.reset(n);
+            tag.other_gen = ctx_b.generation;
+            mu = f32::INFINITY;
+            meet = None;
+
+            // --- forward seeding (mirrors the unidirectional path) ---
+            if let Some(origin_id) = origin {
+                let start = origin_id as usize;
+                ctx_f.set_g(start, 0.0);
+                ctx_f.set_parent(start, u32::MAX);
+                let hs = ctx_f.h_cached(start, || h_f(origin_id));
+                if hs.is_finite() {
+                    ctx_f.open.push(Key::new_bucketed(hs.max(0.0), 0.0, origin_id, bucket));
+                }
+                for &(dst, w) in self.extra.global.iter() {
+                    if dst as usize >= n { continue; }
+                    let w_j = jit.w(origin_id, dst, w);
+                    if w_j < ctx_f.get_g(dst as usize) {
+                        ctx_f.set_g(dst as usize, w_j);
+                        ctx_f.set_link(dst as usize, origin_id, arr(origin_id, dst));
+                        let hv = ctx_f.h_cached(dst as usize, || h_f(dst));
+                        if hv.is_finite() {
+                            ctx_f.open.push(Key::new_bucketed((w_j + hv).max(2.0 * w_j), w_j, dst, bucket));
+                        }
                     }
                 }
             }
-        }
-        for &(node, g0) in seeds {
-            if node as usize >= n { continue; }
-            if g0 < ctx_f.get_g(node as usize) {
-                ctx_f.set_g(node as usize, g0);
-                ctx_f.set_parent(node as usize, u32::MAX);
-                let hv = ctx_f.h_cached(node as usize, || h_f(node));
-                if hv.is_finite() {
-                    ctx_f.open.push(Key::new_bucketed((g0 + hv).max(2.0 * g0), g0, node, bucket));
+            for &(node, g0) in seeds {
+                if node as usize >= n { continue; }
+                if g0 < ctx_f.get_g(node as usize) {
+                    ctx_f.set_g(node as usize, g0);
+                    ctx_f.set_parent(node as usize, u32::MAX);
+                    let hv = ctx_f.h_cached(node as usize, || h_f(node));
+                    if hv.is_finite() {
+                        ctx_f.open.push(Key::new_bucketed((g0 + hv).max(2.0 * g0), g0, node, bucket));
+                    }
                 }
             }
-        }
 
-        // --- backward seeding ---
-        ctx_b.set_g(goal, 0.0);
-        ctx_b.set_parent(goal, u32::MAX);
-        let hg = ctx_b.h_cached(goal, || h_b(goal_id));
-        if hg.is_finite() {
-            ctx_b.open.push(Key::new_bucketed(hg.max(0.0), 0.0, goal_id, bucket));
-        }
-        // A forward seed IS a meeting candidate if it is the goal itself.
-        if ctx_f.get_g(goal).is_finite() {
-            mu = ctx_f.get_g(goal);
-            meet = Some(goal_id);
+            // --- backward seeding ---
+            ctx_b.set_g(goal, 0.0);
+            ctx_b.set_parent(goal, u32::MAX);
+            let hg = ctx_b.h_cached(goal, || h_b(goal_id));
+            if hg.is_finite() {
+                ctx_b.open.push(Key::new_bucketed(hg.max(0.0), 0.0, goal_id, bucket));
+            }
+            // A forward seed IS a meeting candidate if it is the goal itself.
+            if ctx_f.get_g(goal).is_finite() {
+                mu = ctx_f.get_g(goal);
+                meet = Some(goal_id);
+            }
+            pops = 0;
+            pops_f = 0;
+            pops_b = 0;
         }
 
         let fairy_cost_of = |x: u32| -> Option<f32> {
@@ -956,13 +1391,10 @@ impl<'a> EngineView<'a> {
                 .map(|i| self.extra.fairy_dests[i].1)
         };
 
-        let mut pops: u32 = 0;
-        let mut pops_f: u32 = 0;
-        let mut pops_b: u32 = 0;
-        let canon = canonical_ctx(self, params.seed);
         let diag_w = walk_diagonal_ms();
         let max_pops = params.max_pops.unwrap_or(u32::MAX);
         let mut ended: Option<SearchStatus> = None;
+        let mut pending: Option<(Key, bool)> = None;
 
         loop {
             let tf = ctx_f.open.peek().map(|k| k.f_lower(bucket)).unwrap_or(f32::INFINITY);
@@ -972,18 +1404,26 @@ impl<'a> EngineView<'a> {
             if mu <= tf.min(tb) {
                 break;
             }
+            // An exhausted side with no meeting yet proves there is no path: with mu
+            // infinite nothing was pr-pruned, and only provably-unreachable (h = INF)
+            // pushes were skipped, so an empty forward frontier means every origin-reachable
+            // node that could reach the goal was expanded without touching it (a backward
+            // one: no origin reaches the goal). Without this the other side ran on to
+            // exhaustion (or the pop budget, triggering a pointless retry).
+            if mu == f32::INFINITY && (tf == f32::INFINITY || tb == f32::INFINITY) {
+                break;
+            }
 
             let forward = tf <= tb;
-            let Some(Key { g: gcur, id, .. }) =
-                (if forward { ctx_f.open.pop() } else { ctx_b.open.pop() })
-            else {
+            let Some(key) = (if forward { ctx_f.open.pop() } else { ctx_b.open.pop() }) else {
                 break;
             };
+            let (gcur, id) = (key.g(), key.id());
             // Overlap the chosen side's NEXT stale-check load with this expansion.
             if forward {
-                if let Some(k) = ctx_f.open.peek() { prefetch_node(&ctx_f.hot, k.id); }
+                if let Some(k) = ctx_f.open.peek() { prefetch_node(&ctx_f.hot, k.id()); }
             } else if let Some(k) = ctx_b.open.peek() {
-                prefetch_node(&ctx_b.hot, k.id);
+                prefetch_node(&ctx_b.hot, k.id());
             }
             let u = id as usize;
             // Lazy-deletion: an entry superseded by a better g is not an expansion, so it
@@ -996,8 +1436,12 @@ impl<'a> EngineView<'a> {
 
             pops += 1;
             if forward { pops_f += 1 } else { pops_b += 1 }
-            if pops > max_pops { ended = Some(SearchStatus::BudgetExceeded); break; }
-            if pops & 1023 == 0 {
+            if pops > max_pops {
+                ended = Some(SearchStatus::BudgetExceeded);
+                pending = Some((key, forward));
+                break;
+            }
+            if pops & CANCEL_CHECK_MASK == 0 {
                 if let Some(c) = params.cancel {
                     if c.load(std::sync::atomic::Ordering::Relaxed) {
                         ended = Some(SearchStatus::Cancelled);
@@ -1009,15 +1453,14 @@ impl<'a> EngineView<'a> {
             if forward {
                 // ---- expand forward ----
                 let fairy_slice: &[(u32, f32)] =
-                    if !self.extra.fairy_sources.is_empty()
-                        && self.extra.fairy_sources.binary_search(&id).is_ok()
+                    if !self.extra.fairy_sources.is_empty() && fairy.contains(&self.extra.fairy_sources, id)
                     { &self.extra.fairy_dests } else { &[] };
 
                 // Fused NodeState access + push pruning: an entry whose pr exceeds the
                 // (already-updated) meeting cost mu can never be expanded before the
                 // MM stop rule fires — mu only decreases after the decision, so the
                 // prune is pop-sequence-invariant, hence bit-exact.
-                let relax = |v_id: u32, w: f32, ctx: &mut SearchContext, other: &SearchContext,
+                let relax = |v_id: u32, w: f32, dir: u8, ctx: &mut SearchContext, other: &SearchContext,
                              mu: &mut f32, meet: &mut Option<u32>| {
                     let v = v_id as usize;
                     let w_j = jit.w(id, v_id, w);
@@ -1029,15 +1472,26 @@ impl<'a> EngineView<'a> {
                         let fresh = hot.gen != gen;
                         hot.gen = gen;
                         hot.g = ng;
+                        if fresh {
+                            ctx.blk[v >> 6] = gen;
+                        }
                         let cold = &mut ctx.cold[v];
                         if fresh {
                             cold.h = f32::NAN;
                         }
-                        cold.parent = id;
-                        let og = other.get_g(v);
-                        if og.is_finite() && ng + og < *mu {
-                            *mu = ng + og;
-                            *meet = Some(v_id);
+                        cold.link = link(id, dir);
+                        // Meet probe, filtered by the other side's block stamps: an
+                        // unstamped block proves og = INF without the random hot read.
+                        if other.blk[v >> 6] == other.generation {
+                            let og = other.get_g(v);
+                            if og.is_finite() && ng + og < *mu {
+                                *mu = ng + og;
+                                *meet = Some(v_id);
+                            }
+                        }
+                        // pr >= 2*ng > mu: pruned whatever h is — skip the row gather.
+                        if 2.0 * ng > *mu {
+                            return;
                         }
                         let hv = if cold.h.is_nan() {
                             let hh = h_f(v_id);
@@ -1054,34 +1508,45 @@ impl<'a> EngineView<'a> {
                         }
                     }
                 };
-                if let Some((cg, coords, offsets, dst)) = canon {
-                    let parent = ctx_f.cold[u].parent;
+                if let Some((cg, _coords, offsets, dst)) = canon {
                     let mask = cg.masks[u];
-                    let mut bits = cg.succ_bits(id, parent, coords) & mask;
+                    let mut bits = cg.succ_for(u, ctx_f.link_code(u)) & mask;
                     let s0 = offsets[u] as usize;
+                    let mut tv = [0u32; 8];
+                    let mut td = [0u8; 8];
+                    let mut k = 0usize;
                     while bits != 0 {
-                        let d = bits.trailing_zeros() as usize;
+                        let d = bits.trailing_zeros();
                         bits &= bits - 1;
                         let slot = s0 + (mask & ((1u8 << d) - 1)).count_ones() as usize;
+                        let v_id = dst[slot];
+                        prefetch_node(&ctx_f.hot, v_id);
+                        if prefetch_rows { self.lm.prefetch_row(v_id); }
+                        tv[k] = v_id;
+                        td[k] = d as u8;
+                        k += 1;
+                    }
+                    for i in 0..k {
+                        let d = td[i];
                         let w = if d < 4 { WALK_CARDINAL_MS } else { diag_w };
-                        relax(dst[slot], w, ctx_f, ctx_b, &mut mu, &mut meet);
+                        relax(tv[i], w, d + 1, ctx_f, ctx_b, &mut mu, &mut meet);
                     }
                 } else {
                     for &d in self.walk.neighbor_ids(id) {
                         prefetch_node(&ctx_f.hot, d);
                     }
                     self.walk.for_each_neighbor(id, |v_id, w| {
-                        relax(v_id, w, ctx_f, ctx_b, &mut mu, &mut meet)
+                        relax(v_id, w, 0, ctx_f, ctx_b, &mut mu, &mut meet)
                     });
                 }
                 if self.macros.has_macro(id) {
                     for (v_id, w) in self.macros.macro_neighbors(id, params.macro_filter) {
-                        relax(v_id, w, ctx_f, ctx_b, &mut mu, &mut meet);
+                        relax(v_id, w, arr(id, v_id), ctx_f, ctx_b, &mut mu, &mut meet);
                     }
                 }
                 for &(v_id, w) in fairy_slice {
                     if v_id != id {
-                        relax(v_id, w, ctx_f, ctx_b, &mut mu, &mut meet);
+                        relax(v_id, w, arr(id, v_id), ctx_f, ctx_b, &mut mu, &mut meet);
                     }
                 }
             } else {
@@ -1089,11 +1554,10 @@ impl<'a> EngineView<'a> {
                 // Backward fairy: predecessors of ring x are all other rings, each via
                 // the forward edge y->x whose weight is cost(x).
                 let fairy_pred_w: Option<f32> =
-                    if !self.extra.fairy_sources.is_empty()
-                        && self.extra.fairy_sources.binary_search(&id).is_ok()
+                    if !self.extra.fairy_sources.is_empty() && fairy.contains(&self.extra.fairy_sources, id)
                     { fairy_cost_of(id) } else { None };
 
-                let relax = |y_id: u32, w: f32, ctx: &mut SearchContext, other: &SearchContext,
+                let relax = |y_id: u32, w: f32, dir: u8, ctx: &mut SearchContext, other: &SearchContext,
                              mu: &mut f32, meet: &mut Option<u32>| {
                     let y = y_id as usize;
                     // Forward edge identity is (y -> id): jitter must match the forward
@@ -1107,15 +1571,23 @@ impl<'a> EngineView<'a> {
                         let fresh = hot.gen != gen;
                         hot.gen = gen;
                         hot.g = ng;
+                        if fresh {
+                            ctx.blk[y >> 6] = gen;
+                        }
                         let cold = &mut ctx.cold[y];
                         if fresh {
                             cold.h = f32::NAN;
                         }
-                        cold.parent = id;
-                        let og = other.get_g(y);
-                        if og.is_finite() && ng + og < *mu {
-                            *mu = ng + og;
-                            *meet = Some(y_id);
+                        cold.link = link(id, dir);
+                        if other.blk[y >> 6] == other.generation {
+                            let og = other.get_g(y);
+                            if og.is_finite() && ng + og < *mu {
+                                *mu = ng + og;
+                                *meet = Some(y_id);
+                            }
+                        }
+                        if 2.0 * ng > *mu {
+                            return;
                         }
                         let hv = if cold.h.is_nan() {
                             let hh = h_b(y_id);
@@ -1134,42 +1606,66 @@ impl<'a> EngineView<'a> {
                 };
                 // Walk graph is symmetric (asserted at build time): forward neighbor
                 // slice doubles as predecessor slice with identical weights.
-                if let Some((cg, coords, offsets, dst)) = canon {
+                if let Some((cg, _coords, offsets, dst)) = canon {
                     // Walk symmetry (builder-asserted) makes the same table valid for
                     // the reversed graph: predecessors == successors, direction taken
-                    // from the backward parent exactly as forward.
-                    let parent = ctx_b.cold[u].parent;
+                    // from the backward arrival exactly as forward.
                     let mask = cg.masks[u];
-                    let mut bits = cg.succ_bits(id, parent, coords) & mask;
+                    let mut bits = cg.succ_for(u, ctx_b.link_code(u)) & mask;
                     let s0 = offsets[u] as usize;
+                    let mut tv = [0u32; 8];
+                    let mut td = [0u8; 8];
+                    let mut k = 0usize;
                     while bits != 0 {
-                        let d = bits.trailing_zeros() as usize;
+                        let d = bits.trailing_zeros();
                         bits &= bits - 1;
                         let slot = s0 + (mask & ((1u8 << d) - 1)).count_ones() as usize;
+                        let y_id = dst[slot];
+                        prefetch_node(&ctx_b.hot, y_id);
+                        if prefetch_rows_b { self.lm.prefetch_row(y_id); }
+                        tv[k] = y_id;
+                        td[k] = d as u8;
+                        k += 1;
+                    }
+                    for i in 0..k {
+                        let d = td[i];
                         let w = if d < 4 { WALK_CARDINAL_MS } else { diag_w };
-                        relax(dst[slot], w, ctx_b, ctx_f, &mut mu, &mut meet);
+                        relax(tv[i], w, d + 1, ctx_b, ctx_f, &mut mu, &mut meet);
                     }
                 } else {
                     for &d in self.walk.neighbor_ids(id) {
                         prefetch_node(&ctx_b.hot, d);
                     }
                     self.walk.for_each_neighbor(id, |y_id, w| {
-                        relax(y_id, w, ctx_b, ctx_f, &mut mu, &mut meet)
+                        relax(y_id, w, 0, ctx_b, ctx_f, &mut mu, &mut meet)
                     });
                 }
                 if bp.macros_rev.has_macro(id) {
                     for (y_id, w) in bp.macros_rev.macro_neighbors(id, bp.macro_filter_rev) {
-                        relax(y_id, w, ctx_b, ctx_f, &mut mu, &mut meet);
+                        relax(y_id, w, arr(id, y_id), ctx_b, ctx_f, &mut mu, &mut meet);
                     }
                 }
                 if let Some(wx) = fairy_pred_w {
                     for &(y_id, _) in self.extra.fairy_dests.iter() {
                         if y_id != id {
-                            relax(y_id, wx, ctx_b, ctx_f, &mut mu, &mut meet);
+                            relax(y_id, wx, arr(id, y_id), ctx_b, ctx_f, &mut mu, &mut meet);
                         }
                     }
                 }
             }
+        }
+
+        if let (Some(SearchStatus::BudgetExceeded), Some((pk, fwd))) = (ended, pending) {
+            ctx_f.resume = Some(ResumeState {
+                tag,
+                pops,
+                pops_f,
+                pops_b,
+                bound: mu,
+                meet: meet.unwrap_or(u32::MAX),
+                pending: pk,
+                pending_forward: fwd,
+            });
         }
 
         let Some(m) = meet else {
@@ -1640,6 +2136,94 @@ mod tests {
         }
         // The fixture's purpose: different seeds really do select different paths.
         assert!(winners.len() > 1, "every seed picked the same diamond path");
+    }
+
+    /// Symmetric 8-connected-ish grid (4-neighbour, unit weights) of `w` x `h` nodes.
+    fn grid_edges(w: u32, h: u32) -> (Vec<u32>, Vec<u32>, Vec<f32>) {
+        let (mut ws, mut wd, mut ww) = (Vec::new(), Vec::new(), Vec::new());
+        for y in 0..h {
+            for x in 0..w {
+                let u = y * w + x;
+                let mut add = |v: u32, c: f32| {
+                    ws.push(u); wd.push(v); ww.push(c);
+                    ws.push(v); wd.push(u); ww.push(c);
+                };
+                if x + 1 < w { add(u + 1, 1.0 + (x % 3) as f32 * 0.25); }
+                if y + 1 < h { add(u + w, 1.0 + (y % 2) as f32 * 0.5); }
+            }
+        }
+        (ws, wd, ww)
+    }
+
+    fn same(a: &SearchResult, b: &SearchResult) {
+        assert_eq!(a.status, b.status);
+        assert_eq!(a.found, b.found);
+        assert_eq!(a.cost.to_bits(), b.cost.to_bits());
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.pops, b.pops);
+        assert_eq!(a.pops_f, b.pops_f);
+        assert_eq!(a.pops_b, b.pops_b);
+        let (ga, gb): (Vec<u32>, Vec<u32>) = (a.path_g.iter().map(|g| g.to_bits()).collect(), b.path_g.iter().map(|g| g.to_bits()).collect());
+        assert_eq!(ga, gb);
+    }
+
+    /// T1.2: a budget-stopped search continued under a larger budget is bit-identical
+    /// (path, costs, status, CUMULATIVE pop counters) to a fresh run with that budget —
+    /// unidirectional, multi-source and bidirectional, seeded and unseeded, including a
+    /// continuation that stops on its budget again and is continued once more.
+    #[test]
+    fn resumed_search_equals_fresh_search_with_larger_budget() {
+        let (w, h) = (23u32, 17u32);
+        let n = (w * h) as usize;
+        let (ws, wd, ww) = grid_edges(w, h);
+        let mut view = line_view(&ws, &wd, &ww, &[], &[], &[], n);
+        view.extra.global = vec![(200, 9.0), (330, 14.5)].into();
+        let macros_rev = NeighborProvider::new(n, &[], &[], &[]);
+        let bp = BidirParams { macros_rev: &macros_rev, macro_filter_rev: None };
+        let (start, goal) = (3u32, (w * h - 2) as u32);
+        for seed in [None, Some(7u64)] {
+            let params = |max_pops: Option<u32>| SearchParams { start, goal, macro_filter: None, seed, max_pops, cancel: None, bucket_ms: 0.0 };
+            // Unidirectional.
+            let mut ctx = SearchContext::new(n);
+            let fresh = view.astar(params(None), &mut ctx);
+            assert_eq!(fresh.status, SearchStatus::Found);
+            let first = view.astar(params(Some(40)), &mut ctx);
+            assert_eq!(first.status, SearchStatus::BudgetExceeded);
+            assert!(ctx.resumable());
+            let second = view.astar_resume(params(Some(120)), &mut ctx);
+            assert_eq!(second.status, SearchStatus::BudgetExceeded);
+            same(&second, &view.astar(params(Some(120)), &mut SearchContext::new(n)));
+            let cont = view.astar_resume(params(None), &mut ctx);
+            same(&cont, &fresh);
+            // A resume without a matching stopped search is simply a fresh search.
+            let other = view.astar_resume(params(None), &mut ctx);
+            same(&other, &fresh);
+
+            // Multi-source.
+            let seeds = [(0u32, 3.0f32), (40, 1.0)];
+            let fresh_m = view.astar_multi(&seeds, params(None), &mut ctx);
+            let _ = view.astar_multi(&seeds, params(Some(30)), &mut ctx);
+            same(&view.astar_multi_resume(&seeds, params(None), &mut ctx), &fresh_m);
+
+            // Bidirectional.
+            let (mut cf, mut cb) = (SearchContext::new(n), SearchContext::new(n));
+            let fresh_b = view.astar_bidir(&bp, params(None), &mut cf, &mut cb);
+            assert_eq!(fresh_b.status, SearchStatus::Found);
+            let first_b = view.astar_bidir(&bp, params(Some(25)), &mut cf, &mut cb);
+            assert_eq!(first_b.status, SearchStatus::BudgetExceeded);
+            let mid_b = view.astar_bidir_resume(&bp, params(Some(60)), &mut cf, &mut cb);
+            same(&mid_b, &view.astar_bidir(&bp, params(Some(60)), &mut SearchContext::new(n), &mut SearchContext::new(n)));
+            same(&view.astar_bidir_resume(&bp, params(None), &mut cf, &mut cb), &fresh_b);
+            // Reusing the backward context for another search invalidates the resume.
+            let _ = view.astar_bidir(&bp, params(Some(25)), &mut cf, &mut cb);
+            let _ = view.astar(params(None), &mut cb);
+            same(&view.astar_bidir_resume(&bp, params(None), &mut cf, &mut cb), &fresh_b);
+
+            // Bidirectional multi-source.
+            let fresh_bm = view.astar_bidir_multi(&seeds, &bp, params(None), &mut cf, &mut cb);
+            let _ = view.astar_bidir_multi(&seeds, &bp, params(Some(20)), &mut cf, &mut cb);
+            same(&view.astar_bidir_multi_resume(&seeds, &bp, params(None), &mut cf, &mut cb), &fresh_bm);
+        }
     }
 
     #[test]

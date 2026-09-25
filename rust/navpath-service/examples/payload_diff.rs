@@ -10,6 +10,10 @@
 //!       re-run the matrix and fail (exit 1) on ANY semantic difference vs baseline
 //!
 //! Refactors that intend to change payloads must re-capture and justify the diff.
+//!
+//! `NAVPATH_PAYLOAD_BASELINE=<file>` compares against (or captures into) another file,
+//! e.g. a capture made by a previous build on a newer snapshot. The snapshot is paged in
+//! before the matrix runs, like the service does; `NAVPATH_HARNESS_COLD=1` skips that.
 
 use axum::body::Body;
 use axum::http::Request;
@@ -17,6 +21,10 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
+
+// Same allocator as the service binary (T5.14).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn strip_volatile(v: &mut Value) {
     if let Some(obj) = v.as_object_mut() {
@@ -32,7 +40,8 @@ async fn main() {
     std::env::set_var("NAVPATH_MAX_POPS", "0");
 
     let capture = std::env::args().any(|a| a == "--capture");
-    let baseline_path = format!("{}/../../tools/payload_baseline.json", env!("CARGO_MANIFEST_DIR"));
+    let baseline_path = std::env::var("NAVPATH_PAYLOAD_BASELINE")
+        .unwrap_or_else(|_| format!("{}/../../tools/payload_baseline.json", env!("CARGO_MANIFEST_DIR")));
     let snap_path = std::env::var("SNAPSHOT_PATH")
         .unwrap_or_else(|_| format!("{}/../../graph.snapshot", env!("CARGO_MANIFEST_DIR")));
     if !std::path::Path::new(&snap_path).exists() {
@@ -41,30 +50,19 @@ async fn main() {
     }
 
     let snap = navpath_core::Snapshot::open(&snap_path).expect("open snapshot");
-    let req_tag_index = navpath_service::build_req_tag_index(Some(&snap));
-    let (n, nr, g, m) = navpath_service::engine_adapter::build_neighbor_provider(&snap);
-    let (fr, nfr) = navpath_service::engine_adapter::build_fairy_rings(&snap);
-    let cg = navpath_service::engine_adapter::build_component_graph(&snap, &g, &fr);
-    let canon = navpath_service::engine_adapter::build_canonical_grid(&snap);
+    // Page the mapping in first (T5.9), as the service's warm-up does, so the matrix
+    // does not measure disk reads.
+    if !matches!(std::env::var("NAVPATH_HARNESS_COLD").ok().as_deref().map(str::trim), Some("1") | Some("true")) {
+        let t = std::time::Instant::now();
+        let bytes = snap.populate();
+        eprintln!("payload_diff: populated {} MiB in {:?}", bytes >> 20, t.elapsed());
+    }
     let state = navpath_service::AppState {
-        current: Arc::new(arc_swap::ArcSwap::from_pointee(navpath_service::SnapshotState {
-            path: snap_path.clone().into(),
-            snapshot: Some(Arc::new(snap)),
-            neighbors: Some(Arc::new(n)),
-            neighbors_rev: Some(Arc::new(nr)),
-            globals: Arc::new(g),
-            macro_lookup: Arc::new(m),
-            req_tag_index: Arc::new(req_tag_index),
-            loaded_at_unix: 0,
-            snapshot_hash_hex: None,
-            route_cache: navpath_service::new_route_cache(),
-            seed_shadow: navpath_service::new_seed_shadow(),
-            fairy_rings: Arc::new(fr),
-            node_to_fairy_ring: Arc::new(nfr),
-            comp_graph: Some(Arc::new(cg)),
-            canonical_grid: canon,
-            profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache(),
-        })),
+        current: Arc::new(arc_swap::ArcSwap::from_pointee(navpath_service::SnapshotState::build(
+            snap_path.clone().into(),
+            snap,
+            None,
+        ))),
         search_permits: navpath_service::default_search_permits(),
         metrics: Arc::new(navpath_service::Metrics::default()),
         ctx_pool: navpath_service::ContextPool::new(), ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),

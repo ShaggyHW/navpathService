@@ -1,12 +1,13 @@
 //! Canonical successor pruning for the uniform-cost 8-connected walk grid
 //! (roadmap Phase E, §4.6 Stages 1-2a).
 //!
-//! Stage 1: the per-tile 8-direction mask grid is DERIVED from the v8 walk CSR at
-//! load (1 B/node) — no snapshot format change. Two invariants make an O(1)
-//! direction -> CSR-slot mapping possible, both validated during derivation:
-//! node ids follow packed (plane, y, x) key order, and every CSR row is emitted in
+//! Stage 1: the per-tile 8-direction mask grid is DERIVED from the walk CSR at load
+//! (1 B/node) — no snapshot format change. One invariant makes an O(1) direction ->
+//! CSR-slot mapping possible, validated during derivation: every CSR row is emitted in
 //! ascending direction-bit order, so
 //! `slot(u, d) = walk_offsets[u] + popcount(mask[u] & ((1 << d) - 1))`.
+//! (Node ids follow the packed-key order — Morton since snapshot v9 — which only
+//! `find_node` relies on; the jump-table sweeps sort by raster key explicitly.)
 //!
 //! Stage 2a: a per-(node, incoming-direction) successor table (8 B/node) prunes walk
 //! successors that are STRICTLY dominated: direction `c` out of `u` (reached from `p`
@@ -35,7 +36,7 @@
 //! pruning comparison then only UNDERSTATES the through-cost, which keeps pruned
 //! alternatives no-worse and the decision sound.
 
-use crate::snapshot::{unpack_coord, walk_diagonal_ms};
+use crate::snapshot::{raster_key, unpack_coord, walk_diagonal_ms};
 
 /// Direction bits, identical to the builder's mask encoding (graph.rs):
 /// 0:left(-1,0) 1:bottom(0,-1) 2:right(+1,0) 3:top(0,+1)
@@ -84,9 +85,44 @@ fn find_node(coords: &[u32], x: i32, y: i32, plane: i32) -> Option<usize> {
     coords.binary_search(&crate::snapshot::pack_coord(x, y, plane)).ok()
 }
 
-#[inline]
+/// Direction index of the unit step (dx, dy), by table lookup (`(dy+1)*3 + (dx+1)`);
+/// `u8::MAX` marks the non-steps (0,0). Replaces a linear scan of [`DELTAS`] on the
+/// per-pop and grid-build paths.
+const DIR_LUT: [u8; 9] = [
+    5, 1, 6,       // dy = -1: (-1,-1) BL, (0,-1) B, (1,-1) BR
+    0, u8::MAX, 2, // dy =  0: (-1, 0) L,  (0, 0) -, (1, 0) R
+    4, 3, 7,       // dy = +1: (-1, 1) TL, (0, 1) T, (1, 1) TR
+];
+
+#[inline(always)]
 fn dir_of(dx: i32, dy: i32) -> Option<usize> {
-    DELTAS.iter().position(|&(x, y)| x == dx && y == dy)
+    if !(-1..=1).contains(&dx) || !(-1..=1).contains(&dy) {
+        return None;
+    }
+    let d = DIR_LUT[((dy + 1) * 3 + (dx + 1)) as usize];
+    if d == u8::MAX { None } else { Some(d as usize) }
+}
+
+/// Grid-arrival direction code of `node` reached from `parent` over a NON-walk edge
+/// (macro, fairy hop, global teleport): `dir + 1` when `parent` is a same-plane
+/// 8-neighbour of `node`, else 0 (entry arrival, full successor mask). This is exactly
+/// the direction [`CanonicalGrid::succ_bits`] recovers from coordinates, so storing it
+/// with the parent link at relax time lets the pop use [`CanonicalGrid::succ_for`] with
+/// no coordinate loads (walk arrivals store their slot direction directly).
+#[inline]
+pub fn arrival_code(coords: &[u32], parent: u32, node: u32) -> u8 {
+    if parent == u32::MAX {
+        return 0;
+    }
+    let (px, py, pp) = unpack_coord(coords[parent as usize]);
+    let (ux, uy, up) = unpack_coord(coords[node as usize]);
+    if pp != up {
+        return 0;
+    }
+    match dir_of(ux - px, uy - py) {
+        Some(d) => d as u8 + 1,
+        None => 0,
+    }
 }
 
 /// Load-derived canonical grid: effective outgoing masks + strict-domination
@@ -132,6 +168,24 @@ impl CanonicalGrid {
         macro_src: &[u32],
         macro_dst: &[u32],
         macro_w: &[f32],
+    ) -> Result<CanonicalGrid, String> {
+        Self::build_opts(nodes, coords, walk_offsets, walk_dst, macro_src, macro_dst, macro_w, true)
+    }
+
+    /// [`CanonicalGrid::build`], optionally without the jump-point tie-pruned table
+    /// (`with_jps = false`): saves its 8 B/node and most of the table-fill time (the
+    /// strict-domination scan can stop at the first strictly cheaper detour). A grid
+    /// built without it serves canonical pruning only ([`CanonicalGrid::has_jps`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_opts(
+        nodes: usize,
+        coords: &[u32],
+        walk_offsets: &[u32],
+        walk_dst: &[u32],
+        macro_src: &[u32],
+        macro_dst: &[u32],
+        macro_w: &[f32],
+        with_jps: bool,
     ) -> Result<CanonicalGrid, String> {
         if coords.len() < nodes || walk_offsets.len() < nodes + 1 {
             return Err("coords/offsets shorter than node count".into());
@@ -184,17 +238,27 @@ impl CanonicalGrid {
         // ---- Stage 2a: strict-domination successor table ----
         // succ chunks are disjoint per node range: plain scoped threads, deterministic.
         let mut succ = vec![0u8; nodes * 8];
-        let mut succ_jps = vec![0u8; nodes * 8];
+        let mut succ_jps = if with_jps { vec![0u8; nodes * 8] } else { Vec::new() };
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
         let chunk = nodes.div_ceil(threads.max(1)).max(1);
         let masks_ref = &masks;
         std::thread::scope(|scope| {
-            for ((ci, out), out_jps) in succ.chunks_mut(chunk * 8).enumerate().zip(succ_jps.chunks_mut(chunk * 8)) {
+            let mut jps_chunks = succ_jps.chunks_mut(chunk * 8);
+            for (ci, out) in succ.chunks_mut(chunk * 8).enumerate() {
                 let base = ci * chunk;
+                let out_jps = if with_jps { jps_chunks.next() } else { None };
                 scope.spawn(move || {
-                    for ((local, row), row_jps) in out.chunks_mut(8).enumerate().zip(out_jps.chunks_mut(8)) {
-                        let u = base + local;
-                        fill_succ_row(u, coords, walk_offsets, walk_dst, masks_ref, row, row_jps);
+                    match out_jps {
+                        Some(out_jps) => {
+                            for ((local, row), row_jps) in out.chunks_mut(8).enumerate().zip(out_jps.chunks_mut(8)) {
+                                fill_succ_row(base + local, coords, walk_offsets, walk_dst, masks_ref, row, Some(row_jps));
+                            }
+                        }
+                        None => {
+                            for (local, row) in out.chunks_mut(8).enumerate() {
+                                fill_succ_row(base + local, coords, walk_offsets, walk_dst, masks_ref, row, None);
+                            }
+                        }
                     }
                 });
             }
@@ -213,50 +277,76 @@ impl CanonicalGrid {
 
     /// Precompute the JPS+ jump tables from `succ_jps` and the stop bitmap. Each
     /// direction is one linear pass in an order where the neighbour along `d` has
-    /// already been resolved (node ids ascend with (plane, y, x), so directions with
-    /// +y or (+x, y=0) are processed in descending id order, the rest ascending);
-    /// cardinals first because a diagonal step is a jump point when a cardinal
-    /// sub-run from it reaches one. Call after [`CanonicalGrid::add_stop_nodes`].
-    pub fn build_jump_tables(&mut self, offsets: &[u32], dst: &[u32]) {
+    /// already been resolved: a RASTER (plane, y, x) sweep, so directions with +y or
+    /// (+x, y=0) are processed in descending raster order, the rest ascending; cardinals
+    /// first because a diagonal step is a jump point when a cardinal sub-run from it
+    /// reaches one. Node ids are not raster-ordered (Morton numbering), so the sweep
+    /// goes through a raster-sorted id permutation. Call after
+    /// [`CanonicalGrid::add_stop_nodes`].
+    pub fn build_jump_tables(&mut self, offsets: &[u32], dst: &[u32], coords: &[u32]) {
+        assert!(self.has_jps(), "build_jump_tables needs a grid built with the jump-point table");
         let n = self.masks.len();
-        let mut jd = vec![0i16; n * 8];
-        let mut jt = vec![0u32; n * 8];
-        // Cardinals first, then diagonals; descending for +y / +x directions.
-        const ORDER: [(usize, bool); 8] = [(2, true), (3, true), (0, false), (1, false), (7, true), (4, true), (5, false), (6, false)];
-        for (d, descending) in ORDER {
+        let mut order: Vec<(u32, u32)> = (0..n).map(|u| (raster_key(coords[u]), u as u32)).collect();
+        order.sort_unstable();
+        let order: Vec<u32> = order.into_iter().map(|(_, u)| u).collect();
+        // One pass per direction, each writing only its own (dist, to) column: the four
+        // cardinal passes are independent, and the diagonal passes only read the
+        // finished cardinal columns — so each group runs its four directions in
+        // parallel, and the columns are interleaved into the `u*8 + d` layout at the end.
+        let this = &*self;
+        let order = &order;
+        let pass = |d: usize, card: &[(Vec<i16>, Vec<u32>)]| -> (Vec<i16>, Vec<u32>) {
+            let descending = matches!(d, 2 | 3 | 4 | 7);
             let natural: u8 = if d < 4 {
                 1u8 << d
             } else {
                 let (c1, c2) = DIAG_COMPONENTS[d - 4];
                 (1u8 << d) | (1u8 << c1) | (1u8 << c2)
             };
-            let mut u = if descending { n } else { 0 };
-            for _ in 0..n {
-                if descending { u -= 1; }
-                let Some(v) = self.step(u, d, offsets, dst) else {
-                    jd[u * 8 + d] = 0;
-                    jt[u * 8 + d] = u as u32;
-                    if !descending { u += 1; }
+            let mut jd = vec![0i16; n];
+            let mut jt = vec![0u32; n];
+            for i in 0..n {
+                let u = order[if descending { n - 1 - i } else { i }] as usize;
+                let Some(v) = this.step(u, d, offsets, dst) else {
+                    jd[u] = 0;
+                    jt[u] = u as u32;
                     continue;
                 };
-                let sv = self.succ_jps[v * 8 + d];
-                let mut is_jp = self.is_stop(v) || (sv & !natural) != 0;
+                let sv = this.succ_jps[v * 8 + d];
+                let mut is_jp = this.is_stop(v) || (sv & !natural) != 0;
                 if !is_jp && d >= 4 {
                     let (c1, c2) = DIAG_COMPONENTS[d - 4];
-                    is_jp = (sv & (1 << c1) != 0 && jd[v * 8 + c1] > 0) || (sv & (1 << c2) != 0 && jd[v * 8 + c2] > 0);
+                    is_jp = (sv & (1 << c1) != 0 && card[c1].0[v] > 0) || (sv & (1 << c2) != 0 && card[c2].0[v] > 0);
                 }
                 let (dist, to) = if is_jp {
                     (1i16, v as u32)
                 } else if sv & (1 << d) == 0 {
                     (-1i16, v as u32)
                 } else {
-                    let dv = jd[v * 8 + d];
+                    let dv = jd[v];
                     debug_assert!(dv != 0, "continuable run must have a resolved successor");
-                    (if dv > 0 { dv.saturating_add(1) } else { dv.saturating_sub(1) }, jt[v * 8 + d])
+                    (if dv > 0 { dv.saturating_add(1) } else { dv.saturating_sub(1) }, jt[v])
                 };
-                jd[u * 8 + d] = dist;
-                jt[u * 8 + d] = to;
-                if !descending { u += 1; }
+                jd[u] = dist;
+                jt[u] = to;
+            }
+            (jd, jt)
+        };
+        let cardinals: Vec<(Vec<i16>, Vec<u32>)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..4).map(|d| sc.spawn(move || pass(d, &[]))).collect();
+            hs.into_iter().map(|h| h.join().expect("jump-table pass panicked")).collect()
+        });
+        let diagonals: Vec<(Vec<i16>, Vec<u32>)> = std::thread::scope(|sc| {
+            let card = &cardinals;
+            let hs: Vec<_> = (4..8).map(|d| sc.spawn(move || pass(d, card))).collect();
+            hs.into_iter().map(|h| h.join().expect("jump-table pass panicked")).collect()
+        });
+        let mut jd = vec![0i16; n * 8];
+        let mut jt = vec![0u32; n * 8];
+        for (d, (cd, ct)) in cardinals.iter().chain(diagonals.iter()).enumerate() {
+            for u in 0..n {
+                jd[u * 8 + d] = cd[u];
+                jt[u * 8 + d] = ct[u];
             }
         }
         self.jump_dist = jd;
@@ -272,13 +362,28 @@ impl CanonicalGrid {
         if self.jump_dist.is_empty() {
             return self.jump_walk(u, d, goal, offsets, dst);
         }
+        self.jump_from(u, unpack_coord(coords[u]), d, goal, unpack_coord(coords[goal]), coords)
+    }
+
+    /// [`CanonicalGrid::jump`] with the expanded node's and the goal's coordinates
+    /// already unpacked (the engine unpacks the goal once per search and the popped
+    /// node once per expansion instead of once per direction). Requires the JPS+
+    /// tables.
+    #[inline]
+    pub fn jump_from(
+        &self,
+        u: usize,
+        (ux, uy, up): (i32, i32, i32),
+        d: usize,
+        goal: usize,
+        (gx, gy, gp): (i32, i32, i32),
+        coords: &[u32],
+    ) -> Option<(usize, u32)> {
         let k = self.jump_dist[u * 8 + d];
         if k == 0 {
             return None;
         }
         let n = k.unsigned_abs() as u32;
-        let (ux, uy, up) = unpack_coord(coords[u]);
-        let (gx, gy, gp) = unpack_coord(coords[goal]);
         if up == gp {
             let (dx, dy) = DELTAS[d];
             let (ex, ey) = (gx - ux, gy - uy);
@@ -293,35 +398,42 @@ impl CanonicalGrid {
                     return Some((goal, ix as u32));
                 }
                 let (c1, c2) = DIAG_COMPONENTS[d - 4];
-                let mut best: Option<u32> = None;
+                // (steps along the run, node there): the earliest diagonal node from
+                // which a straight cardinal run reaches the goal.
+                let mut best: Option<(u32, usize)> = None;
                 // Goal's row is reached at step iy; then a horizontal run of `rem`.
                 if iy >= 1 && (iy as u32) <= n {
                     let rem = (ex - iy * dx) * dx;
                     if rem >= 1 {
                         if let Some(ni) = find_node(coords, ux + iy * dx, uy + iy * dy, up) {
                             if rem as u32 <= self.jump_dist[ni * 8 + c1].unsigned_abs() as u32 {
-                                best = Some(iy as u32);
+                                best = Some((iy as u32, ni));
                             }
                         }
                     }
                 }
                 if ix >= 1 && (ix as u32) <= n {
                     let rem = (ey - ix * dy) * dy;
-                    if rem >= 1 && best.map_or(true, |b| (ix as u32) < b) {
+                    if rem >= 1 && best.is_none_or(|(b, _)| (ix as u32) < b) {
                         if let Some(ni) = find_node(coords, ux + ix * dx, uy + ix * dy, up) {
                             if rem as u32 <= self.jump_dist[ni * 8 + c2].unsigned_abs() as u32 {
-                                best = Some(ix as u32);
+                                best = Some((ix as u32, ni));
                             }
                         }
                     }
                 }
-                if let Some(i) = best {
-                    let ni = find_node(coords, ux + i as i32 * dx, uy + i as i32 * dy, up).expect("node on the run");
+                if let Some((i, ni)) = best {
                     return Some((ni, i));
                 }
             }
         }
         if k > 0 { Some((self.jump_to[u * 8 + d] as usize, n)) } else { None }
+    }
+
+    /// Whether the jump-point tie-pruned table was built (see [`CanonicalGrid::build_opts`]).
+    #[inline]
+    pub fn has_jps(&self) -> bool {
+        !self.succ_jps.is_empty()
     }
 
     /// Mark extra nodes a jump must stop at (fairy ring nodes; any superset is safe).
@@ -416,6 +528,19 @@ impl CanonicalGrid {
         }
     }
 
+    /// Successor direction bits for `node` entered with direction code `dcode`
+    /// (0 = entry arrival: seed / non-adjacent parent => full mask; else direction
+    /// index + 1). Identical to [`CanonicalGrid::succ_bits`] for the parent the code
+    /// was derived from, without its coordinate loads.
+    #[inline(always)]
+    pub fn succ_for(&self, node: usize, dcode: u8) -> u8 {
+        if dcode == 0 {
+            self.masks[node]
+        } else {
+            self.succ[node * 8 + (dcode as usize - 1)]
+        }
+    }
+
     /// Successor direction bits for `node` given its stored parent, or the full mask
     /// for entry arrivals (no parent / non-adjacent parent — seeds, teleports, macro
     /// and fairy hops, cross-plane moves).
@@ -448,8 +573,9 @@ fn fill_succ_row(
     walk_dst: &[u32],
     masks: &[u8],
     row: &mut [u8],
-    row_jps: &mut [u8],
+    mut row_jps: Option<&mut [u8]>,
 ) {
+    let with_jps = row_jps.is_some();
     let mask_u = masks[u];
     let (ux, uy, up) = unpack_coord(coords[u]);
 
@@ -468,7 +594,9 @@ fn fill_succ_row(
         let rev = dir_of(-pdx, -pdy).unwrap();
         let Some(p) = step(u, mask_u, rev) else {
             row[din] = mask_u;
-            row_jps[din] = mask_u;
+            if let Some(rj) = row_jps.as_deref_mut() {
+                rj[din] = mask_u;
+            }
             continue;
         };
         debug_assert_eq!(unpack_coord(coords[p]), (px, py, up));
@@ -498,6 +626,9 @@ fn fill_succ_row(
                     dominated_jps = true;
                 }
             }
+            // Without the jump-point table only strict domination matters, so the scan
+            // may stop at the first strictly cheaper detour (`dominated` then implies
+            // `dominated_jps`, which is what the loop condition tests).
             if !dominated_jps {
                 for xd in 0..8 {
                     let (xdx, xdy) = DELTAS[xd];
@@ -521,6 +652,9 @@ fn fill_succ_row(
                     }
                 }
             }
+            if !with_jps {
+                dominated_jps = dominated;
+            }
             if !dominated {
                 keep |= 1 << c;
             }
@@ -529,7 +663,9 @@ fn fill_succ_row(
             }
         }
         row[din] = keep;
-        row_jps[din] = keep_jps;
+        if let Some(rj) = row_jps.as_deref_mut() {
+            rj[din] = keep_jps;
+        }
     }
 }
 
@@ -606,7 +742,7 @@ mod tests {
         let (offsets, dst) = csr_of(&coords, allow);
         let n = coords.len();
         g.add_stop_nodes(&[coords.binary_search(&pack_coord(2, 2, 0)).unwrap() as u32, coords.binary_search(&pack_coord(8, 12, 0)).unwrap() as u32]);
-        g.build_jump_tables(&offsets, &dst);
+        g.build_jump_tables(&offsets, &dst, &coords);
         assert_eq!(g.jump_dist.len(), n * 8);
         let mut checked = 0usize;
         for u in 0..n {

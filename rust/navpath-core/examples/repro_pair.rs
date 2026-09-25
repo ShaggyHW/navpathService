@@ -7,6 +7,24 @@ use navpath_core::engine::neighbors::NeighborProvider;
 use navpath_core::engine::search::{BidirParams, SearchContext, SearchParams};
 use navpath_core::{EngineView, Snapshot};
 
+// Production allocator (the service and builder both run on mimalloc; efficiency audit
+// T5.14) so allocation-heavy paths are timed as they run in production.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Pre-fault the snapshot like the service does at load, so timings measure the engine
+/// rather than disk reads (efficiency audit T5.9). `NAVPATH_HARNESS_COLD=1` skips it for
+/// cold-cache studies.
+fn warm_snapshot(snap: &Snapshot) {
+    if std::env::var("NAVPATH_HARNESS_COLD").ok().as_deref() == Some("1") {
+        eprintln!("NAVPATH_HARNESS_COLD=1: snapshot not pre-faulted");
+        return;
+    }
+    let t = std::time::Instant::now();
+    let bytes = snap.populate();
+    eprintln!("snapshot pre-faulted: {:.0} MiB in {:?}", bytes as f64 / (1 << 20) as f64, t.elapsed());
+}
+
 fn parse_globals(snap: &Snapshot) -> Vec<(u32, f32)> {
     let msrc = snap.macro_src();
     let mdst = snap.macro_dst();
@@ -43,6 +61,7 @@ fn main() {
     let path = std::env::var("NAVPATH_BENCH_SNAPSHOT")
         .unwrap_or_else(|_| format!("{}/../../graph.snapshot", env!("CARGO_MANIFEST_DIR")));
     let snap = Snapshot::open(&path).expect("open snapshot");
+    warm_snapshot(&snap);
     let nodes = snap.counts().nodes as usize;
     let s = snap.find_node(sx, sy, sp).expect("start not in snapshot");
     let g = snap.find_node(gx, gy, gp).expect("goal not in snapshot");

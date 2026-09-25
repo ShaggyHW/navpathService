@@ -1,5 +1,5 @@
 {
-  "snapshot_hash": "2018eedb602a2fe6d5133c59594f305741969afd4ecfcb0c96c9ea444594a5ec",
+  "snapshot_hash": "c91d8c16654035ec75d46a46117804f96bccbbf7fec3e9ab9469254220e5e4cb",
   "entries": [
     {
       "name": "readme_route_al_kharid",
@@ -38,7 +38,7 @@
       "expect": {
         "found": true,
         "cost_unseeded": 18866.009765625,
-        "pops_max": 7000
+        "pops_max": 6000
       }
     },
     {
@@ -58,7 +58,7 @@
       "expect": {
         "found": true,
         "cost_unseeded": 67182.21875,
-        "pops_max": 111000
+        "pops_max": 6000
       }
     },
     {
@@ -77,7 +77,7 @@
       "quick_tele": true,
       "expect": {
         "found": false,
-        "pops_max": 2456000
+        "pops_max": 1365000
       }
     },
     {
@@ -97,7 +97,7 @@
       "expect": {
         "found": true,
         "cost_unseeded": 67182.21875,
-        "pops_max": 111000
+        "pops_max": 6000
       }
     },
     {
@@ -117,7 +117,7 @@
       "expect": {
         "found": true,
         "cost_unseeded": 62347.08984375,
-        "pops_max": 46000
+        "pops_max": 47000
       }
     },
     {
@@ -177,7 +177,7 @@
       "expect": {
         "found": true,
         "cost_unseeded": 8924.263671875,
-        "entry": 962821,
+        "entry": 988415,
         "pops_max": 5000
       }
     },

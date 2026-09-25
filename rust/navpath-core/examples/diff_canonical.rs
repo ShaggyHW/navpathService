@@ -7,6 +7,8 @@
 //!   cargo run --release -p navpath-core --example diff_canonical -- 500
 //!
 //! Also reports the pops and wall-time deltas — the Stage 2a go/no-go measurement.
+//! The two variants alternate which runs first on each pair, so neither is
+//! systematically timed with the other's cache warm-up.
 
 use std::sync::Arc;
 
@@ -14,6 +16,24 @@ use navpath_core::engine::canonical::CanonicalGrid;
 use navpath_core::engine::neighbors::{NeighborProvider, WalkGraph};
 use navpath_core::engine::search::{BidirParams, SearchContext, SearchParams};
 use navpath_core::{EngineView, Snapshot};
+
+// Production allocator (the service and builder both run on mimalloc; efficiency audit
+// T5.14) so allocation-heavy paths are timed as they run in production.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Pre-fault the snapshot like the service does at load, so timings measure the engine
+/// rather than disk reads (efficiency audit T5.9). `NAVPATH_HARNESS_COLD=1` skips it for
+/// cold-cache studies.
+fn warm_snapshot(snap: &Snapshot) {
+    if std::env::var("NAVPATH_HARNESS_COLD").ok().as_deref() == Some("1") {
+        eprintln!("NAVPATH_HARNESS_COLD=1: snapshot not pre-faulted");
+        return;
+    }
+    let t = std::time::Instant::now();
+    let bytes = snap.populate();
+    eprintln!("snapshot pre-faulted: {:.0} MiB in {:?}", bytes as f64 / (1 << 20) as f64, t.elapsed());
+}
 
 fn parse_globals(snap: &Snapshot) -> Vec<(u32, f32)> {
     let msrc = snap.macro_src();
@@ -55,6 +75,7 @@ fn main() {
     let path = std::env::var("NAVPATH_BENCH_SNAPSHOT")
         .unwrap_or_else(|_| format!("{}/../../graph.snapshot", env!("CARGO_MANIFEST_DIR")));
     let snap = Snapshot::open(&path).expect("open snapshot");
+    warm_snapshot(&snap);
     let nodes = snap.counts().nodes as usize;
 
     let t = std::time::Instant::now();
@@ -172,18 +193,38 @@ fn main() {
             start: s, goal: g, macro_filter: filter, seed: None,
             max_pops: Some(1_500_000), cancel: None, bucket_ms: 0.0,
         };
-        let t0 = std::time::Instant::now();
-        let a = full.astar(params(), &mut ctx);
-        t_full += t0.elapsed();
-        let t0 = std::time::Instant::now();
-        let b = canon.astar(params(), &mut ctx);
-        t_canon += t0.elapsed();
-        let t0 = std::time::Instant::now();
-        let abi = full.astar_bidir(&bp, params(), &mut cf, &mut cb);
-        t_full_bi += t0.elapsed();
-        let t0 = std::time::Instant::now();
-        let bbi = canon.astar_bidir(&bp, params(), &mut cf, &mut cb);
-        t_canon_bi += t0.elapsed();
+        // Alternate which variant runs first on each pair (efficiency audit T5.10): the
+        // second search of a pair finds the pair's ALT rows / CSR / context pages already
+        // cached, so a fixed order systematically flatters whichever variant runs second.
+        let canon_first = checked.is_multiple_of(2);
+        let uni = |v: &EngineView, ctx: &mut SearchContext| {
+            let t0 = std::time::Instant::now();
+            let r = v.astar(params(), ctx);
+            (r, t0.elapsed())
+        };
+        let bidir = |v: &EngineView, cf: &mut SearchContext, cb: &mut SearchContext| {
+            let t0 = std::time::Instant::now();
+            let r = v.astar_bidir(&bp, params(), cf, cb);
+            (r, t0.elapsed())
+        };
+        let ((a, ta), (b, tb)) = if canon_first {
+            let second = uni(&canon, &mut ctx);
+            (uni(&full, &mut ctx), second)
+        } else {
+            let first = uni(&full, &mut ctx);
+            (first, uni(&canon, &mut ctx))
+        };
+        let ((abi, tabi), (bbi, tbbi)) = if canon_first {
+            let second = bidir(&canon, &mut cf, &mut cb);
+            (bidir(&full, &mut cf, &mut cb), second)
+        } else {
+            let first = bidir(&full, &mut cf, &mut cb);
+            (first, bidir(&canon, &mut cf, &mut cb))
+        };
+        t_full += ta;
+        t_canon += tb;
+        t_full_bi += tabi;
+        t_canon_bi += tbbi;
 
         pops_full += a.pops as u64;
         pops_canon += b.pops as u64;

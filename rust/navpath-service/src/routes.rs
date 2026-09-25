@@ -62,29 +62,6 @@ fn req_has_quick_tele(reqs: &[RequirementKV]) -> bool {
     false
 }
 
-/// Parse a macro edge's metadata once and return it if the profile satisfies the edge's
-/// requirements (missing/unparseable metadata counts as allowed, matching the search's
-/// fail-open handling of empty requirement lists). None = edge not allowed.
-fn macro_edge_meta_if_allowed(
-    snap: &navpath_core::Snapshot,
-    macro_idx: usize,
-    req_id_to_tag_idx: &crate::FxHashMap<u32, usize>,
-    mask: &navpath_core::eligibility::EligibilityMask,
-) -> Option<serde_json::Value> {
-    let Some(bytes) = snap.macro_meta_at(macro_idx) else { return Some(serde_json::json!({})); };
-    let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) else { return Some(serde_json::json!({})); };
-    if let Some(arr) = val.get("requirements").and_then(|v| v.as_array()) {
-        for ridv in arr {
-            let Some(rid) = ridv.as_u64() else { continue; };
-            let Some(&tag_idx) = req_id_to_tag_idx.get(&(rid as u32)) else { return None; };
-            if !mask.is_satisfied(tag_idx) {
-                return None;
-            }
-        }
-    }
-    Some(val)
-}
-
 #[derive(Debug, Deserialize, Default)]
 pub struct RouteOptions {
     #[serde(default)]
@@ -633,7 +610,9 @@ pub struct Counts {
 pub struct RouteResponse {
     pub found: bool,
     pub cost: f32,
-    #[serde(skip_serializing_if = "Vec::is_empty")] pub path: Vec<u32>,
+    /// The node-id path, pre-serialized with the payload (T3.13). Absent when empty or
+    /// with `only_actions` — exactly where the old `Vec<u32>` field was skipped.
+    #[serde(skip_serializing_if = "Option::is_none")] pub path: Option<Box<serde_json::value::RawValue>>,
     pub length_tiles: usize,
     pub duration_ms: u128,
     /// Same clock as `duration_ms`, in microseconds (sub-ms routes read as 0 there).
@@ -642,16 +621,36 @@ pub struct RouteResponse {
     /// ("budget_exceeded" or "cancelled"). With found=false the goal may still be
     /// reachable; with found=true the returned path is valid but was not proven
     /// optimal (the search was truncated mid-proof). Absent on proven outcomes.
-    #[serde(skip_serializing_if = "Option::is_none")] pub reason: Option<String>,
-    /// Present when a request-level guarantee was traded for an answer. Currently only
-    /// "seed_dropped": the request sent a seed, both seeded attempts exhausted their
-    /// budgets, and the served route is the deterministic unseeded optimum.
-    #[serde(skip_serializing_if = "Option::is_none")] pub degraded: Option<String>,
-    /// Pre-serialized in the blocking task (`RawValue` embeds verbatim), so the multi-KB
+    #[serde(skip_serializing_if = "Option::is_none")] pub reason: Option<&'static str>,
+    /// Present when a request-level guarantee was traded for an answer: "seed_dropped"
+    /// (the request sent a seed, both seeded attempts exhausted their budgets, and the
+    /// served route is the deterministic unseeded optimum) or "seed_ignored" (the
+    /// server runs with `--no-seed`).
+    #[serde(skip_serializing_if = "Option::is_none")] pub degraded: Option<&'static str>,
+    /// Pre-serialized off the reactor (`RawValue` embeds verbatim), so the multi-KB
     /// action list / geometry never serialize on the reactor thread. Bytes are identical
     /// to serializing the typed values here — same serializer, same values.
     #[serde(skip_serializing_if = "Option::is_none")] pub actions: Option<Box<serde_json::value::RawValue>>,
     #[serde(skip_serializing_if = "Option::is_none")] pub geometry: Option<Box<serde_json::value::RawValue>>,
+}
+
+/// Serialize a response body ONCE into a buffer sized up front (T3.13), with the
+/// headers and error handling of axum's `Json` responder — the bytes on the wire are
+/// identical, but the pre-serialized multi-KB parts are copied a single time instead of
+/// into a 128-byte buffer that grows by doubling.
+fn json_response<T: Serialize>(value: &T, size_hint: usize) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    use axum::response::IntoResponse;
+    let mut buf = Vec::with_capacity(size_hint);
+    match serde_json::to_writer(&mut buf, value) {
+        Ok(()) => ([(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))], buf).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"))],
+            err.to_string(),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -847,76 +846,74 @@ fn global_step_kind(meta: &serde_json::Value) -> &str {
         .unwrap_or("global_teleport")
 }
 
-/// Build the optional actions/geometry payload for a found route. Runs inside the
-/// request's blocking task so thousands of per-step constructions never stall the
-/// async reactor threads. Emits typed [`Action`]s serialized directly by serde
-/// (roadmap 5.3) — no per-tile/per-action `serde_json::Value` assembly.
-#[allow(clippy::too_many_arguments)]
-fn build_route_payload(
-    snap: &navpath_core::Snapshot,
-    globals: &[engine_adapter::GlobalTeleport],
-    macro_lookup: &crate::FxHashMap<(u32, u32), Vec<u32>>,
-    fairy_rings: &[engine_adapter::FairyRing],
-    node_to_fairy_ring: &crate::FxHashMap<u32, usize>,
-    req_id_to_tag_idx: &crate::FxHashMap<u32, usize>,
+/// The eligible global teleport landing on `dst` with the lowest effective cost
+/// (quick-tele lodestones at 2400 ms), with its load-time-parsed metadata. Ties keep the
+/// first teleport in snapshot order — the strict `<` replacement rule of the per-payload
+/// maps this lookup replaces (T3.8). Called only for the rare path steps that are neither
+/// walk nor macro edges, and for a virtual start's entry, so a scan over the ~124
+/// globals beats building two hash maps on every payload.
+fn eligible_global_to<'g>(
+    globals: &'g [engine_adapter::GlobalTeleport],
     mask: &navpath_core::eligibility::EligibilityMask,
     quick_tele: bool,
-    return_geometry: bool,
-    only_actions: bool,
-    surge: &SurgeConfig,
-    dive: &DiveConfig,
-    virtual_start_from: Option<(i32, i32, i32)>,
+    dst: u32,
+) -> Option<(f32, &'g Arc<serde_json::Value>)> {
+    let mut best: Option<(f32, &'g Arc<serde_json::Value>)> = None;
+    for g in globals {
+        if g.dst != dst || g.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
+            continue;
+        }
+        let cost = if quick_tele && g.kind_first == 2 { 2400.0 } else { g.cost };
+        if best.is_none_or(|(c, _)| cost < c) {
+            best = Some((cost, &g.meta));
+        }
+    }
+    best
+}
+
+/// Build the optional actions/geometry payload for a route. Runs in the request's
+/// blocking task (or inline for small cache hits) so thousands of per-step
+/// constructions never stall the async reactor threads. Emits typed [`Action`]s
+/// serialized directly by serde (roadmap 5.3) — no per-tile/per-action
+/// `serde_json::Value` assembly. `path` may be a slice of a cached path.
+fn build_route_payload(
+    job: &RouteJob,
+    found: bool,
+    path: &[u32],
     virtual_entry: Option<u32>,
-    sid: u32,
-    res: &navpath_core::SearchResult,
 ) -> (Option<Vec<Action>>, Option<Vec<[i32; 3]>>) {
-    if !res.found {
+    if !found {
         return (None, None);
     }
+    let snap: &navpath_core::Snapshot = job.snap();
+    let globals: &[engine_adapter::GlobalTeleport] = &job.cur.globals;
+    let macro_lookup: &engine_adapter::MacroLookup = &job.cur.macro_lookup;
+    let fairy_rings: &[engine_adapter::FairyRing] = &job.cur.fairy_rings;
+    let node_to_fairy_ring = &job.cur.node_to_fairy_ring;
+    let mask = &job.mask;
+    let quick_tele = job.quick_tele;
 
     let coord = |id: u32| -> (i32, i32, i32) { snap.node_coord(id) };
 
     let mut geometry: Option<Vec<[i32; 3]>> = None;
-    if return_geometry {
-        let mut geom: Vec<[i32; 3]> = Vec::with_capacity(res.path.len());
-        for &id in &res.path {
+    if job.return_geometry {
+        let mut geom: Vec<[i32; 3]> = Vec::with_capacity(path.len());
+        for &id in path {
             let (x, y, p) = coord(id);
             geom.push([x, y, p]);
         }
         geometry = Some(geom);
     }
 
-    if !(only_actions || return_geometry) {
+    if !(job.only_actions || job.return_geometry) {
         return (None, geometry);
     }
 
-    // Eligible global teleports for action annotation, from the metadata parsed once
-    // at snapshot load (no per-request 113KB JSON re-parse). Metadata stays behind the
-    // shared Arc — serialization reads through it, so nothing is deep-cloned here.
-    let mut global_cost: crate::FxHashMap<u32, f32> = crate::FxHashMap::default();
-    let mut global_meta: crate::FxHashMap<u32, Arc<serde_json::Value>> = crate::FxHashMap::default();
-    for g in globals.iter() {
-        if g.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
-            continue;
-        }
-        let mut cost = g.cost;
-        if quick_tele && g.kind_first == 2 {
-            cost = 2400.0;
-        }
-        let should_replace = global_cost.get(&g.dst).map(|c| cost < *c).unwrap_or(true);
-        if should_replace {
-            global_cost.insert(g.dst, cost);
-            global_meta.insert(g.dst, g.meta.clone());
-        }
-    }
-
-    let mut acts: Vec<Action> = Vec::with_capacity(res.path.len().saturating_sub(1));
-
-    // If we used a virtual start (non-existent start coordinate), we'll need to add the teleport action later
-    // after we determine the actual teleport type from the first real action
+    // If we used a virtual start (non-existent start coordinate), the synthetic teleport
+    // action goes first; it is completed after the loop from the winning entry teleport.
     let mut virtual_start_action: Option<VirtualStartAction> = None;
-    if let Some((vsx, vsy, vsp)) = virtual_start_from {
-        let entry_id = virtual_entry.unwrap_or(sid);
+    if let Some((vsx, vsy, vsp)) = job.virtual_start_from {
+        let entry_id = virtual_entry.unwrap_or(job.sid);
         let (actual_x, actual_y, actual_p) = coord(entry_id);
         virtual_start_action = Some(VirtualStartAction {
             kind: "global_teleport".to_string(),
@@ -927,36 +924,46 @@ fn build_route_payload(
         });
     }
 
-    for w in res.path.windows(2) {
+    let mut acts: Vec<Action> =
+        Vec::with_capacity(path.len().saturating_sub(1) + usize::from(virtual_start_action.is_some()));
+    if virtual_start_action.is_some() {
+        // Placeholder for slot 0, overwritten below (no `insert(0, ..)` shift).
+        acts.push(Action::Teleport(TeleportAction {
+            kind: "teleport",
+            from: MinMax::point(0, 0, 0),
+            to: MinMax::point(0, 0, 0),
+            cost_ms: 0,
+        }));
+    }
+
+    for w in path.windows(2) {
         let (u, v) = (w[0], w[1]);
         let (x1, y1, p1) = coord(u);
         let (x2, y2, p2) = coord(v);
 
         if let Some(idxs) = macro_lookup.get(&(u, v)) {
-            let mut chosen: Option<(usize, f32, serde_json::Value)> = None;
+            // Cheapest parallel edge the profile may use; requirement lists were decoded
+            // at load (T3.7), so no candidate's metadata is parsed here.
+            let mut chosen: Option<(usize, f32)> = None;
             for &idx_u32 in idxs {
                 let idx = idx_u32 as usize;
-                let Some(meta) = macro_edge_meta_if_allowed(snap, idx, &req_id_to_tag_idx, mask) else {
+                if !macro_lookup.allowed(idx, mask) {
                     continue;
-                };
+                }
                 let mut cost_ms = snap.macro_w().get(idx).copied().unwrap_or(0.0);
                 let k = snap.macro_kind_first().get(idx).copied().unwrap_or(0);
                 if quick_tele && k == 2 {
                     cost_ms = 2400.0;
                 }
-                if chosen.as_ref().map_or(true, |(_, best_cost, _)| cost_ms < *best_cost) {
-                    chosen = Some((idx, cost_ms, meta));
+                if chosen.is_none_or(|(_, best_cost)| cost_ms < best_cost) {
+                    chosen = Some((idx, cost_ms));
                 }
             }
-            let (idx, mut cost_ms, mut meta) = if let Some(best) = chosen {
-                best
-            } else {
+            let (idx, mut cost_ms) = chosen.unwrap_or_else(|| {
                 let idx = idxs.first().copied().unwrap_or(0) as usize;
-                let meta = snap.macro_meta_at(idx)
-                    .and_then(|b| serde_json::from_slice(b).ok())
-                    .unwrap_or(serde_json::json!({}));
-                (idx, snap.macro_w().get(idx).copied().unwrap_or(0.0), meta)
-            };
+                (idx, snap.macro_w().get(idx).copied().unwrap_or(0.0))
+            });
+            let mut meta = macro_lookup.meta_value(snap, idx);
 
             let k = snap.macro_kind_first().get(idx).copied().unwrap_or(0);
             let kid = snap.macro_id_first().get(idx).copied().unwrap_or(0);
@@ -1026,11 +1033,9 @@ fn build_route_payload(
                     to: [x2, y2, p2],
                     cost_ms: w_cost.round() as f64,
                 }));
-            } else if let Some(gc) = global_cost.get(&v).copied() {
-                let meta: Arc<serde_json::Value> = global_meta
-                    .get(&v)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(serde_json::json!({})));
+            } else if let Some((gc, meta)) = eligible_global_to(globals, mask, quick_tele, v) {
+                // Metadata stays behind the shared Arc — serialization reads through it.
+                let meta = meta.clone();
                 // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
                 let kstr = global_step_kind(&meta);
                 let cost_ms = if quick_tele && kstr == "lodestone" { 2400.0 } else { gc as f64 };
@@ -1081,14 +1086,13 @@ fn build_route_payload(
         }
     }
 
-    // If we had a virtual start, add a synthetic first action derived from the selected global teleport metadata/cost.
+    // If we had a virtual start, fill slot 0 with the synthetic first action, derived from
+    // the selected global teleport's metadata/cost.
     if let Some(mut virtual_action) = virtual_start_action {
         if let Some(entry_id) = virtual_entry {
-            if let Some(gc) = global_cost.get(&entry_id).copied() {
+            if let Some((gc, meta)) = eligible_global_to(globals, mask, quick_tele, entry_id) {
                 virtual_action.cost_ms = serde_json::Number::from_f64(gc as f64)
                     .unwrap_or_else(|| serde_json::Number::from(0));
-            }
-            if let Some(meta) = global_meta.get(&entry_id) {
                 virtual_action.kind = global_step_kind(meta).to_string();
                 if let Some(obj) = virtual_action.metadata.as_object_mut() {
                     // The metadata subtree is mutated here, so this one clones out of
@@ -1097,32 +1101,252 @@ fn build_route_payload(
                 }
             }
         }
-        acts.insert(0, Action::VirtualStart(Box::new(virtual_action)));
+        acts[0] = Action::VirtualStart(Box::new(virtual_action));
     }
 
     // The tile the character stands on before the first action. For a virtual start the
     // synthetic teleport action already occupies index 0 and carries it, but on the normal
     // path nothing in `acts` records it — see `optimize_with_surge_dive`.
-    let route_origin = res.path.first().map(|&id| coord(id));
+    let route_origin = path.first().map(|&id| coord(id));
 
     // Apply surge/dive optimization to the actions
-    (Some(optimize_with_surge_dive(acts, surge, dive, route_origin)), geometry)
+    (Some(optimize_with_surge_dive(acts, &job.surge, &job.dive, route_origin)), geometry)
 }
 
-/// Everything the blocking task computes for one request; carried back to the handler
-/// for the response, metrics, and the log line.
-struct RouteTaskOut {
-    res: navpath_core::SearchResult,
-    virtual_entry: Option<u32>,
+/// Everything one route's search and payload work needs, shared by its blocking tasks
+/// behind ONE `Arc` (T3.15: the handler used to clone ~15 separate Arcs and the
+/// eligibility mask twice per request).
+struct RouteJob {
+    /// The snapshot generation this request resolved against (its snapshot is loaded).
+    cur: Arc<SnapshotState>,
+    /// Per-profile search artifacts; None on cache/sub-path hits (no search runs).
+    artifacts: Option<Arc<engine_adapter::ProfileArtifacts>>,
+    mask: navpath_core::eligibility::EligibilityMask,
+    sid: u32,
+    gid: u32,
+    used_virtual_start: bool,
+    seed: Option<u64>,
+    quick_tele: bool,
+    return_geometry: bool,
+    only_actions: bool,
+    surge: SurgeConfig,
+    dive: DiveConfig,
+    virtual_start_from: Option<(i32, i32, i32)>,
+    /// Fresh proven results are indexed for the sub-path cache (unseeded, on-graph start,
+    /// cache enabled) — in the blocking task, off the reactor (T3.6).
+    index_subpath: bool,
+}
+
+/// The pre-serialized halves of a response (T3.13).
+struct Payload {
+    path: Option<Box<serde_json::value::RawValue>>,
     actions: Option<Box<serde_json::value::RawValue>>,
     geometry: Option<Box<serde_json::value::RawValue>>,
+    payload_us: u64,
+}
+
+impl Payload {
+    fn len(&self) -> usize {
+        [&self.path, &self.actions, &self.geometry]
+            .iter()
+            .map(|p| p.as_ref().map_or(0, |r| r.get().len()))
+            .sum()
+    }
+}
+
+impl RouteJob {
+    fn snap(&self) -> &Arc<navpath_core::Snapshot> {
+        self.cur.snapshot.as_ref().expect("route jobs are only built for a loaded snapshot")
+    }
+
+    /// Build and serialize the payload for `path` (a full result or a cached slice).
+    fn payload(&self, found: bool, path: &[u32], virtual_entry: Option<u32>) -> Payload {
+        let t_payload = std::time::Instant::now();
+        let (actions, geometry) = build_route_payload(self, found, path, virtual_entry);
+        let actions = actions.map(|a| serde_json::value::to_raw_value(&a).expect("actions serialize"));
+        let geometry = geometry.map(|g| serde_json::value::to_raw_value(&g).expect("geometry serialize"));
+        // only_actions means exactly that: skip the duplicate node-id path in the payload.
+        let path = if self.only_actions || path.is_empty() {
+            None
+        } else {
+            Some(serde_json::value::to_raw_value(path).expect("path serialize"))
+        };
+        Payload { path, actions, geometry, payload_us: t_payload.elapsed().as_micros() as u64 }
+    }
+
+    /// One fresh search on `engine`, observing `cancel`. The contexts return to the pool
+    /// when this returns, before payload building.
+    fn run_search(
+        &self,
+        engine: engine_adapter::EngineChoice,
+        cancel: &std::sync::atomic::AtomicBool,
+        pool: &Arc<crate::ContextPool>,
+    ) -> (engine_adapter::SearchOutcome, Option<u32>) {
+        let arts = self.artifacts.as_ref().expect("profile artifacts resolved for fresh searches");
+        let cur = &self.cur;
+        let neighbors = cur.neighbors.clone().expect("neighbors are loaded with the snapshot");
+        let mut lease = pool.checkout();
+        if self.used_virtual_start {
+            engine_adapter::run_route_with_requirements_virtual_start(
+                self.snap().clone(),
+                neighbors,
+                cur.neighbors_rev.clone(),
+                self.gid,
+                self.seed,
+                Some(cancel),
+                arts,
+                cur.canonical_grid.clone(),
+                engine,
+                &mut lease,
+            )
+        } else {
+            (
+                engine_adapter::run_route_with_requirements_and_fairy_rings(
+                    self.snap().clone(),
+                    neighbors,
+                    cur.neighbors_rev.clone(),
+                    self.sid,
+                    self.gid,
+                    &self.mask,
+                    self.seed,
+                    Some(cancel),
+                    arts,
+                    cur.canonical_grid.clone(),
+                    engine,
+                    &mut lease,
+                ),
+                None,
+            )
+        }
+    }
+
+    /// Wrap a search outcome for the handler: share the result (one allocation for the
+    /// response, the route cache and the sub-path cache), index it for sub-path reuse,
+    /// and build + serialize the payload — all on the calling blocking thread.
+    fn finish(&self, outcome: engine_adapter::SearchOutcome, virtual_entry: Option<u32>, search_us: u64) -> RouteTaskOut {
+        let res = Arc::new(outcome.res);
+        let payload = self.payload(res.found, &res.path, virtual_entry);
+        let subpath_rec = if self.index_subpath { crate::PathRecord::new(res.clone()) } else { None };
+        RouteTaskOut {
+            res,
+            virtual_entry,
+            payload,
+            subpath_rec,
+            retried: outcome.retried,
+            attempts_pops: outcome.attempts_pops,
+            seed_dropped: outcome.seed_dropped,
+            engine: outcome.engine,
+            search_us,
+        }
+    }
+}
+
+/// Everything the blocking task computes for one fresh search; carried back to the
+/// handler for the caches, the response, metrics, and the log line.
+struct RouteTaskOut {
+    res: Arc<navpath_core::SearchResult>,
+    virtual_entry: Option<u32>,
+    payload: Payload,
+    subpath_rec: Option<Arc<crate::PathRecord>>,
     retried: bool,
     attempts_pops: [u32; 3],
     seed_dropped: bool,
     engine: &'static str,
     search_us: u64,
-    payload_us: u64,
 }
+
+/// A request answered without a search: a route-cache entry or a slice of a cached
+/// optimal path.
+enum Hit {
+    Cached(crate::RouteCacheEntry),
+    Subpath(crate::SubpathHit),
+}
+
+impl Hit {
+    fn path(&self) -> &[u32] {
+        match self {
+            Hit::Cached(e) => &e.res.path,
+            Hit::Subpath(h) => h.path(),
+        }
+    }
+}
+
+/// What the response, the metrics and the log line need from a finished request.
+struct Served {
+    found: bool,
+    status: navpath_core::SearchStatus,
+    cost: f32,
+    length_tiles: usize,
+    pops: u32,
+    pops_f: u32,
+    pops_b: u32,
+    retried: bool,
+    attempts_pops: [u32; 3],
+    seed_dropped: bool,
+    engine: &'static str,
+    search_us: u64,
+    payload: Payload,
+}
+
+impl Served {
+    fn from_hit(hit: &Hit, payload: Payload) -> Self {
+        match hit {
+            Hit::Cached(e) => Served {
+                found: e.res.found,
+                status: e.res.status,
+                cost: e.res.cost,
+                length_tiles: e.res.path.len(),
+                pops: e.res.pops,
+                pops_f: e.res.pops_f,
+                pops_b: e.res.pops_b,
+                retried: false,
+                attempts_pops: [0, 0, 0],
+                seed_dropped: e.seed_dropped,
+                engine: "cache",
+                search_us: 0,
+                payload,
+            },
+            Hit::Subpath(h) => Served {
+                found: true,
+                status: navpath_core::SearchStatus::Found,
+                cost: h.cost(),
+                length_tiles: h.pg - h.ps + 1,
+                pops: 0,
+                pops_f: 0,
+                pops_b: 0,
+                retried: false,
+                attempts_pops: [0, 0, 0],
+                seed_dropped: false,
+                engine: "cache",
+                search_us: 0,
+                payload,
+            },
+        }
+    }
+
+    fn from_search(out: RouteTaskOut) -> Self {
+        Served {
+            found: out.res.found,
+            status: out.res.status,
+            cost: out.res.cost,
+            length_tiles: out.res.path.len(),
+            pops: out.res.pops,
+            pops_f: out.res.pops_f,
+            pops_b: out.res.pops_b,
+            retried: out.retried,
+            attempts_pops: out.attempts_pops,
+            seed_dropped: out.seed_dropped,
+            engine: out.engine,
+            search_us: out.search_us,
+            payload: out.payload,
+        }
+    }
+}
+
+/// Cache hits whose payload is at most this many path nodes (or that request no
+/// actions/geometry at all) are answered on the reactor (T3.11): the payload is
+/// microseconds, less than the `spawn_blocking` round trip it used to take.
+const INLINE_HIT_PAYLOAD_NODES: usize = 256;
 
 /// Process-lifetime service counters (see [`crate::Metrics`]) plus the live route-cache
 /// state and the policy in force — so a zero hit rate can be diagnosed from one call:
@@ -1131,16 +1355,11 @@ struct RouteTaskOut {
 pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
     let cur = state.current.load();
     let mut out = state.metrics.snapshot_json();
-    let entries = cur
+    let (entries, capacity) = cur
         .route_cache
         .as_ref()
-        .and_then(|c| c.lock().ok().map(|c| c.len()))
-        .unwrap_or(0);
-    let capacity = cur
-        .route_cache
-        .as_ref()
-        .and_then(|c| c.lock().ok().map(|c| c.cap().get()))
-        .unwrap_or(0);
+        .and_then(|c| c.lock().ok().map(|c| (c.len(), c.cap().get())))
+        .unwrap_or((0, 0));
     if let Some(obj) = out.as_object_mut() {
         obj.insert(
             "route_cache".to_string(),
@@ -1148,7 +1367,7 @@ pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "enabled": cur.route_cache.is_some(),
                 "entries": entries,
                 "capacity": capacity,
-                "ignore_seed": cache_ignore_seed(),
+                "ignore_seed": crate::cache_ignore_seed(),
             }),
         );
         obj.insert("subpath_cache".to_string(), serde_json::json!({
@@ -1157,23 +1376,29 @@ pub async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
         }));
         obj.insert("seeding_disabled".to_string(), serde_json::json!(seeding_disabled()));
         obj.insert("race_enabled".to_string(), serde_json::json!(race_enabled()));
+        obj.insert("race".to_string(), serde_json::json!({
+            "primary": race_primary().as_str(),
+            "hedge_ms": race_hedge_delay().as_secs_f64() * 1000.0,
+            "gate": race_gate(),
+        }));
+        obj.insert("search_permits".to_string(), serde_json::json!({
+            "total": state.search_permits.total(),
+            "available": state.search_permits.available(),
+        }));
+        obj.insert("ctx_pool".to_string(), serde_json::json!({
+            "idle": state.ctx_pool.idle(),
+            "fresh_allocations": state.ctx_pool.fresh_allocations(),
+        }));
         obj.insert("ready".to_string(), serde_json::json!(state.ready.load(std::sync::atomic::Ordering::Acquire)));
     }
     Json(out)
 }
 
-/// Cache seed policy (`NAVPATH_CACHE_IGNORE_SEED`, **default ON since 2026-08-06** —
-/// plan v3 §3a): drop the seed from the route-cache key, so repeat traffic with
-/// varying seeds — the dominant production shape, which otherwise never hits — is
-/// served the cached path. Cached hits lose per-seed tie variety (jitter is
-/// < 0.1 ms/edge against 300 ms edges, so only equal-cost tie selection changes —
-/// the same trade the budget retry already makes). Measured on the gate that
-/// roadmap 5.2 demanded (2026-07-31): 11 of 12 repeat requests became hits,
-/// ~118 ms → ~0.3–0.9 ms. Set `NAVPATH_CACHE_IGNORE_SEED=0` to restore the legacy
-/// per-seed keying.
-/// `NAVPATH_RACE=1`: hedged engine race (uni and bidir concurrently, first stable result
-/// wins, loser cancelled). Default off. Costs a second search permit per cache miss
-/// while both engines run; degrades to the single-engine path when none is free.
+/// `NAVPATH_RACE=1`: hedged engine race (uni and bidir, first stable result wins, loser
+/// cancelled). Default off. The second engine (the hedge) needs a spare search permit
+/// (see [`crate::SearchPermits::try_acquire_hedge`]); without one the request runs the
+/// primary engine alone. See [`race_hedge_delay`], [`race_gate`] and
+/// [`race_primary`] for when the hedge starts.
 pub fn race_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -1181,11 +1406,81 @@ pub fn race_enabled() -> bool {
     })
 }
 
-fn cache_ignore_seed() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(std::env::var("NAVPATH_CACHE_IGNORE_SEED").ok().as_deref().map(str::trim), Some("0") | Some("false"))
+/// `NAVPATH_RACE_HEDGE_MS` (T3.2a, default 0): start the hedge engine only if the
+/// primary has not finished within this many milliseconds; `0` starts both engines
+/// together. Applies to the misses the gate lets race. Tokio's timer has 1 ms
+/// granularity, so a delay of `D` starts the hedge between `D` and `D+1` ms in.
+/// Default 0 because a delay only pays where the gate is off: over the same sweeps a
+/// 1 ms delay saved 6-11% CPU for +0-11% latency sum (long searches dominate CPU and
+/// still hedge), while the gate removes most hedges with no latency cost.
+pub fn race_hedge_delay() -> std::time::Duration {
+    static D: OnceLock<std::time::Duration> = OnceLock::new();
+    *D.get_or_init(|| {
+        let ms = std::env::var("NAVPATH_RACE_HEDGE_MS").ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(RACE_HEDGE_MS_DEFAULT);
+        std::time::Duration::from_secs_f64(ms / 1000.0)
     })
+}
+const RACE_HEDGE_MS_DEFAULT: f64 = 0.0;
+
+/// `NAVPATH_RACE_GATE` (T3.2b, default on; `0` races every miss): hedge only routes the
+/// [`engine_adapter::RaceHint`] predicts the second engine can win — for a bidir
+/// primary, teleport-dominated routes or `h(start)` >= 20 s; for a JPS/uni primary,
+/// heuristic-blind routes (`h = 0`). Every other miss runs the primary engine alone.
+/// Measured (examples/race_sweep, see `RaceHint`): latency sum within 0-2% of racing
+/// every miss with identical p99/max, 4-49% less race CPU, and with a JPS primary the
+/// hedge (second permit, second context lease, second blocking thread) runs on 2-3% of
+/// misses instead of all of them.
+pub fn race_gate() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("NAVPATH_RACE_GATE").ok().as_deref().map(str::trim), Some("0") | Some("false")))
+}
+
+/// Which engine a race starts first; the other one is the hedge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RacePrimary {
+    /// The engine expected to win: the unidirectional engine when jump-point expansion
+    /// applies to the search (`NAVPATH_JPS=1`, canonical grid loaded, unseeded), else
+    /// bidirectional. Measured with `examples/race_sweep` (2026-09-25, 300-400 LCG pairs
+    /// per config): JPS beats bidir on 383-386/400 all-eligible pairs and 294/300 gated
+    /// ones; without JPS (seeded, or `NAVPATH_JPS=0`) bidir is the better single engine
+    /// (sum of per-pair times ~0.5-0.6x of plain uni).
+    Auto,
+    Uni,
+    Bidir,
+}
+
+impl RacePrimary {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RacePrimary::Auto => "auto",
+            RacePrimary::Uni => "uni",
+            RacePrimary::Bidir => "bidir",
+        }
+    }
+}
+
+/// `NAVPATH_RACE_PRIMARY=auto|uni|bidir` (default `auto`, see [`RacePrimary`]). The
+/// primary is also the engine a race-eligible miss runs alone when the hedge does not
+/// start (gated, finished inside the delay, or no spare permit).
+pub fn race_primary() -> RacePrimary {
+    static P: OnceLock<RacePrimary> = OnceLock::new();
+    *P.get_or_init(|| match std::env::var("NAVPATH_RACE_PRIMARY").ok().as_deref().map(str::trim) {
+        Some("uni") | Some("jps") => RacePrimary::Uni,
+        Some("bidir") => RacePrimary::Bidir,
+        _ => RacePrimary::Auto,
+    })
+}
+
+/// Resolve the race primary for one request.
+fn primary_is_uni(seed: Option<u64>, canonical_loaded: bool) -> bool {
+    match race_primary() {
+        RacePrimary::Uni => true,
+        RacePrimary::Bidir => false,
+        RacePrimary::Auto => seed.is_none() && canonical_loaded && navpath_core::engine::search::jps_enabled(),
+    }
 }
 
 /// Server-side seed kill switch (`--no-seed` / `NAVPATH_IGNORE_SEED=1`, default off —
@@ -1202,7 +1497,9 @@ pub fn seeding_disabled() -> bool {
     })
 }
 
-pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteRequest>) -> Result<Json<RouteResponse>, (StatusCode, String)> {
+type RouteResult = Result<axum::response::Response, (StatusCode, String)>;
+
+pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteRequest>) -> RouteResult {
     let start = std::time::Instant::now();
     // Seed kill switch: clear before ANY reader (cache key, shadow attribution,
     // search) so the request is unseeded everywhere, not just in the engine.
@@ -1212,14 +1509,14 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
     if !state.ready.load(std::sync::atomic::Ordering::Acquire) {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "warming up (snapshot populate / context pre-warm); retry".into()));
     }
-    let cur = state.current.load();
+    // One reference to this request's snapshot generation; everything below borrows it.
+    let cur: Arc<SnapshotState> = state.current.load_full();
     let Some(snap) = cur.snapshot.as_ref() else {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "snapshot not loaded".into()));
     };
     let Some(neighbors) = cur.neighbors.as_ref() else {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "neighbors not loaded".into()));
     };
-    let globals = cur.globals.clone();
     let counts = snap.counts();
 
     // Resolve node ids
@@ -1275,17 +1572,19 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
             }
         }),
     );
-    
+
     // Route results are pure functions of (snapshot, endpoints, eligibility, seed);
     // repeated requests hit the per-snapshot LRU and skip the search entirely (payload
     // is still rebuilt per request so one entry serves every options combination).
+    let mask_bits = crate::pack_mask_bits(&mask.satisfied);
+    let profile_key: crate::ProfileKey = (mask_bits.clone(), quick_tele);
     let cache_key = crate::RouteCacheKey {
         virtual_start: used_virtual_start,
         sid: if used_virtual_start { 0 } else { sid },
         gid,
-        mask_bits: crate::pack_mask_bits(&mask.satisfied),
+        mask_bits,
         quick_tele,
-        seed: if cache_ignore_seed() { None } else { req.seed },
+        seed: if crate::cache_ignore_seed() { None } else { req.seed },
     };
     let cached: Option<crate::RouteCacheEntry> = cur
         .route_cache
@@ -1294,32 +1593,35 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
 
     // Exact sub-path reuse (crate::SubpathCache): both endpoints on a cached optimal
     // path for this profile => serve the slice, no search. Virtual starts never qualify.
-    let profile_key: crate::ProfileKey = (cache_key.mask_bits.clone(), quick_tele);
     let mut goal_known = false;
     // Cached slices carry UNSEEDED (base-cost) `path_g`; a seeded request may use them
     // only under the seed-blind cache policy, exactly like the route cache.
-    let subpath_hit: Option<crate::RouteCacheEntry> = if cached.is_none() && !used_virtual_start && (req.seed.is_none() || cache_ignore_seed()) {
+    let subpath_hit: Option<crate::SubpathHit> = if cached.is_none() && !used_virtual_start && (req.seed.is_none() || crate::cache_ignore_seed()) {
         cur.subpath_cache.as_ref().and_then(|c| {
             let (hit, known) = crate::subpath_lookup(c, &profile_key, sid, gid);
             goal_known = known;
-            hit.map(|res| Arc::new((res, None, false)))
+            hit
         })
     } else {
         None
     };
-    let subpath_served = subpath_hit.is_some();
-    let cached = cached.or(subpath_hit);
+    let hit: Option<Hit> = match (cached, subpath_hit) {
+        (Some(e), _) => Some(Hit::Cached(e)),
+        (None, Some(h)) => Some(Hit::Subpath(h)),
+        (None, None) => None,
+    };
+    let subpath_served = matches!(hit, Some(Hit::Subpath(_)));
 
     // Attribute the miss (see crate::SeedShadow). A seeded request whose seed-blind key
     // is already known missed *because of the seed*; anything else is a genuinely new
-    // (endpoints, profile) pair. The key is rebuilt only where it is used (a seeded miss,
-    // or a cache put) so hits and unseeded traffic never pay for the clone.
+    // (endpoints, profile) pair. The shadow only exists under per-seed keying (T3.12),
+    // and the seed-blind key is rebuilt only where it is used.
     let seed_blind_key = || crate::RouteCacheKey { seed: None, ..cache_key.clone() };
     let cache_outcome = if subpath_served {
         crate::CacheOutcome::Subpath
     } else if cur.route_cache.is_none() {
         crate::CacheOutcome::Disabled
-    } else if cached.is_some() {
+    } else if hit.is_some() {
         crate::CacheOutcome::Hit
     } else if cache_key.seed.is_some()
         && cur
@@ -1339,343 +1641,208 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
             crate::CacheOutcome::MissCold => { metrics.cache_miss_cold.fetch_add(1, Relaxed); }
             _ => {}
         }
-        if cached.is_none() && goal_known {
+        if hit.is_none() && goal_known {
             metrics.cache_miss_goal_known.fetch_add(1, Relaxed);
         }
     }
 
-    // Exact reachability precheck (roadmap 4.1): eligibility never gates walk edges,
-    // so "can this goal be reached at all under this profile" is decided on the
-    // ~491-component condensation in microseconds — BEFORE a permit, a blocking
-    // thread, or a context pair is committed. Every rejection here is a budget-capped
-    // ~1.5M-pop flood (plus its retry) that never ran. The verdict is exact, so the
-    // response is identical to what the flood would have produced.
-    if cached.is_none() {
-        if let Some(cg) = cur.comp_graph.as_ref() {
-            let comps = snap.comp_ids();
-            let start_comp = if used_virtual_start { None } else { Some(comps[sid as usize]) };
-            let goal_comp = comps[gid as usize];
-            if !engine_adapter::goal_reachable(cg, &mask, start_comp, goal_comp) {
-                use std::sync::atomic::Ordering::Relaxed;
-                metrics.precheck_rejects.fetch_add(1, Relaxed);
-                metrics.not_found.fetch_add(1, Relaxed);
-                let duration_us = start.elapsed().as_micros() as u64;
-                let duration_ms = (duration_us / 1000) as u128;
-                info!(duration_ms, sid, gid, virtual_start = used_virtual_start,
-                      "route rejected by component reachability precheck");
-                return Ok(Json(RouteResponse {
-                    found: false,
-                    cost: f32::INFINITY,
-                    path: Vec::new(),
-                    length_tiles: 0,
-                    duration_ms,
-                    duration_us,
-                    reason: None,
-                    degraded: None,
-                    actions: None,
-                    geometry: None,
-                }));
-            }
-        }
-    }
-
-    // Offload search to a blocking thread, bounded by the search semaphore so a burst of
-    // slow queries cannot pin hundreds of blocking-pool threads (each holding a
-    // node-sized SearchContext). Overload fails fast instead of queueing floods. Cache
-    // hits skip the search and need no permit. The permit moves into the blocking task
-    // and is released the moment the search itself finishes — payload building and
-    // response serialization must not count against search admission.
-    let permit = if cached.is_none() {
-        match state.search_permits.clone().try_acquire_owned() {
-            Ok(p) => Some(p),
-            Err(_) => {
-                metrics.semaphore_rejects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!(sid, gid, "search capacity exhausted; rejecting with 503");
-                return Err((StatusCode::SERVICE_UNAVAILABLE, "search capacity exhausted; retry".into()));
-            }
-        }
+    let virtual_start_from = if used_virtual_start {
+        req.start.as_ref().map(|c| (c.wx, c.wy, c.plane))
     } else {
         None
     };
+    let seed = req.seed;
+    let mut job = RouteJob {
+        cur: cur.clone(),
+        artifacts: None,
+        mask,
+        sid,
+        gid,
+        used_virtual_start,
+        seed,
+        quick_tele,
+        return_geometry: req.options.return_geometry,
+        only_actions: req.options.only_actions,
+        surge: req.surge,
+        dive: req.dive,
+        virtual_start_from,
+        index_subpath: cur.subpath_cache.is_some() && !used_virtual_start && seed.is_none(),
+    };
 
-    // Per-profile search artifacts (roadmap 5.4): MacroFilters, eligible globals and
-    // fairy sets are pure functions of (snapshot, exact mask bits, quick_tele), so
-    // cache-missing requests resolve them from the per-snapshot LRU instead of
-    // rebuilding. Cheap (a lock + at worst one ~1k-slot scan), so it runs here before
-    // the blocking task; cache hits skip it entirely.
-    let artifacts: Option<Arc<engine_adapter::ProfileArtifacts>> = if cached.is_none() {
-        let key: crate::ProfileKey = profile_key.clone();
-        let hit = cur
-            .profile_cache
-            .lock()
-            .ok()
-            .and_then(|mut c| c.get(&key).cloned());
-        Some(match hit {
+    // ---- Cache / sub-path hit: no search, no permit. ----
+    if let Some(hit) = hit {
+        let job = Arc::new(job);
+        let virtual_entry = match &hit {
+            Hit::Cached(e) => e.virtual_entry,
+            Hit::Subpath(_) => None,
+        };
+        let no_payload = !(job.only_actions || job.return_geometry);
+        let served = if no_payload || hit.path().len() <= INLINE_HIT_PAYLOAD_NODES {
+            let payload = job.payload(hit_found(&hit), hit.path(), virtual_entry);
+            Served::from_hit(&hit, payload)
+        } else {
+            let task_job = job.clone();
+            tokio::task::spawn_blocking(move || {
+                let payload = task_job.payload(hit_found(&hit), hit.path(), virtual_entry);
+                Served::from_hit(&hit, payload)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        };
+        return Ok(respond(&metrics, start, served, true, subpath_served, cache_outcome, seed_ignored));
+    }
+
+    // Per-profile search artifacts (roadmap 5.4): MacroFilters, eligible globals, fairy
+    // sets and the reachability view are pure functions of (snapshot, exact mask bits,
+    // quick_tele), so misses resolve them from the per-snapshot LRU instead of
+    // rebuilding. Cheap (a lock + at worst one ~1.7k-slot scan). Resolved before the
+    // precheck, which reads the profile's reachability view (T3.14).
+    let artifacts: Arc<engine_adapter::ProfileArtifacts> = {
+        let hit = cur.profile_cache.lock().ok().and_then(|mut c| c.get(&profile_key).cloned());
+        match hit {
             Some(a) => a,
             None => {
                 let built = Arc::new(engine_adapter::build_profile_artifacts(
                     neighbors.as_ref(),
                     cur.neighbors_rev.as_deref(),
-                    globals.as_slice(),
+                    cur.globals.as_slice(),
                     cur.fairy_rings.as_slice(),
-                    &mask,
+                    &job.mask,
                     quick_tele,
                 ));
                 if let Ok(mut c) = cur.profile_cache.lock() {
-                    c.put(key, built.clone());
+                    c.put(profile_key.clone(), built.clone());
                 }
                 built
             }
-        })
-    } else {
-        None
+        }
     };
 
-    let snap_arc = snap.clone();
-    let neighbors_arc = neighbors.clone();
-    let neighbors_rev_arc = cur.neighbors_rev.clone();
-    let globals_arc = globals.clone();
-    let fairy_rings_arc = cur.fairy_rings.clone();
-    let node_to_fairy_ring_arc = cur.node_to_fairy_ring.clone();
-    let seed = req.seed;
-    let mask_for_search = mask.clone();
-    let mask_for_payload = mask.clone();
+    // Exact reachability precheck (roadmap 4.1): eligibility never gates walk edges,
+    // so "can this goal be reached at all under this profile" is decided on the
+    // ~491-component condensation in microseconds — BEFORE a permit, a blocking
+    // thread, or a search context is committed. Every rejection here is a budget-capped
+    // ~1.5M-pop flood (plus its retry) that never ran. The verdict is exact, so the
+    // response is identical to what the flood would have produced.
+    if let Some(cg) = cur.comp_graph.as_ref() {
+        let comps = snap.comp_ids();
+        let start_comp = if used_virtual_start { None } else { Some(comps[sid as usize]) };
+        let goal_comp = comps[gid as usize];
+        if !artifacts.reach(cg, &job.mask).reachable(start_comp, goal_comp) {
+            use std::sync::atomic::Ordering::Relaxed;
+            metrics.precheck_rejects.fetch_add(1, Relaxed);
+            metrics.not_found.fetch_add(1, Relaxed);
+            let duration_us = start.elapsed().as_micros() as u64;
+            let duration_ms = (duration_us / 1000) as u128;
+            info!(duration_ms, sid, gid, virtual_start = used_virtual_start,
+                  "route rejected by component reachability precheck");
+            let resp = RouteResponse {
+                found: false,
+                cost: f32::INFINITY,
+                path: None,
+                length_tiles: 0,
+                duration_ms,
+                duration_us,
+                reason: None,
+                degraded: None,
+                actions: None,
+                geometry: None,
+            };
+            return Ok(json_response(&resp, 128));
+        }
+    }
 
-    // Hedged race (`NAVPATH_RACE=1`): run the uni and bidir engines concurrently and
-    // serve the first stable result. Both engines are exact, so the served cost is
-    // identical either way; what the race buys is the per-pair minimum of two engines
-    // whose relative speed swings 3-5x in both directions depending on whether the
-    // route is walk- or teleport-dominated (docs/route_latency_improvements_2026-09-17.md
-    // §1.2/§2.1). The second engine needs its own search permit: when none is free the
-    // request silently degrades to the single-engine policy path, so the race never
-    // adds admission pressure under load.
-    let mut permit = permit;
-    let race_permit = if cached.is_none()
-        && race_enabled()
-        && engine_adapter::bidir_enabled()
-        && neighbors_rev_arc.is_some()
-    {
-        state.search_permits.clone().try_acquire_owned().ok()
-    } else {
-        None
+    // Offload search to a blocking thread, bounded by the search semaphore so a burst of
+    // slow queries cannot pin hundreds of blocking-pool threads (each holding
+    // node-sized search contexts). Overload fails fast instead of queueing floods. The
+    // permit moves into the blocking task and is released the moment the search itself
+    // finishes — payload building and response serialization must not count against
+    // search admission.
+    let Some(permit) = state.search_permits.try_acquire() else {
+        metrics.semaphore_rejects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        warn!(sid, gid, "search capacity exhausted; rejecting with 503");
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "search capacity exhausted; retry".into()));
     };
-    let race = race_permit.is_some();
+
+    // Hedged race (`NAVPATH_RACE=1`): the uni and bidir engines are both exact, so the
+    // served cost is identical either way; the race buys the per-pair minimum of two
+    // engines whose relative speed swings 3-5x in both directions depending on whether
+    // the route is walk- or teleport-dominated (docs/route_latency_improvements_2026-09-17.md
+    // §1.2/§2.1). The primary engine starts at once; the hedge (the other engine) starts
+    // only if the primary is still running after `NAVPATH_RACE_HEDGE_MS`, only when the
+    // predictive gate (if on) judges the route worth it, and only with a spare permit.
+    let race_possible = race_enabled() && engine_adapter::bidir_enabled() && cur.neighbors_rev.is_some();
+    let uni_primary = primary_is_uni(seed, cur.canonical_grid.is_some());
+    let (primary, hedge) = if uni_primary {
+        (engine_adapter::EngineChoice::Uni, engine_adapter::EngineChoice::Bidir)
+    } else {
+        (engine_adapter::EngineChoice::Bidir, engine_adapter::EngineChoice::Uni)
+    };
+    let race = race_possible && {
+        let worth = !race_gate() || {
+            let start_node = if used_virtual_start { None } else { Some(sid) };
+            engine_adapter::race_hint(snap, &artifacts, start_node, gid).worth_racing(uni_primary)
+        };
+        if !worth {
+            metrics.race_gated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        worth
+    };
+    // Without a race the primary still runs when racing is configured (so gated routes
+    // use the engine the race would have started first); otherwise the shipped policy.
+    let single_engine = if race_possible { primary } else { engine_adapter::EngineChoice::Policy };
+    job.artifacts = Some(artifacts);
+    let job = Arc::new(job);
 
     // Cooperative cancellation: one flag per engine (the race cancels only the loser);
     // the disconnect guard and the route deadline flip every flag. The engine checks
     // its flag every 1024 pops, and the retry ladder never starts a rung once it is set.
-    let cancel_flags: Vec<Arc<std::sync::atomic::AtomicBool>> =
+    let cancel_flags: Arc<[Arc<std::sync::atomic::AtomicBool>]> =
         (0..if race { 2 } else { 1 }).map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false))).collect();
-    struct CancelOnDrop(Vec<Arc<std::sync::atomic::AtomicBool>>, bool);
+    struct CancelOnDrop(Arc<[Arc<std::sync::atomic::AtomicBool>]>, bool);
     impl Drop for CancelOnDrop {
         fn drop(&mut self) {
             if !self.1 {
-                for f in &self.0 {
+                for f in self.0.iter() {
                     f.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
     }
     let mut disconnect_guard = CancelOnDrop(cancel_flags.clone(), false);
-
-    let used_virtual_start_for_search = used_virtual_start;
-    let macro_lookup_arc = cur.macro_lookup.clone();
-    let req_tag_index_arc = cur.req_tag_index.clone();
-    let return_geometry = req.options.return_geometry;
-    let only_actions = req.options.only_actions;
-    let surge_cfg = req.surge.clone();
-    let dive_cfg = req.dive.clone();
-    let virtual_start_from = if used_virtual_start {
-        req.start.as_ref().map(|c| (c.wx, c.wy, c.plane))
-    } else {
-        None
-    };
-    let cached_for_task = cached.clone();
-    let canonical_for_search = cur.canonical_grid.clone();
     let ctx_pool = state.ctx_pool.clone();
 
-    // One fresh search on `engine`, observing `cancel`. Cloneable (captures are Arcs
-    // and Copy values) so the race can hand one copy to each blocking task.
-    let snap_for_search = snap_arc.clone();
-    let run_search = move |engine: engine_adapter::EngineChoice,
-                           cancel: Arc<std::sync::atomic::AtomicBool>|
-     -> (engine_adapter::SearchOutcome, Option<u32>) {
-        let arts = artifacts.as_ref().expect("profile artifacts resolved for fresh searches");
-        // Checkout scope: the pair returns to the pool when this closure returns,
-        // before payload building.
-        let mut pooled = ctx_pool.checkout();
-        if used_virtual_start_for_search {
-            engine_adapter::run_route_with_requirements_virtual_start(
-                snap_for_search.clone(),
-                neighbors_arc.clone(),
-                neighbors_rev_arc.clone(),
-                gid,
-                seed,
-                Some(cancel.as_ref()),
-                arts,
-                canonical_for_search.clone(),
-                engine,
-                pooled.pair(),
-            )
-        } else {
-            (
-                engine_adapter::run_route_with_requirements_and_fairy_rings(
-                    snap_for_search.clone(),
-                    neighbors_arc.clone(),
-                    neighbors_rev_arc.clone(),
-                    sid,
-                    gid,
-                    &mask_for_search,
-                    seed,
-                    Some(cancel.as_ref()),
-                    arts,
-                    canonical_for_search.clone(),
-                    engine,
-                    pooled.pair(),
-                ),
-                None,
-            )
-        }
-    };
-
-    // Payload build + serialization for one search outcome, off the reactor.
-    let build_payload = move |outcome: engine_adapter::SearchOutcome, virtual_entry: Option<u32>, search_us: u64| -> RouteTaskOut {
-        let t_payload = std::time::Instant::now();
-        let (actions, geometry) = build_route_payload(
-            &snap_arc,
-            &globals_arc,
-            &macro_lookup_arc,
-            &fairy_rings_arc,
-            &node_to_fairy_ring_arc,
-            &req_tag_index_arc,
-            &mask_for_payload,
-            quick_tele,
-            return_geometry,
-            only_actions,
-            &surge_cfg,
-            &dive_cfg,
-            virtual_start_from,
-            virtual_entry,
-            sid,
-            &outcome.res,
-        );
-        // Serialize the bulky payload halves here, off the reactor; `payload_us`
-        // deliberately includes it (it is payload work).
-        let actions = actions
-            .map(|a| serde_json::value::to_raw_value(&a).expect("actions serialize"));
-        let geometry = geometry
-            .map(|g| serde_json::value::to_raw_value(&g).expect("geometry serialize"));
-        let payload_us = t_payload.elapsed().as_micros() as u64;
-        RouteTaskOut {
-            res: outcome.res,
-            virtual_entry,
-            actions,
-            geometry,
-            retried: outcome.retried,
-            attempts_pops: outcome.attempts_pops,
-            seed_dropped: outcome.seed_dropped,
-            engine: outcome.engine,
-            search_us,
-            payload_us,
-        }
-    };
-
     let work: std::pin::Pin<Box<dyn std::future::Future<Output = Result<RouteTaskOut, String>> + Send>> = if !race {
+        let job = job.clone();
         let cancel = cancel_flags[0].clone();
-        let permit = permit.take();
         let join = tokio::task::spawn_blocking(move || {
             let t_search = std::time::Instant::now();
-            let (outcome, virtual_entry) = if let Some(hit) = cached_for_task {
-                (
-                    engine_adapter::SearchOutcome { res: hit.0.clone(), retried: false, attempts_pops: [0, 0, 0], seed_dropped: hit.2, engine: "cache" },
-                    hit.1,
-                )
-            } else {
-                run_search(engine_adapter::EngineChoice::Policy, cancel)
-            };
+            let (outcome, virtual_entry) = job.run_search(single_engine, &cancel, &ctx_pool);
             let search_us = t_search.elapsed().as_micros() as u64;
             drop(permit);
-            build_payload(outcome, virtual_entry, search_us)
+            job.finish(outcome, virtual_entry, search_us)
         });
         Box::pin(async move { join.await.map_err(|e| e.to_string()) })
     } else {
-        // Each racer runs its search, and the first one to finish with a STABLE result
-        // (Found / genuine NotFound) claims the request: it cancels the other engine and
-        // builds the payload on its own thread, so the winning path costs no extra task
-        // hop. A truncated result (budget/cancel) never claims; if both truncate, the
-        // handler picks the better one and builds the payload itself.
-        enum RaceMsg {
-            Done(RouteTaskOut),
-            Truncated(engine_adapter::SearchOutcome, Option<u32>, u64),
-        }
-        fn stable(o: &engine_adapter::SearchOutcome) -> bool {
-            matches!(o.res.status, navpath_core::SearchStatus::Found | navpath_core::SearchStatus::NotFound)
-        }
-        let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<RaceMsg>(2);
-        let racers = [
-            (engine_adapter::EngineChoice::Uni, 0usize, permit.take()),
-            (engine_adapter::EngineChoice::Bidir, 1usize, race_permit),
-        ];
-        for (engine, idx, permit) in racers {
-            let run = run_search.clone();
-            let payload = build_payload.clone();
-            let tx = tx.clone();
-            let claimed = claimed.clone();
-            let flags = cancel_flags.clone();
-            tokio::task::spawn_blocking(move || {
-                let t_search = std::time::Instant::now();
-                let (outcome, virtual_entry) = run(engine, flags[idx].clone());
-                let search_us = t_search.elapsed().as_micros() as u64;
-                drop(permit);
-                let won = stable(&outcome)
-                    && claimed
-                        .compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
-                        .is_ok();
-                if won {
-                    flags[1 - idx].store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = tx.blocking_send(RaceMsg::Done(payload(outcome, virtual_entry, search_us)));
-                } else {
-                    // Loser (or truncated): the receiver may already be gone.
-                    let _ = tx.blocking_send(RaceMsg::Truncated(outcome, virtual_entry, search_us));
-                }
-            });
-        }
-        drop(tx);
-        let metrics = metrics.clone();
-        Box::pin(async move {
-            metrics.race_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut truncated: Option<(engine_adapter::SearchOutcome, Option<u32>, u64)> = None;
-            loop {
-                match rx.recv().await {
-                    Some(RaceMsg::Done(out)) => {
-                        let ctr = if out.engine == "bidir" { &metrics.race_wins_bidir } else { &metrics.race_wins_uni };
-                        ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(out);
-                    }
-                    Some(RaceMsg::Truncated(o, ve, ms)) => {
-                        // A stable loser also lands here (it lost the claim); the
-                        // winner's Done is already in the channel or arriving, so keep
-                        // waiting unless this is the second message.
-                        truncated = Some(match truncated.take() {
-                            None => (o, ve, ms),
-                            Some((po, pve, pms)) => {
-                                if stable(&o) || (o.res.found && (!po.res.found || o.res.cost < po.res.cost)) { (o, ve, ms) } else { (po, pve, pms) }
-                            }
-                        });
-                    }
-                    None => break,
-                }
-            }
-            let (o, ve, ms) = truncated.ok_or_else(|| "race: no engine reported".to_string())?;
-            tokio::task::spawn_blocking(move || build_payload(o, ve, ms)).await.map_err(|e| e.to_string())
-        })
+        Box::pin(run_race(
+            RaceSetup {
+                job: job.clone(),
+                pool: ctx_pool,
+                permits: state.search_permits.clone(),
+                metrics: metrics.clone(),
+                flags: cancel_flags.clone(),
+                primary,
+                hedge,
+                delay: race_hedge_delay(),
+            },
+            permit,
+        ))
     };
     let out = match tokio::time::timeout(route_deadline(), work).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
         Err(_) => {
-            for f in &cancel_flags {
+            for f in cancel_flags.iter() {
                 f.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             metrics.deadline_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1686,57 +1853,75 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
     // Search finished; disarm the disconnect guard so late drops don't poison anything.
     disconnect_guard.1 = true;
 
-    let RouteTaskOut { mut res, virtual_entry, actions, geometry, retried, attempts_pops, seed_dropped, engine, search_us, payload_us } = out;
-
-    // Populate the cache on fresh, stable outcomes (Found / genuine NotFound only —
+    // Populate the caches: the sub-path index was built in the blocking task (only for
+    // unseeded, on-graph, proven results), and both caches share the result's Arc.
+    let mut out = out;
+    if let (Some(c), Some(rec)) = (cur.subpath_cache.as_ref(), out.subpath_rec.take()) {
+        crate::subpath_insert(c, profile_key, rec);
+    }
+    // The route cache takes fresh, stable outcomes (Found / genuine NotFound only —
     // budget or cancellation truncations, including truncated-found results whose cost
     // is unproven, are transient and must not stick).
-    if cached.is_none() {
-        // Only unseeded results: their `path_g` are base costs valid for every request.
-        if !used_virtual_start && seed.is_none() {
-            if let Some(c) = cur.subpath_cache.as_ref() {
-                crate::subpath_insert(c, profile_key.clone(), &res);
+    if matches!(out.res.status, navpath_core::SearchStatus::Found | navpath_core::SearchStatus::NotFound) {
+        if let Some(c) = cur.route_cache.as_ref() {
+            // Keeping the attribution index in step with what the cache actually holds
+            // is what stops `miss_seed` from claiming a hit the policy could not have
+            // delivered. Built before the key is moved into the cache.
+            let shadow = cur.seed_shadow.as_ref().map(|s| (s, seed_blind_key()));
+            if let Ok(mut c) = c.lock() {
+                c.put(
+                    cache_key,
+                    crate::RouteCacheEntry { res: out.res.clone(), virtual_entry: out.virtual_entry, seed_dropped: out.seed_dropped },
+                );
+                metrics.cache_puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-        }
-        if matches!(res.status, navpath_core::SearchStatus::Found | navpath_core::SearchStatus::NotFound) {
-            if let Some(c) = cur.route_cache.as_ref() {
-                // Built before the key is moved into the cache. Keeping the attribution
-                // index in step with what the cache actually holds is what stops
-                // `miss_seed` from claiming a hit the policy could not have delivered.
-                let shadow = seed_blind_key();
-                if let Ok(mut c) = c.lock() {
-                    c.put(cache_key, Arc::new((res.clone(), virtual_entry, seed_dropped)));
-                    metrics.cache_puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                if let Some(s) = cur.seed_shadow.as_ref() {
-                    if let Ok(mut s) = s.lock() {
-                        s.put(shadow, ());
-                    }
+            if let Some((s, key)) = shadow {
+                if let Ok(mut s) = s.lock() {
+                    s.put(key, ());
                 }
             }
         }
     }
 
+    Ok(respond(&metrics, start, Served::from_search(out), false, false, cache_outcome, seed_ignored))
+}
+
+fn hit_found(hit: &Hit) -> bool {
+    match hit {
+        Hit::Cached(e) => e.res.found,
+        Hit::Subpath(_) => true,
+    }
+}
+
+/// Metrics, optional dump, the per-request log line, and the single-pass response body.
+fn respond(
+    metrics: &crate::Metrics,
+    start: std::time::Instant,
+    s: Served,
+    cache_hit: bool,
+    subpath_served: bool,
+    cache_outcome: crate::CacheOutcome,
+    seed_ignored: bool,
+) -> axum::response::Response {
     {
         use std::sync::atomic::Ordering::Relaxed;
-        let cache_hit = cached.is_some();
         if subpath_served {
             metrics.cache_subpath_hits.fetch_add(1, Relaxed);
         } else if cache_hit {
             metrics.cache_hits.fetch_add(1, Relaxed);
         } else {
             metrics.searches.fetch_add(1, Relaxed);
-            if retried {
+            if s.retried {
                 metrics.retries.fetch_add(1, Relaxed);
-                if res.found {
+                if s.found {
                     metrics.retry_found.fetch_add(1, Relaxed);
                 }
             }
-            metrics.record_pops(res.pops as u64);
-            metrics.record_search_ms(search_us / 1000);
-            metrics.record_search_us(search_us, res.pops as u64);
+            metrics.record_pops(s.pops as u64);
+            metrics.record_search_ms(s.search_us / 1000);
+            metrics.record_search_us(s.search_us, s.pops as u64);
         }
-        match res.status {
+        match s.status {
             navpath_core::SearchStatus::Found => metrics.found.fetch_add(1, Relaxed),
             navpath_core::SearchStatus::NotFound => metrics.not_found.fetch_add(1, Relaxed),
             navpath_core::SearchStatus::BudgetExceeded => metrics.budget_exceeded.fetch_add(1, Relaxed),
@@ -1746,35 +1931,33 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
 
     let duration_us = start.elapsed().as_micros() as u64;
     let duration_ms = (duration_us / 1000) as u128;
-    let length_tiles = res.path.len();
-    // only_actions means exactly that: skip the duplicate node-id path in the payload.
-    let path = if only_actions { Vec::new() } else { std::mem::take(&mut res.path) };
-
-    let reason = match res.status {
-        navpath_core::SearchStatus::BudgetExceeded => Some("budget_exceeded".to_string()),
-        navpath_core::SearchStatus::Cancelled => Some("cancelled".to_string()),
+    let reason = match s.status {
+        navpath_core::SearchStatus::BudgetExceeded => Some("budget_exceeded"),
+        navpath_core::SearchStatus::Cancelled => Some("cancelled"),
         _ => None,
     };
-    let degraded = if seed_dropped {
-        Some("seed_dropped".to_string())
+    let degraded = if s.seed_dropped {
+        Some("seed_dropped")
     } else if seed_ignored {
         // The client sent a seed but the server runs with --no-seed: the served route
         // is the deterministic unseeded optimum.
-        Some("seed_ignored".to_string())
+        Some("seed_ignored")
     } else {
         None
     };
+    let payload_us = s.payload.payload_us;
+    let size_hint = s.payload.len() + 256;
     let resp = RouteResponse {
-        found: res.found,
-        cost: res.cost,
-        path,
-        length_tiles,
+        found: s.found,
+        cost: s.cost,
+        path: s.payload.path,
+        length_tiles: s.length_tiles,
         duration_ms,
         duration_us,
         reason,
         degraded,
-        actions,
-        geometry,
+        actions: s.payload.actions,
+        geometry: s.payload.geometry,
     };
     if let Some(dump_path) = result_dump_path() {
         if let Ok(bytes) = serde_json::to_vec_pretty(&resp) {
@@ -1783,81 +1966,215 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
     }
     info!(
         duration_ms = duration_ms,
-        search_ms = search_us / 1000,
+        search_ms = s.search_us / 1000,
         payload_ms = payload_us / 1000,
         duration_us = duration_us,
-        search_us = search_us,
+        search_us = s.search_us,
         payload_us = payload_us,
         // Memory-behaviour signal: ~150-230 warm, tens of thousands on a cold page cache.
-        ns_per_pop = if res.pops > 0 { search_us * 1000 / res.pops as u64 } else { 0 },
-        found = res.found,
-        cost = res.cost,
-        length = length_tiles,
-        status = ?res.status,
-        pops = res.pops,
-        pops_f = res.pops_f,
-        pops_b = res.pops_b,
-        retried = retried,
-        first_attempt_pops = attempts_pops[0],
-        retry_pops = attempts_pops[1],
-        retry_unseeded_pops = attempts_pops[2],
-        seed_dropped = seed_dropped,
-        cache_hit = cached.is_some(),
-        // Which engine served it: uni | bidir | cache (race winners are uni/bidir).
-        engine = engine,
-        // Why the cache did/didn't serve this: hit | miss_seed | miss_cold | off.
+        ns_per_pop = if s.pops > 0 { s.search_us * 1000 / s.pops as u64 } else { 0 },
+        found = s.found,
+        cost = s.cost,
+        length = s.length_tiles,
+        status = ?s.status,
+        pops = s.pops,
+        pops_f = s.pops_f,
+        pops_b = s.pops_b,
+        retried = s.retried,
+        first_attempt_pops = s.attempts_pops[0],
+        retry_pops = s.attempts_pops[1],
+        retry_unseeded_pops = s.attempts_pops[2],
+        seed_dropped = s.seed_dropped,
+        cache_hit = cache_hit,
+        // Which engine served it: uni | jps | bidir | cache (race winners are uni/jps/bidir).
+        engine = s.engine,
+        // Why the cache did/didn't serve this: hit | subpath | miss_seed | miss_cold | off.
         cache = cache_outcome.as_str(),
         "route request completed"
     );
-    Ok(Json(resp))
+    json_response(&resp, size_hint)
+}
+
+/// Inputs of one hedged race (see [`run_race`]).
+struct RaceSetup {
+    job: Arc<RouteJob>,
+    pool: Arc<crate::ContextPool>,
+    permits: Arc<crate::SearchPermits>,
+    metrics: Arc<crate::Metrics>,
+    /// Cancel flags: [primary, hedge].
+    flags: Arc<[Arc<std::sync::atomic::AtomicBool>]>,
+    primary: engine_adapter::EngineChoice,
+    hedge: engine_adapter::EngineChoice,
+    delay: std::time::Duration,
+}
+
+enum RaceMsg {
+    /// The arm that claimed the request, with its payload built on its own thread.
+    Done(RouteTaskOut),
+    /// An arm that did not claim: truncated (budget/cancel), or stable but second.
+    Truncated(engine_adapter::SearchOutcome, Option<u32>, u64),
+}
+
+fn stable(o: &engine_adapter::SearchOutcome) -> bool {
+    matches!(o.res.status, navpath_core::SearchStatus::Found | navpath_core::SearchStatus::NotFound)
+}
+
+/// Start one race arm on the blocking pool. The first arm to finish with a STABLE result
+/// (Found / genuine NotFound) claims the request: it cancels the other engine and builds
+/// the payload on its own thread, so the winning path costs no extra task hop. A
+/// truncated result (budget/cancel) never claims.
+fn spawn_race_arm(
+    setup: &RaceSetup,
+    engine: engine_adapter::EngineChoice,
+    idx: usize,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    claimed: &Arc<std::sync::atomic::AtomicBool>,
+    tx: &tokio::sync::mpsc::Sender<RaceMsg>,
+) {
+    let (job, pool, flags) = (setup.job.clone(), setup.pool.clone(), setup.flags.clone());
+    let (claimed, tx) = (claimed.clone(), tx.clone());
+    tokio::task::spawn_blocking(move || {
+        let t_search = std::time::Instant::now();
+        let (outcome, virtual_entry) = job.run_search(engine, &flags[idx], &pool);
+        let search_us = t_search.elapsed().as_micros() as u64;
+        drop(permit);
+        let won = stable(&outcome)
+            && claimed
+                .compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+                .is_ok();
+        if won {
+            if let Some(other) = flags.get(1 - idx) {
+                other.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = tx.blocking_send(RaceMsg::Done(job.finish(outcome, virtual_entry, search_us)));
+        } else {
+            // Loser (or truncated): the receiver may already be gone.
+            let _ = tx.blocking_send(RaceMsg::Truncated(outcome, virtual_entry, search_us));
+        }
+    });
+}
+
+/// Run the primary engine and, per the hedge policy, the other engine; serve the first
+/// stable result. If both arms truncate, the better truncated result is served.
+async fn run_race(setup: RaceSetup, primary_permit: tokio::sync::OwnedSemaphorePermit) -> Result<RouteTaskOut, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<RaceMsg>(2);
+    let (primary, hedge, delay) = (setup.primary, setup.hedge, setup.delay);
+    spawn_race_arm(&setup, primary, 0, primary_permit, &claimed, &tx);
+
+    // Start the hedge: needs a spare permit (T3.1). Our sender is dropped once the hedge
+    // is decided, so the channel closes when every started arm has reported (or died).
+    let start_hedge = |setup: &RaceSetup, tx: &tokio::sync::mpsc::Sender<RaceMsg>| -> bool {
+        match setup.permits.try_acquire_hedge() {
+            Some(p) => {
+                setup.metrics.race_runs.fetch_add(1, Relaxed);
+                spawn_race_arm(setup, hedge, 1, p, &claimed, tx);
+                true
+            }
+            None => {
+                setup.metrics.race_hedge_denied.fetch_add(1, Relaxed);
+                false
+            }
+        }
+    };
+    let mut raced = false;
+    let mut tx = Some(tx);
+    let mut hedge_at: Option<tokio::time::Instant> = None;
+    if delay.is_zero() {
+        raced = start_hedge(&setup, tx.as_ref().expect("sender held until the hedge is decided"));
+        tx = None;
+    } else {
+        hedge_at = Some(tokio::time::Instant::now() + delay);
+    }
+
+    let mut truncated: Option<(engine_adapter::SearchOutcome, Option<u32>, u64)> = None;
+    loop {
+        let msg = match hedge_at {
+            Some(at) => tokio::select! {
+                biased;
+                m = rx.recv() => m,
+                _ = tokio::time::sleep_until(at) => {
+                    hedge_at = None;
+                    if let Some(tx) = tx.take() {
+                        raced = start_hedge(&setup, &tx);
+                    }
+                    continue;
+                }
+            },
+            None => rx.recv().await,
+        };
+        match msg {
+            Some(RaceMsg::Done(out)) => {
+                if raced {
+                    let ctr = if out.engine == "bidir" { &setup.metrics.race_wins_bidir } else { &setup.metrics.race_wins_uni };
+                    ctr.fetch_add(1, Relaxed);
+                } else if hedge_at.is_some() {
+                    setup.metrics.race_hedge_skipped.fetch_add(1, Relaxed);
+                }
+                return Ok(out);
+            }
+            Some(RaceMsg::Truncated(o, ve, us)) => {
+                // A stable loser also lands here (it lost the claim); the winner's Done
+                // is already in the channel or arriving, so keep waiting until the
+                // channel closes.
+                truncated = Some(match truncated.take() {
+                    None => (o, ve, us),
+                    Some((po, pve, pus)) => {
+                        if stable(&o) || (o.res.found && (!po.res.found || o.res.cost < po.res.cost)) { (o, ve, us) } else { (po, pve, pus) }
+                    }
+                });
+                // The primary gave up (budget) inside the hedge delay: hedge now — the
+                // other engine may prove the route within its own budget.
+                if hedge_at.take().is_some() {
+                    if let Some(tx) = tx.take() {
+                        raced = start_hedge(&setup, &tx);
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    let (o, ve, us) = truncated.ok_or_else(|| "race: no engine reported".to_string())?;
+    let job = setup.job.clone();
+    tokio::task::spawn_blocking(move || job.finish(o, ve, us)).await.map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Serialize)]
 pub struct ReloadResponse { pub reloaded: bool, pub snapshot_hash: Option<String>, pub loaded_at: u64 }
 
-pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let cur = state.current.load();
+pub async fn reload(State(state): State<AppState>, Query(q): Query<ReloadQuery>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let cur = state.current.load_full();
     let path = cur.path.clone();
+    let force = matches!(q.force.as_deref().map(str::trim), Some("1") | Some("true"));
 
     // Snapshot open + provider/component/canonical builds are ~100 ms of CPU work —
     // run them on the blocking pool so reactor threads keep serving requests.
     let log_path = path.clone();
+    let serving = cur.clone();
     let built = tokio::task::spawn_blocking(move || {
+        // The file on disk is the snapshot already serving (same blake3 tail hash): keep
+        // the live state — mapping, derived structures and warm caches. `?force=1`
+        // rebuilds anyway.
+        if !force && serving.snapshot.is_some() {
+            let disk = crate::read_tail_hash_hex(&path);
+            if disk.is_some() && disk == serving.snapshot_hash_hex {
+                return Ok(None);
+            }
+        }
         let new_snap = navpath_core::Snapshot::open(&path).map_err(|e| e.to_string())?;
         // Page the new mapping in BEFORE it is swapped live.
-        crate::warm_snapshot(&new_snap);
-        let new_hash = crate::read_tail_hash_hex(&path);
-        // Pre-compute neighbors and globals
-        let (neighbors, neighbors_rev, globals, macro_lookup) = crate::engine_adapter::build_neighbor_provider(&new_snap);
-        // Pre-compute fairy rings
-        let (fairy_rings, node_to_fairy_ring) = crate::engine_adapter::build_fairy_rings(&new_snap);
-        let comp_graph = crate::engine_adapter::build_component_graph(&new_snap, &globals, &fairy_rings);
-        let canonical_grid = crate::engine_adapter::build_canonical_grid(&new_snap);
-        let req_tag_index = crate::build_req_tag_index(Some(&new_snap));
-        Ok::<SnapshotState, String>(SnapshotState {
-            path,
-            snapshot: Some(Arc::new(new_snap)),
-            neighbors: Some(Arc::new(neighbors)),
-            neighbors_rev: Some(Arc::new(neighbors_rev)),
-            globals: Arc::new(globals),
-            macro_lookup: Arc::new(macro_lookup),
-            req_tag_index: Arc::new(req_tag_index),
-            loaded_at_unix: crate::now_unix(),
-            snapshot_hash_hex: new_hash,
-            route_cache: crate::new_route_cache(),
-            seed_shadow: crate::new_seed_shadow(),
-            fairy_rings: Arc::new(fairy_rings),
-            node_to_fairy_ring: Arc::new(node_to_fairy_ring),
-            comp_graph: Some(Arc::new(comp_graph)),
-            canonical_grid,
-            profile_cache: crate::new_profile_cache(), subpath_cache: crate::new_subpath_cache(),
-        })
+        let warm = crate::warm_snapshot(&new_snap);
+        let new_hash = new_snap.tail_hash_hex();
+        let st = SnapshotState::build(path, new_snap, new_hash);
+        st.set_warm_state(warm);
+        Ok::<Option<SnapshotState>, String>(Some(st))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     match built {
-        Ok(new_state) => {
+        Ok(Some(new_state)) => {
             let new_hash = new_state.snapshot_hash_hex.clone();
             state.current.store(Arc::new(new_state));
             info!(path=?log_path, hash=?new_hash, "reloaded snapshot");
@@ -1868,11 +2185,27 @@ pub async fn reload(State(state): State<AppState>) -> Result<Json<serde_json::Va
                 "loaded_at": latest.loaded_at_unix
             })))
         }
+        Ok(None) => {
+            info!(path=?log_path, hash=?cur.snapshot_hash_hex, "snapshot unchanged on disk; reload skipped (?force=1 rebuilds)");
+            Ok(Json(serde_json::json!({
+                "reloaded": false,
+                "unchanged": true,
+                "snapshot_hash": cur.snapshot_hash_hex,
+                "loaded_at": cur.loaded_at_unix
+            })))
+        }
         Err(e) => {
             warn!(error=%e, path=?log_path, "reload failed; keeping old snapshot");
             Err((StatusCode::CONFLICT, e))
         }
     }
+}
+
+/// `POST /admin/reload?force=1` rebuilds even when the snapshot file is unchanged.
+#[derive(Debug, Deserialize, Default)]
+pub struct ReloadQuery {
+    #[serde(default)]
+    pub force: Option<String>,
 }
 
 #[cfg(test)]

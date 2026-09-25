@@ -6,6 +6,7 @@ import binascii
 import json
 import re
 import sqlite3
+import struct
 import sys
 from typing import List, Tuple
 
@@ -61,16 +62,14 @@ def _maybe_hex_text_to_bytes(b: bytes) -> bytes:
     return b
 
 
+_TRIPLET_LE_I32 = struct.Struct("<3i")
+
+
 def decode_triplets_le_i32(buf: bytes) -> List[Tuple[int, int, int]]:
-    if len(buf) % 12 != 0:
+    if len(buf) % _TRIPLET_LE_I32.size != 0:
         raise ValueError(f"Blob length {len(buf)} is not a multiple of 12 bytes.")
-    pts = []
-    for i in range(0, len(buf), 12):
-        x = int.from_bytes(buf[i:i+4], "little", signed=True)
-        y = int.from_bytes(buf[i+4:i+8], "little", signed=True)
-        plane = int.from_bytes(buf[i+8:i+12], "little", signed=True)
-        pts.append((x, y, plane))
-    return pts
+    # One C-level pass instead of three int.from_bytes slices per point.
+    return list(_TRIPLET_LE_I32.iter_unpack(buf))
 
 
 def main():

@@ -72,7 +72,7 @@ fn load_tiles_from_regions(conn: &Connection) -> Result<Option<Vec<Tile>>> {
 pub fn load_all_tiles(conn: &Connection) -> Result<Vec<Tile>> {
     use rayon::prelude::*;
     if let Some(mut tiles) = load_tiles_from_regions(conn)? {
-        tiles.par_sort_unstable_by_key(|t| (t.plane, t.y, t.x));
+        tiles.par_sort_unstable_by_key(|t| navpath_core::snapshot::pack_coord(t.x, t.y, t.plane));
         return Ok(tiles);
     }
     // Loud, not silent: this fallback costs ~10x the region path (and ~200+ MB of DB
@@ -105,8 +105,9 @@ pub fn load_all_tiles(conn: &Connection) -> Result<Vec<Tile>> {
     for r in rows {
         out.push(r?);
     }
-    // Deterministic despite parallelism: (plane, y, x) keys are unique per tile.
-    out.par_sort_unstable_by_key(|t| (t.plane, t.y, t.x));
+    // Deterministic despite parallelism: packed keys are unique per tile. Node ids are
+    // assigned in packed-key (v9: plane-major Morton) order.
+    out.par_sort_unstable_by_key(|t| navpath_core::snapshot::pack_coord(t.x, t.y, t.plane));
     Ok(out)
 }
 
