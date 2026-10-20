@@ -861,7 +861,7 @@ fn global_step_kind(meta: &serde_json::Value) -> &str {
 }
 
 /// The eligible global teleport landing on `dst` with the lowest effective cost
-/// (quick-tele lodestones at 2400 ms), with its load-time-parsed metadata. Ties keep the
+/// (quick-tele lodestones at `QUICK_TELE_LODESTONE_MS`), with its load-time-parsed metadata. Ties keep the
 /// first teleport in snapshot order — the strict `<` replacement rule of the per-payload
 /// maps this lookup replaces (T3.8). Called only for the rare path steps that are neither
 /// walk nor macro edges, and for a virtual start's entry, so a scan over the ~124
@@ -877,7 +877,7 @@ fn eligible_global_to<'g>(
         if g.dst != dst || g.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
             continue;
         }
-        let cost = if quick_tele && g.kind_first == 2 { 2400.0 } else { g.cost };
+        let cost = if quick_tele && g.kind_first == 2 { navpath_core::QUICK_TELE_LODESTONE_MS } else { g.cost };
         if best.is_none_or(|(c, _)| cost < c) {
             best = Some((cost, &g.meta));
         }
@@ -1038,7 +1038,7 @@ fn build_route_payload(
                 let mut cost_ms = snap.macro_w().get(idx).copied().unwrap_or(0.0);
                 let k = snap.macro_kind_first().get(idx).copied().unwrap_or(0);
                 if quick_tele && k == 2 {
-                    cost_ms = 2400.0;
+                    cost_ms = navpath_core::QUICK_TELE_LODESTONE_MS;
                 }
                 if chosen.is_none_or(|(_, best_cost)| cost_ms < best_cost) {
                     chosen = Some((idx, cost_ms));
@@ -1064,7 +1064,7 @@ fn build_route_payload(
                 _ => "teleport",
             };
             if quick_tele && kstr == "lodestone" {
-                cost_ms = 2400.0;
+                cost_ms = navpath_core::QUICK_TELE_LODESTONE_MS;
             }
 
             // For doors, compute dynamic approach direction (IN/OUT) using db_row tile_inside/tile_outside
@@ -1197,7 +1197,7 @@ fn build_route_payload(
     (Some(optimize_with_surge_dive(acts, &job.surge, &job.dive, route_origin)), geometry)
 }
 
-/// A global teleport action; `gc` is its effective cost (quick-tele lodestones 2400).
+/// A global teleport action; `gc` is its effective cost (quick-tele lodestones `QUICK_TELE_LODESTONE_MS`).
 fn global_action(
     meta: &Arc<serde_json::Value>,
     quick_tele: bool,
@@ -1209,7 +1209,7 @@ fn global_action(
     let meta = meta.clone();
     // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
     let kstr = global_step_kind(&meta);
-    let cost_ms = if quick_tele && kstr == "lodestone" { 2400.0 } else { gc as f64 };
+    let cost_ms = if quick_tele && kstr == "lodestone" { navpath_core::QUICK_TELE_LODESTONE_MS as f64 } else { gc as f64 };
     Action::Global(Box::new(GlobalAction {
         kind: kstr.to_string(),
         from: MinMax::point(from.0, from.1, from.2),

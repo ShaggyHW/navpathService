@@ -753,7 +753,7 @@ pub fn build_profile_artifacts(
         if allowed {
             let mut cost = g.cost;
             if quick_tele && g.kind_first == 2 {
-                cost = 2400.0;
+                cost = navpath_core::QUICK_TELE_LODESTONE_MS;
             }
             eligible_globals.push((g.dst, cost));
         }

@@ -55,13 +55,13 @@ fn parse_globals(snap: &Snapshot) -> Vec<(u32, f32)> {
 }
 
 /// The builder's table graph, rebuilt from a snapshot: walk CSR + macro edges
-/// (lodestone-first floored at the quick-tele 2400 ms) + the full fairy clique.
+/// (lodestone-first floored at the quick-tele cost) + the full fairy clique.
 fn structure_of(snap: &Snapshot) -> Structure {
     let n = snap.counts().nodes as usize;
     let (ms, md, mw, mk) = (snap.macro_src(), snap.macro_dst(), snap.macro_w(), snap.macro_kind_first());
     let mut es: Vec<u32> = ms.to_vec();
     let mut ed: Vec<u32> = md.to_vec();
-    let mut ew: Vec<f32> = mw.iter().zip(mk).map(|(&w, &k)| if k == 2 { w.min(2400.0) } else { w }).collect();
+    let mut ew: Vec<f32> = mw.iter().zip(mk).map(|(&w, &k)| if k == 2 { w.min(navpath_core::QUICK_TELE_LODESTONE_MS) } else { w }).collect();
     let (fnodes, fcost) = (snap.fairy_nodes(), snap.fairy_cost_ms());
     for &a in fnodes {
         for (j, &b) in fnodes.iter().enumerate() {

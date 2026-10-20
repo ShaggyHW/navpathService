@@ -262,9 +262,9 @@ impl NeighborProvider {
             if ed.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
                 allowed[i] = false;
             }
-            // Hardcoded: lodestone cost when hasQuickTele=1
+            // Lodestone cost when hasQuickTele=1
             if quick_tele && ed.kind_first == 2 {
-                w[i] = 2400.0;
+                w[i] = crate::QUICK_TELE_LODESTONE_MS;
             }
         }
         MacroFilter { allowed, w }

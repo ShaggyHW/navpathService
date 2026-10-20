@@ -119,7 +119,7 @@ impl Recoster {
             if g.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
                 continue;
             }
-            let cost = if quick_tele && g.kind_first == 2 { 2400.0 } else { g.cost };
+            let cost = if quick_tele && g.kind_first == 2 { navpath_core::QUICK_TELE_LODESTONE_MS } else { g.cost };
             let e = global_cost.entry(g.dst).or_insert(f32::INFINITY);
             if cost < *e {
                 *e = cost;
@@ -137,7 +137,7 @@ impl Recoster {
                 if data.reqs.iter().any(|&idx| !mask.is_satisfied(idx)) {
                     continue;
                 }
-                let w = if quick_tele && data.kind_first == 2 { 2400.0 } else { adj.w[slot] };
+                let w = if quick_tele && data.kind_first == 2 { navpath_core::QUICK_TELE_LODESTONE_MS } else { adj.w[slot] };
                 let key = (u, adj.dst[slot]);
                 let entry = macro_w.entry(key).or_insert(f32::INFINITY);
                 if w < *entry {

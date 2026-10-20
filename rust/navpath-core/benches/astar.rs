@@ -465,7 +465,7 @@ fn bench_astar(c: &mut Criterion) {
     let macros_rev = LazyCell::new(|| NeighborProvider::new(n, snap.macro_dst(), snap.macro_src(), snap.macro_w()));
 
     // Gated (lodestone-only quick-tele) profile: only lodestone macro edges eligible,
-    // rewritten to the 2400 ms quick-tele cost; globals reduced to lodestones at 2400.
+    // rewritten to the quick-tele cost; globals reduced to lodestones at that cost.
     // Kind data per CSR slot comes from a kinds-aware provider built from the same
     // arrays (identical counting-sort slot order as the view's provider); the
     // providers are dropped once the (fw, rev) filters are extracted.
@@ -478,7 +478,7 @@ fn bench_astar(c: &mut Criterion) {
                     .w
                     .iter()
                     .zip(p.macro_data.iter())
-                    .map(|(&w, d)| if d.kind_first == 2 { 2400.0 } else { w })
+                    .map(|(&w, d)| if d.kind_first == 2 { navpath_core::QUICK_TELE_LODESTONE_MS } else { w })
                     .collect(),
             }
         };
@@ -499,7 +499,7 @@ fn bench_astar(c: &mut Criterion) {
         v.extra.global = globals_full
             .iter()
             .filter(|&&(_, _, k)| k == 2)
-            .map(|&(d, _, _)| (d, 2400.0))
+            .map(|&(d, _, _)| (d, navpath_core::QUICK_TELE_LODESTONE_MS))
             .collect::<Vec<_>>()
             .into();
         v

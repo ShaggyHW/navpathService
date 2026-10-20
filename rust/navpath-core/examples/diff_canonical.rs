@@ -129,7 +129,7 @@ fn main() {
                                         .and_then(|a| a.first()).and_then(|s| s.get("kind"))
                                         .and_then(|v| v.as_str()).unwrap_or("");
                                     if dst != 0 && kind == "lodestone" {
-                                        out.push((dst, 2400.0));
+                                        out.push((dst, navpath_core::QUICK_TELE_LODESTONE_MS));
                                     }
                                 }
                             }
@@ -149,7 +149,7 @@ fn main() {
     // sanity: canonical view really is a CSR walk with coords
     assert!(matches!(canon.walk, WalkGraph::Csr { .. }) && canon.coords.is_some());
 
-    // Gated profile: only lodestone macro edges, at the 2400 ms quick-tele cost;
+    // Gated profile: only lodestone macro edges, at the quick-tele cost;
     // globals reduced to lodestones (mirrors the bench's astar_gated group).
     let empty_reqs: Vec<Vec<usize>> = vec![Vec::new(); snap.macro_src().len()];
     let kinds_fw = NeighborProvider::new_with_reqs(
@@ -158,7 +158,7 @@ fn main() {
     let gated_filter = navpath_core::engine::neighbors::MacroFilter {
         allowed: kinds_fw.macro_data.iter().map(|d| d.kind_first == 2).collect(),
         w: kinds_fw.macro_edges.w.iter().zip(kinds_fw.macro_data.iter())
-            .map(|(&w, d)| if d.kind_first == 2 { 2400.0 } else { w }).collect(),
+            .map(|(&w, d)| if d.kind_first == 2 { navpath_core::QUICK_TELE_LODESTONE_MS } else { w }).collect(),
     };
     let filter: Option<&navpath_core::engine::neighbors::MacroFilter> =
         if gated { Some(&gated_filter) } else { None };

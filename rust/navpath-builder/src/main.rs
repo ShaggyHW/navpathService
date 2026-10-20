@@ -698,14 +698,14 @@ fn main() -> Result<()> {
     // weights >= the ones used here):
     //  - fairy hops connect every ring to every other ring at the destination ring's
     //    cost; per-request eligibility only removes rings, which keeps bounds valid;
-    //  - quick-tele can lower lodestone-first macro edges (kind_first == 2) to 2400ms
-    //    at query time, so the table graph uses min(w, 2400) for those.
+    //  - quick-tele replaces lodestone-first macro edges (kind_first == 2) with
+    //    QUICK_TELE_LODESTONE_MS at query time, so the table graph uses min(w, it) for those.
     let mut alt_macro_src = macro_src.clone();
     let mut alt_macro_dst = macro_dst.clone();
     let mut alt_macro_w: Vec<f32> = macro_w
         .iter()
         .zip(macro_kind_first.iter())
-        .map(|(&w, &k)| if k == 2 { w.min(2400.0) } else { w })
+        .map(|(&w, &k)| if k == 2 { w.min(navpath_core::QUICK_TELE_LODESTONE_MS) } else { w })
         .collect();
     for a in &fairy_ring_rows {
         for b in &fairy_ring_rows {

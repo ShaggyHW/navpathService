@@ -42,7 +42,7 @@ fn parse_globals(snap: &Snapshot) -> Vec<(u32, f32)> {
                                 .and_then(|s| s.get("kind")).and_then(|v| v.as_str()).unwrap_or("");
                             if lode_only {
                                 if kind != "lodestone" { continue; }
-                                cost = 2400.0; // hasQuickTele
+                                cost = navpath_core::QUICK_TELE_LODESTONE_MS; // hasQuickTele
                             }
                             if dst != 0 { out.push((dst, cost)); }
                         }
