@@ -503,6 +503,20 @@ pub fn goal_reachable(
     ProfileReach::build(cg, mask).reachable(start_comp, goal_comp)
 }
 
+/// Cost of opening the fairy ring dial with the portable fairy ring item (its "Teleport"
+/// option), on top of the destination ring's own cost. The measured cost of any item that
+/// opens an option list (NavRecorder `Costs.ITEM_OPENS_LIST`, 0.22-0.81 s): the ring's
+/// cost already covers dialling and the teleport, exactly as on a ring-to-ring hop.
+pub const PORTABLE_FAIRY_OPEN_MS: f32 = 550.0;
+
+/// Planning surcharge on a portable hop: each one spends a charge of the item, so a real ring
+/// within ~2000 ms of walking (open + surcharge) wins — walk W + ring beats open + surcharge +
+/// ring whenever W < 2000. A preference, not a measured time.
+pub const PORTABLE_FAIRY_CHARGE_PENALTY_MS: f32 = 1450.0;
+
+/// Everything a portable hop costs on top of the destination ring's own cost.
+pub const PORTABLE_FAIRY_EXTRA_MS: f32 = PORTABLE_FAIRY_OPEN_MS + PORTABLE_FAIRY_CHARGE_PENALTY_MS;
+
 /// One profile's view of the [`ComponentGraph`] (T3.14): the eligible macro edges as a
 /// deduplicated component CSR, the eligible fairy-ring components, and the components
 /// eligible global teleports land in. Everything the per-request precheck used to
@@ -525,6 +539,12 @@ pub struct ProfileReach {
 
 impl ProfileReach {
     pub fn build(cg: &ComponentGraph, mask: &EligibilityMask) -> Self {
+        Self::build_with(cg, mask, false)
+    }
+
+    /// `portable_fairy`: the profile carries the portable fairy ring, so every eligible
+    /// ring is also an origin seed (it can be dialled from anywhere).
+    pub fn build_with(cg: &ComponentGraph, mask: &EligibilityMask, portable_fairy: bool) -> Self {
         let eligible = |reqs: &[usize]| reqs.iter().all(|&i| mask.is_satisfied(i));
         let mut n = cg.components;
         let mut edges: Vec<(u16, u16)> = Vec::new();
@@ -540,6 +560,9 @@ impl ProfileReach {
         rings.sort_unstable();
         rings.dedup();
         let mut globals: Vec<u16> = cg.globals.iter().filter(|(_, r)| eligible(r)).map(|&(c, _)| c).collect();
+        if portable_fairy {
+            globals.extend_from_slice(&rings);
+        }
         globals.sort_unstable();
         globals.dedup();
         for &c in rings.iter().chain(globals.iter()) {
@@ -654,7 +677,7 @@ fn sort_extra_edges(edges: &mut [(u32, f32)]) {
 
 /// Per-profile search artifacts (roadmap 5.4): everything a search rebuilds per
 /// request that is actually a pure function of (snapshot, exact eligibility mask bits,
-/// quick_tele) — the forward/reversed MacroFilters (959-slot scans over per-edge
+/// quick_tele, portable_fairy) — the forward/reversed MacroFilters (959-slot scans over per-edge
 /// requirement lists), the eligible global teleports, and the eligible fairy ring
 /// sources/destinations. Built once per profile via [`build_profile_artifacts`] and
 /// cached in the per-snapshot LRU ([`crate::SnapshotState::profile_cache`]); the
@@ -665,8 +688,11 @@ pub struct ProfileArtifacts {
     /// Same filter over the reversed macro adjacency (None when no reversed provider
     /// exists; bidirectional search is then unavailable, exactly as before).
     pub macro_filter_rev: Option<MacroFilter>,
-    /// Eligible global teleports (quick-tele effective costs), sorted by (dst, w).
+    /// Eligible global teleports (quick-tele effective costs), sorted by (dst, w). With
+    /// the portable fairy ring this also holds one origin hop per eligible ring.
     pub eligible_globals: Vec<(u32, f32)>,
+    /// The profile carries the portable fairy ring (`hasPortableFairyRing`).
+    pub portable_fairy: bool,
     /// Eligible fairy ring source nodes, sorted + deduped.
     pub fairy_sources: Vec<u32>,
     /// Eligible fairy ring destinations, sorted by (dst, w).
@@ -685,7 +711,7 @@ impl ProfileArtifacts {
     /// artifacts were built for (the profile cache is keyed on its exact bits, and both
     /// live per snapshot, like `cg`).
     pub fn reach(&self, cg: &ComponentGraph, mask: &EligibilityMask) -> &ProfileReach {
-        self.reach.get_or_init(|| ProfileReach::build(cg, mask))
+        self.reach.get_or_init(|| ProfileReach::build_with(cg, mask, self.portable_fairy))
     }
 
     /// The eligible globals' backward-landmark aggregate over `lm` (the snapshot these
@@ -712,6 +738,7 @@ pub fn build_profile_artifacts(
     fairy_rings: &[FairyRing],
     mask: &EligibilityMask,
     quick_tele: bool,
+    portable_fairy: bool,
 ) -> ProfileArtifacts {
     // Eligible global teleports.
     let mut eligible_globals: Vec<(u32, f32)> = Vec::new();
@@ -731,7 +758,6 @@ pub fn build_profile_artifacts(
             eligible_globals.push((g.dst, cost));
         }
     }
-    sort_extra_edges(&mut eligible_globals);
 
     // Eligible fairy ring destinations (rings whose requirements are satisfied). For
     // each eligible source ring, the engine can teleport to any other eligible ring.
@@ -756,10 +782,21 @@ pub fn build_profile_artifacts(
     fairy_sources.dedup();
     sort_extra_edges(&mut fairy_dests);
 
+    // Portable fairy ring: the dial opens anywhere, so every eligible ring is an origin
+    // teleport like any other global (relaxed from the start only), priced open + charge
+    // surcharge + ring (see PORTABLE_FAIRY_EXTRA_MS).
+    if portable_fairy {
+        for &(node, cost) in &fairy_dests {
+            eligible_globals.push((node, PORTABLE_FAIRY_EXTRA_MS + cost));
+        }
+    }
+    sort_extra_edges(&mut eligible_globals);
+
     ProfileArtifacts {
         macro_filter: neighbors.macro_filter(mask, quick_tele),
         macro_filter_rev: neighbors_rev.map(|rev| rev.macro_filter(mask, quick_tele)),
         eligible_globals,
+        portable_fairy,
         fairy_sources,
         fairy_dests,
         reach: OnceLock::new(),
@@ -1308,6 +1345,25 @@ mod tests {
         // No eligible entry at all: virtual start reaches nothing.
         let cg2 = ComponentGraph { components: 2, macro_edges: vec![], fairy: vec![], globals: vec![(1, vec![0])] };
         assert!(!goal_reachable(&cg2, &mask_of(&[false]), None, 1));
+    }
+
+    #[test]
+    fn portable_fairy_ring_seeds_every_eligible_ring() {
+        // Start in comp 0 with no way out; rings in comps 1 and 2 (ring 2 gated by tag 0).
+        let cg = ComponentGraph {
+            components: 3,
+            macro_edges: vec![],
+            fairy: vec![(1, vec![]), (2, vec![0])],
+            globals: vec![],
+        };
+        let without = ProfileReach::build_with(&cg, &mask_of(&[true]), false);
+        assert!(!without.reachable(Some(0), 1));
+        let with = ProfileReach::build_with(&cg, &mask_of(&[true]), true);
+        assert!(with.reachable(Some(0), 1) && with.reachable(Some(0), 2));
+        assert!(with.reachable(None, 2), "an off-graph start dials a ring too");
+        // A ring the profile may not use stays out of reach even with the item.
+        let gated = ProfileReach::build_with(&cg, &mask_of(&[false]), true);
+        assert!(gated.reachable(Some(0), 1) && !gated.reachable(Some(0), 2));
     }
 
     /// The pre-T3.14 precheck, verbatim: per-request filtering plus fixpoint sweeps.

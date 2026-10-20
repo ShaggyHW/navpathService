@@ -46,8 +46,20 @@ pub struct Profile {
 }
 
 fn req_has_quick_tele(reqs: &[RequirementKV]) -> bool {
+    req_flag(reqs, "hasQuickTele")
+}
+
+/// The client carries the portable fairy ring (`hasPortableFairyRing=1`): every eligible
+/// fairy ring becomes an origin teleport. Read straight from the profile like
+/// `hasQuickTele` — no requirement row, so no snapshot rebuild.
+fn req_has_portable_fairy(reqs: &[RequirementKV]) -> bool {
+    req_flag(reqs, "hasPortableFairyRing")
+}
+
+/// A profile flag set to 1 / true / "1".
+fn req_flag(reqs: &[RequirementKV], key: &str) -> bool {
     for r in reqs {
-        if r.key.trim().eq_ignore_ascii_case("hasQuickTele") {
+        if r.key.trim().eq_ignore_ascii_case(key) {
             if r.value.as_i64() == Some(1) || r.value.as_u64() == Some(1) {
                 return true;
             }
@@ -240,12 +252,14 @@ pub struct GlobalAction {
     pub metadata: Arc<serde_json::Value>,
 }
 
-/// `from` block of a fairy ring action (carries the source ring's object id).
+/// `from` block of a fairy ring action (carries the source ring's object id; none for
+/// a portable fairy ring hop, which opens the dial from the item instead).
 #[derive(Debug, Serialize)]
 pub struct FairyFrom {
     pub min: [i32; 3],
     pub max: [i32; 3],
-    pub object_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<u64>,
 }
 
 /// A fairy ring hop.
@@ -871,6 +885,77 @@ fn eligible_global_to<'g>(
     best
 }
 
+/// How the route's origin reaches `dst` without walking: an eligible global teleport, or
+/// (portable fairy ring) dialling `dst`'s ring from wherever the player stands.
+enum OriginHop<'g> {
+    Global(f32, &'g Arc<serde_json::Value>),
+    /// Index into the snapshot's fairy rings, and the hop's cost (open + charge surcharge + ring).
+    Portable(usize, f32),
+}
+
+impl OriginHop<'_> {
+    fn cost(&self) -> f32 {
+        match self {
+            OriginHop::Global(c, _) | OriginHop::Portable(_, c) => *c,
+        }
+    }
+}
+
+/// The cheapest [`OriginHop`] landing on `dst` — the same candidates
+/// `build_profile_artifacts` handed the engine as `eligible_globals`. Ties keep the global.
+fn origin_hop_to<'g>(job: &'g RouteJob, dst: u32) -> Option<OriginHop<'g>> {
+    let global = eligible_global_to(&job.cur.globals, &job.mask, job.quick_tele, dst)
+        .map(|(c, meta)| OriginHop::Global(c, meta));
+    let portable = if job.portable_fairy {
+        job.cur.node_to_fairy_ring.get(&dst).and_then(|&i| {
+            let ring = &job.cur.fairy_rings[i];
+            ring.req_tag_idxs
+                .iter()
+                .all(|&idx| job.mask.is_satisfied(idx))
+                .then(|| OriginHop::Portable(i, engine_adapter::PORTABLE_FAIRY_EXTRA_MS + ring.cost_ms))
+        })
+    } else {
+        None
+    };
+    match (global, portable) {
+        (Some(g), Some(p)) => Some(if p.cost() < g.cost() { p } else { g }),
+        (g, p) => g.or(p),
+    }
+}
+
+/// A fairy ring action landing on `dst_ring`, dialled at the ring `src` (an object id to
+/// click) or, with `src = None`, from the portable fairy ring item.
+fn fairy_action(
+    src: Option<&engine_adapter::FairyRing>,
+    dst_ring: &engine_adapter::FairyRing,
+    from: (i32, i32, i32),
+    to: (i32, i32, i32),
+    cost_ms: f64,
+) -> Action {
+    let mut meta = serde_json::Map::new();
+    if let Some(src_ring) = src {
+        meta.insert("source_code".to_string(), serde_json::Value::String(src_ring.code.clone()));
+    } else {
+        meta.insert("portable".to_string(), serde_json::Value::Bool(true));
+    }
+    meta.insert("destination_code".to_string(), serde_json::Value::String(dst_ring.code.clone()));
+    if let Some(ref action) = dst_ring.action {
+        meta.insert("action".to_string(), serde_json::Value::String(action.clone()));
+    }
+    Action::Fairy(Box::new(FairyAction {
+        kind: "fairy_ring",
+        from: FairyFrom {
+            min: [from.0, from.1, from.2],
+            max: [from.0, from.1, from.2],
+            object_id: src.map(|r| r.object_id),
+        },
+        to: MinMax::point(to.0, to.1, to.2),
+        code: dst_ring.code.clone(),
+        cost_ms,
+        metadata: serde_json::Value::Object(meta),
+    }))
+}
+
 /// Build the optional actions/geometry payload for a route. Runs in the request's
 /// blocking task (or inline for small cache hits) so thousands of per-step
 /// constructions never stall the async reactor threads. Emits typed [`Action`]s
@@ -936,7 +1021,7 @@ fn build_route_payload(
         }));
     }
 
-    for w in path.windows(2) {
+    for (step, w) in path.windows(2).enumerate() {
         let (u, v) = (w[0], w[1]);
         let (x1, y1, p1) = coord(u);
         let (x2, y2, p2) = coord(v);
@@ -1033,46 +1118,34 @@ fn build_route_payload(
                     to: [x2, y2, p2],
                     cost_ms: w_cost.round() as f64,
                 }));
-            } else if let Some((gc, meta)) = eligible_global_to(globals, mask, quick_tele, v) {
-                // Metadata stays behind the shared Arc — serialization reads through it.
-                let meta = meta.clone();
-                // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
-                let kstr = global_step_kind(&meta);
-                let cost_ms = if quick_tele && kstr == "lodestone" { 2400.0 } else { gc as f64 };
-                let kind = kstr.to_string();
-                acts.push(Action::Global(Box::new(GlobalAction {
-                    kind,
-                    from: MinMax::point(x1, y1, p1),
-                    to: MinMax::point(x2, y2, p2),
-                    cost_ms,
-                    metadata: meta,
-                })));
             } else {
-                // Check if this is a fairy ring hop (u and v are both fairy ring nodes)
-                let src_ring_idx = node_to_fairy_ring.get(&u);
-                let dst_ring_idx = node_to_fairy_ring.get(&v);
-                if let (Some(&src_idx), Some(&dst_idx)) = (src_ring_idx, dst_ring_idx) {
-                    // Fairy ring teleport
-                    let src_ring = &fairy_rings[src_idx];
-                    let dst_ring = &fairy_rings[dst_idx];
-                    let mut meta = serde_json::Map::new();
-                    meta.insert("source_code".to_string(), serde_json::Value::String(src_ring.code.clone()));
-                    meta.insert("destination_code".to_string(), serde_json::Value::String(dst_ring.code.clone()));
-                    if let Some(ref action) = dst_ring.action {
-                        meta.insert("action".to_string(), serde_json::Value::String(action.clone()));
-                    }
-                    acts.push(Action::Fairy(Box::new(FairyAction {
-                        kind: "fairy_ring",
-                        from: FairyFrom {
-                            min: [x1, y1, p1],
-                            max: [x1, y1, p1],
-                            object_id: src_ring.object_id,
-                        },
-                        to: MinMax::point(x2, y2, p2),
-                        code: dst_ring.code.clone(),
-                        cost_ms: dst_ring.cost_ms as f64,
-                        metadata: serde_json::Value::Object(meta),
-                    })));
+                // A teleport edge: a ring-to-ring hop (u and v both fairy ring nodes), or —
+                // on the FIRST edge of an on-graph start only, since the engine relaxes
+                // globals from the start node and nowhere else — a global teleport or a
+                // portable fairy ring hop. Each is labelled by the cheapest candidate, so a
+                // ring hop whose destination also has a global (Zanaris via Grace of the
+                // elves) is no longer emitted as that global.
+                let ring_hop = match (node_to_fairy_ring.get(&u), node_to_fairy_ring.get(&v)) {
+                    (Some(&s), Some(&d)) => Some((s, d)),
+                    _ => None,
+                };
+                let origin = if step == 0 && job.virtual_start_from.is_none() { origin_hop_to(job, v) } else { None };
+                let origin = match (origin, ring_hop) {
+                    (Some(o), Some((_, d))) if o.cost() >= fairy_rings[d].cost_ms => None,
+                    (o, _) => o,
+                };
+                if let Some(o) = origin {
+                    acts.push(match o {
+                        OriginHop::Global(gc, meta) => global_action(meta, quick_tele, gc, (x1, y1, p1), (x2, y2, p2)),
+                        OriginHop::Portable(d, cost) => {
+                            fairy_action(None, &fairy_rings[d], (x1, y1, p1), (x2, y2, p2), cost as f64)
+                        }
+                    });
+                } else if let Some((s, d)) = ring_hop {
+                    let dst_ring = &fairy_rings[d];
+                    acts.push(fairy_action(Some(&fairy_rings[s]), dst_ring, (x1, y1, p1), (x2, y2, p2), dst_ring.cost_ms as f64));
+                } else if let Some((gc, meta)) = eligible_global_to(globals, mask, quick_tele, v) {
+                    acts.push(global_action(meta, quick_tele, gc, (x1, y1, p1), (x2, y2, p2)));
                 } else {
                     // Fallback: unknown edge kind; emit as generic teleport with zero cost
                     acts.push(Action::Teleport(TeleportAction {
@@ -1089,19 +1162,30 @@ fn build_route_payload(
     // If we had a virtual start, fill slot 0 with the synthetic first action, derived from
     // the selected global teleport's metadata/cost.
     if let Some(mut virtual_action) = virtual_start_action {
+        let mut entry_fairy: Option<Action> = None;
         if let Some(entry_id) = virtual_entry {
-            if let Some((gc, meta)) = eligible_global_to(globals, mask, quick_tele, entry_id) {
-                virtual_action.cost_ms = serde_json::Number::from_f64(gc as f64)
-                    .unwrap_or_else(|| serde_json::Number::from(0));
-                virtual_action.kind = global_step_kind(meta).to_string();
-                if let Some(obj) = virtual_action.metadata.as_object_mut() {
-                    // The metadata subtree is mutated here, so this one clones out of
-                    // the Arc (exactly as before).
-                    obj.insert("teleport".to_string(), (**meta).clone());
+            match origin_hop_to(job, entry_id) {
+                Some(OriginHop::Global(gc, meta)) => {
+                    virtual_action.cost_ms = serde_json::Number::from_f64(gc as f64)
+                        .unwrap_or_else(|| serde_json::Number::from(0));
+                    virtual_action.kind = global_step_kind(meta).to_string();
+                    if let Some(obj) = virtual_action.metadata.as_object_mut() {
+                        // The metadata subtree is mutated here, so this one clones out of
+                        // the Arc (exactly as before).
+                        obj.insert("teleport".to_string(), (**meta).clone());
+                    }
                 }
+                Some(OriginHop::Portable(d, cost)) => {
+                    // Entered by dialling a ring from the off-graph start: a portable fairy
+                    // ring action from the requested coordinate, in the virtual start's slot.
+                    let f = virtual_action.from.min;
+                    let t = virtual_action.to.min;
+                    entry_fairy = Some(fairy_action(None, &fairy_rings[d], (f[0], f[1], f[2]), (t[0], t[1], t[2]), cost as f64));
+                }
+                None => {}
             }
         }
-        acts[0] = Action::VirtualStart(Box::new(virtual_action));
+        acts[0] = entry_fairy.unwrap_or_else(|| Action::VirtualStart(Box::new(virtual_action)));
     }
 
     // The tile the character stands on before the first action. For a virtual start the
@@ -1111,6 +1195,28 @@ fn build_route_payload(
 
     // Apply surge/dive optimization to the actions
     (Some(optimize_with_surge_dive(acts, &job.surge, &job.dive, route_origin)), geometry)
+}
+
+/// A global teleport action; `gc` is its effective cost (quick-tele lodestones 2400).
+fn global_action(
+    meta: &Arc<serde_json::Value>,
+    quick_tele: bool,
+    gc: f32,
+    from: (i32, i32, i32),
+    to: (i32, i32, i32),
+) -> Action {
+    // Metadata stays behind the shared Arc — serialization reads through it.
+    let meta = meta.clone();
+    // Prefer the specific step kind (e.g., "lodestone", "npc") if present in metadata
+    let kstr = global_step_kind(&meta);
+    let cost_ms = if quick_tele && kstr == "lodestone" { 2400.0 } else { gc as f64 };
+    Action::Global(Box::new(GlobalAction {
+        kind: kstr.to_string(),
+        from: MinMax::point(from.0, from.1, from.2),
+        to: MinMax::point(to.0, to.1, to.2),
+        cost_ms,
+        metadata: meta,
+    }))
 }
 
 /// Everything one route's search and payload work needs, shared by its blocking tasks
@@ -1127,6 +1233,7 @@ struct RouteJob {
     used_virtual_start: bool,
     seed: Option<u64>,
     quick_tele: bool,
+    portable_fairy: bool,
     return_geometry: bool,
     only_actions: bool,
     surge: SurgeConfig,
@@ -1549,6 +1656,7 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
     }
 
     let quick_tele = req_has_quick_tele(&req.profile.requirements);
+    let portable_fairy = req_has_portable_fairy(&req.profile.requirements);
 
     let mask = build_mask_from_u32(
         snap.req_tags(),
@@ -1577,13 +1685,14 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
     // repeated requests hit the per-snapshot LRU and skip the search entirely (payload
     // is still rebuilt per request so one entry serves every options combination).
     let mask_bits = crate::pack_mask_bits(&mask.satisfied);
-    let profile_key: crate::ProfileKey = (mask_bits.clone(), quick_tele);
+    let profile_key: crate::ProfileKey = (mask_bits.clone(), quick_tele, portable_fairy);
     let cache_key = crate::RouteCacheKey {
         virtual_start: used_virtual_start,
         sid: if used_virtual_start { 0 } else { sid },
         gid,
         mask_bits,
         quick_tele,
+        portable_fairy,
         seed: if crate::cache_ignore_seed() { None } else { req.seed },
     };
     let cached: Option<crate::RouteCacheEntry> = cur
@@ -1661,6 +1770,7 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
         used_virtual_start,
         seed,
         quick_tele,
+        portable_fairy,
         return_geometry: req.options.return_geometry,
         only_actions: req.options.only_actions,
         surge: req.surge,
@@ -1709,6 +1819,7 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
                     cur.fairy_rings.as_slice(),
                     &job.mask,
                     quick_tele,
+                    portable_fairy,
                 ));
                 if let Ok(mut c) = cur.profile_cache.lock() {
                     c.put(profile_key.clone(), built.clone());

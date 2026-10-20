@@ -113,7 +113,7 @@ fn main() {
     let ntags = snap.req_tags().len() / 4;
     let mask = navpath_core::eligibility::EligibilityMask { satisfied: vec![profile == "all"; ntags] };
     let arts = build_profile_artifacts(
-        st.neighbors.as_ref().unwrap(), st.neighbors_rev.as_deref(), &st.globals, &st.fairy_rings, &mask, false,
+        st.neighbors.as_ref().unwrap(), st.neighbors_rev.as_deref(), &st.globals, &st.fairy_rings, &mask, false, false,
     );
     let cg = st.comp_graph.clone().unwrap();
     let reach = arts.reach(&cg, &mask);

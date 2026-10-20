@@ -241,7 +241,7 @@ cargo run -p navpath-service --release -- --no-seed
 ## Route cache
 
 Results are cached per snapshot in an LRU keyed on
-`(start, goal, exact eligibility bits, hasQuickTele, seed)`. A hit skips the search
+`(start, goal, exact eligibility bits, hasQuickTele, hasPortableFairyRing, seed)`. A hit skips the search
 entirely (sub-millisecond responses); the actions/geometry payload is still rebuilt per
 request, so one entry serves every `options`/`surge`/`dive` combination. The cache is
 dropped whenever the snapshot is swapped (`/admin/reload`). A reload whose snapshot file
@@ -328,3 +328,15 @@ You can check the rest of the keys in the worldReachableTiles.db TeleportRequire
 
 IF YOU WANT TO BUILD YOUR OWN DATABASE, I GOT MINE BY USING THIS REPO:
 https://github.com/ShaggyHW/rs3cache_extractor
+
+## Portable fairy ring
+
+A profile with `hasPortableFairyRing=1` (read straight from the request, like `hasQuickTele` — no
+requirement row, no rebuild) makes every fairy ring the profile may use an origin teleport:
+`build_profile_artifacts` adds `(ring, PORTABLE_FAIRY_EXTRA_MS + ring cost)` to the eligible globals
+(relaxed from the start only; EXTRA = 550 open + 1450 charge surcharge, so a real ring within ~2000 ms
+of walking wins), and the reachability precheck seeds the ring components. The payload
+emits it as `{"type":"fairy_ring", "from":{min,max} (no object_id), "code", "metadata":{"portable":true,
+"destination_code", "action"}}` — also as the first action of an off-graph (virtual) start. A teleport
+edge on the first step is labelled by the cheapest of global / portable / ring-to-ring hop; later
+teleport edges are ring hops (globals are never relaxed past the start).

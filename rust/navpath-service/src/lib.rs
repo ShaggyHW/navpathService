@@ -29,6 +29,7 @@ pub struct RouteCacheKey {
     /// every further key copy is a reference-count bump.
     pub mask_bits: Arc<[u64]>,
     pub quick_tele: bool,
+    pub portable_fairy: bool,
     pub seed: Option<u64>,
 }
 
@@ -137,9 +138,9 @@ impl CacheOutcome {
 
 /// Key for the per-profile artifact cache (roadmap 5.4): the eligibility mask's EXACT
 /// packed bits (via [`pack_mask_bits`] — lossless, same rationale as the route-cache
-/// key) plus the quick-tele flag. Snapshot identity is implicit: the cache lives in
+/// key) plus the quick-tele and portable-fairy-ring flags. Snapshot identity is implicit: the cache lives in
 /// [`SnapshotState`], so a snapshot swap drops it wholesale.
-pub type ProfileKey = (Arc<[u64]>, bool);
+pub type ProfileKey = (Arc<[u64]>, bool, bool);
 
 /// One cached optimal path with a node -> position index, for exact sub-path reuse.
 /// `res` is the same allocation the route cache holds (T3.6).
@@ -843,7 +844,7 @@ mod subpath_tests {
     #[test]
     fn subpath_cache_serves_exact_slices_and_reports_goal_known() {
         let cache = new_subpath_cache().expect("enabled by default");
-        let key: ProfileKey = (Arc::from([0b101u64]), false);
+        let key: ProfileKey = (Arc::from([0b101u64]), false, false);
         insert(&cache, &key, res(vec![10, 11, 12, 13], vec![0.0, 300.0, 600.0, 1024.0]));
 
         // suffix
@@ -866,7 +867,7 @@ mod subpath_tests {
         let (hit, known) = subpath_lookup(&cache, &key, 10, 99);
         assert!(hit.is_none() && !known);
         // other profile sees nothing
-        assert!(subpath_lookup(&cache, &(Arc::from([0b111u64]), false), 11, 13).0.is_none());
+        assert!(subpath_lookup(&cache, &(Arc::from([0b111u64]), false, false), 11, 13).0.is_none());
         // truncated / not-found results are never inserted
         let mut bad = res(vec![1, 2], vec![0.0, 300.0]);
         bad.status = SearchStatus::BudgetExceeded;

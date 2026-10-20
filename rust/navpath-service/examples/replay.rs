@@ -322,6 +322,7 @@ fn main() {
                 &ctx.fairy_rings,
                 &mask,
                 entry.quick_tele,
+                false,
             );
             (mask, recoster, artifacts)
         });
