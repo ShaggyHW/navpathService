@@ -22,8 +22,9 @@ pub mod engine;
 /// Cost (ms) of a lodestone-first macro edge when the request has quick teleport
 /// (`hasQuickTele`): it replaces the edge's sheet cost (17000, the normal teleport).
 /// Measured through the Hoor2 executor at 6.6-7.4 s per quick lodestone node, click to
-/// arrival animation done (2026-10-16 cost audit). Was a hard-coded 2400.
-pub const QUICK_TELE_LODESTONE_MS: f32 = 7000.0;
+/// arrival animation done (2026-10-16 cost audit), then lowered to 5000 to favor
+/// quick lodestones more. Was a hard-coded 2400.
+pub const QUICK_TELE_LODESTONE_MS: f32 = 5000.0;
 
 pub use snapshot::Snapshot;
 pub use engine::{EngineView, SearchParams, SearchResult, SearchStatus, NeighborProvider, LandmarkHeuristic};
