@@ -705,6 +705,14 @@ pub struct Metrics {
     /// Nanoseconds per heap pop, log2 buckets: the memory-behaviour signal. Warm searches
     /// sit at 128-256 ns; a cold page cache shows up as 32-128 µs.
     pub ns_per_pop_log2: [AtomicU64; 22],
+    /// `/route_area` accounting, kept apart from the `/route` counters above: requests,
+    /// fresh searches, and their outcomes (found / not found / truncated by budget or
+    /// cancellation; precheck rejections count as not found).
+    pub area_requests: AtomicU64,
+    pub area_searches: AtomicU64,
+    pub area_found: AtomicU64,
+    pub area_not_found: AtomicU64,
+    pub area_truncated: AtomicU64,
 }
 
 impl Metrics {
@@ -776,6 +784,13 @@ impl Metrics {
             "search_ms_log2": hist(&self.search_ms_log2),
             "search_us_log2": hist(&self.search_us_log2),
             "ns_per_pop_log2": hist(&self.ns_per_pop_log2),
+            "area": {
+                "requests": c(&self.area_requests),
+                "searches": c(&self.area_searches),
+                "found": c(&self.area_found),
+                "not_found": c(&self.area_not_found),
+                "truncated": c(&self.area_truncated),
+            },
         })
     }
 }
@@ -819,6 +834,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(routes::health))
         .route("/healthz", get(routes::health))
         .route("/route", post(routes::route))
+        .route("/route_area", post(routes::route_area))
         .route("/tile/exists", get(routes::tile_exists))
         .route("/reachable", get(routes::reachable))
         .route("/admin/reload", post(routes::reload))

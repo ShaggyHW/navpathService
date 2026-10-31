@@ -201,6 +201,61 @@ curl -s http://127.0.0.1:8080/route \
   }'
 ```
 
+### Route to an area
+
+`POST /route_area` returns the cheapest route to **any** tile of an area (emote clue
+rectangles, search/cryptic walk areas) and says which tile it ends on. It is a separate
+endpoint: `/route` (one goal tile) is unchanged.
+
+```sh
+curl -s http://127.0.0.1:8080/route_area \
+  -H 'content-type: application/json' \
+  -d '{
+    "start": {"wx": 3222, "wy": 3218, "plane": 0},
+    "goal_area": {"min_wx": 2842, "min_wy": 3486, "max_wx": 2858, "max_wy": 3502, "plane": 1},
+    "goal_tiles": [{"wx": 2860, "wy": 3500, "plane": 1}],
+    "goal": {"wx": 2848, "wy": 3494, "plane": 1},
+    "profile": {"requirements": []}, "options": {"only_actions": true}, "seed": 123
+  }'
+```
+
+- **Request:** the `/route` body (`start` or `start_id`, `profile`, `options`, `surge`,
+  `dive`, `seed`), plus the goal set. `goal_area` is an inclusive rectangle on one plane
+  (at most 4096 tiles, i.e. 64x64). `goal_tiles` is an explicit list that may span planes
+  (at most 4096). Give either or both; the goal set is their union. Tiles that are not in
+  the snapshot are skipped. A start that is off the snapshot enters through a global
+  teleport, as on `/route`. `goal` is optional and only breaks exact cost ties: among
+  equally cheap tiles the one nearest to it (Chebyshev, same plane first) wins, then the
+  lowest node id.
+- **Response:** the `/route` fields, plus:
+  - `goal_reached`: the `{wx, wy, plane}` tile the path ends on. This is the first area
+    tile the path reaches. It is absent when `found` is false.
+  - `goal_tiles_resolved`: how many area tiles exist in the snapshot.
+  - `goal_tiles_searched`: how many tiles the search targeted (see below).
+- **Semantics:** `cost` is the minimum, over the area's tiles, of the single-tile route
+  cost (same profile and seed). The cheapest tile can be an interior one: a teleport, a
+  lodestone, a fairy ring, a door or stairs can land inside the area. The search only
+  targets tiles a route can reach first: tiles with a walkable neighbour outside the
+  area, tiles some edge lands on, and the start tile. Every other tile is strictly more
+  expensive than the boundary tile its route crossed, so leaving it out is exact. Tiles in
+  components the profile cannot reach are dropped too. If none is left, the response is
+  `found: false` and no search runs.
+- **Errors (400):** no `goal_area`/`goal_tiles`, an inverted or oversized rectangle, more
+  than 4096 tiles, or `"no goal_area tile in snapshot"` when no tile of the set exists.
+- **Engine:** one engine per request, never the hedged race, so the same request always
+  ends on the same tile. Unseeded requests run the unidirectional engine (JPS when
+  `NAVPATH_JPS=1`), which resolves exact ties by `goal`. Seeded requests run the race's
+  primary, or the default policy when the race is off. Jitter makes seeded ties
+  vanishingly rare. Area results bypass the route and sub-path caches, so `/route` caching
+  is unaffected. `/stats` reports the endpoint under `area`.
+
+Acceptance sweep on the real snapshot (exactness against brute force over every area
+tile, path ends on the first area tile, determinism, latency against a single-tile route):
+
+```sh
+NAVPATH_JPS=1 cargo run --release -p navpath-service --example area_sweep -- 80 [--seeded] [--profile=none] [--size=17]
+```
+
 ### Path Randomization
 
 You can add a `seed` parameter to get different paths for the same start/goal. Same seed = same path. Different seeds = different paths (when alternatives exist).

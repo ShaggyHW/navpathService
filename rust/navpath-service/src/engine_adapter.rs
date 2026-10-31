@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use rustc_hash::FxHashMap;
 
-use navpath_core::{EngineView, SearchParams, SearchResult, SearchStatus, Snapshot, NeighborProvider};
+use navpath_core::{EngineView, GoalSet, SearchParams, SearchResult, SearchStatus, Snapshot, NeighborProvider};
 use navpath_core::engine::canonical::CanonicalGrid;
 use navpath_core::engine::search::{ExtraEdges, SearchContext};
 use navpath_core::engine::neighbors::{MacroFilter, WalkGraph};
@@ -639,6 +639,50 @@ impl ProfileReach {
         }
         seen[g / 64] & (1u64 << (g % 64)) != 0
     }
+
+    /// The whole reachable component set from `start_comp` (same closure as
+    /// [`ProfileReach::reachable`]), as a predicate — one closure for a route to an area
+    /// instead of one per goal component.
+    pub fn reachable_comps(&self, start_comp: Option<u16>) -> impl Fn(u16) -> bool + '_ {
+        let mut seen = vec![0u64; self.n.div_ceil(64)];
+        let mut stack: Vec<u16> = Vec::with_capacity(32);
+        let visit = |c: u16, seen: &mut [u64], stack: &mut Vec<u16>| {
+            let (w, b) = (c as usize / 64, 1u64 << (c % 64));
+            if seen[w] & b == 0 {
+                seen[w] |= b;
+                stack.push(c);
+            }
+        };
+        if let Some(sc) = start_comp {
+            if (sc as usize) < self.n {
+                visit(sc, &mut seen, &mut stack);
+            }
+        }
+        for &c in &self.globals {
+            visit(c, &mut seen, &mut stack);
+        }
+        let mut rings_joined = false;
+        while let Some(c) = stack.pop() {
+            if !rings_joined && self.ring_bits[c as usize / 64] & (1u64 << (c % 64)) != 0 {
+                rings_joined = true;
+                for &r in &self.rings {
+                    visit(r, &mut seen, &mut stack);
+                }
+            }
+            let (s, e) = (self.offsets[c as usize] as usize, self.offsets[c as usize + 1] as usize);
+            for &d in &self.succ[s..e] {
+                visit(d, &mut seen, &mut stack);
+            }
+        }
+        // A component no edge, ring or global touches is reached only by a start inside it.
+        move |c: u16| {
+            if (c as usize) < self.n {
+                seen[c as usize / 64] & (1u64 << (c % 64)) != 0
+            } else {
+                start_comp == Some(c)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1052,12 +1096,57 @@ pub fn build_fairy_rings(snapshot: &Snapshot) -> (Vec<FairyRing>, FxHashMap<u32,
     (rings, node_to_ring)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_route_with_requirements_and_fairy_rings(
     snapshot: Arc<Snapshot>,
     neighbors: Arc<NeighborProvider>,
     neighbors_rev: Option<Arc<NeighborProvider>>,
     start_id: u32,
     goal_id: u32,
+    mask: &EligibilityMask,
+    seed: Option<u64>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    artifacts: &ProfileArtifacts,
+    canonical: Option<Arc<CanonicalGrid>>,
+    engine: EngineChoice,
+    ctxs: &mut dyn SearchContexts,
+) -> SearchOutcome {
+    route_on_graph(snapshot, neighbors, neighbors_rev, start_id, goal_id, None, mask, seed, cancel, artifacts, canonical, engine, ctxs)
+}
+
+/// Route to the cheapest node of `goals` (route to an area, `/route_area`) from an
+/// on-graph start. Identical setup, engine policy and retry ladder to
+/// [`run_route_with_requirements_and_fairy_rings`]; `goal_id` is the set's
+/// representative (landmark ranking, the weak-backward policy) and must be one of its
+/// nodes. The path ends on the goal reached.
+#[allow(clippy::too_many_arguments)]
+pub fn run_area_route(
+    snapshot: Arc<Snapshot>,
+    neighbors: Arc<NeighborProvider>,
+    neighbors_rev: Option<Arc<NeighborProvider>>,
+    start_id: u32,
+    goals: &GoalSet,
+    goal_id: u32,
+    mask: &EligibilityMask,
+    seed: Option<u64>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    artifacts: &ProfileArtifacts,
+    canonical: Option<Arc<CanonicalGrid>>,
+    engine: EngineChoice,
+    ctxs: &mut dyn SearchContexts,
+) -> SearchOutcome {
+    route_on_graph(snapshot, neighbors, neighbors_rev, start_id, goal_id, Some(goals), mask, seed, cancel, artifacts, canonical, engine, ctxs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_on_graph(
+    snapshot: Arc<Snapshot>,
+    neighbors: Arc<NeighborProvider>,
+    neighbors_rev: Option<Arc<NeighborProvider>>,
+    start_id: u32,
+    goal_id: u32,
+    // Goal set of an area route (None: the single goal `goal_id`).
+    goals: Option<&GoalSet>,
     mask: &EligibilityMask,
     seed: Option<u64>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
@@ -1169,7 +1258,13 @@ pub fn run_route_with_requirements_and_fairy_rings(
         if let Some((rev, macro_filter_rev)) = bidir.as_ref() {
             let bp = BidirParams { macros_rev: rev, macro_filter_rev: Some(macro_filter_rev) };
             let (cf, cb) = ctxs.two();
+            if let Some(gs) = goals {
+                return view.astar_bidir_set(Some(start_id), &[], gs, &bp, params, cf, cb, resume);
+            }
             return if resume { view.astar_bidir_resume(&bp, params, cf, cb) } else { view.astar_bidir(&bp, params, cf, cb) };
+        }
+        if let Some(gs) = goals {
+            return view.astar_set(Some(start_id), &[], gs, params, ctxs.one(), resume);
         }
         if resume { view.astar_resume(params, ctxs.one()) } else { view.astar(params, ctxs.one()) }
     };
@@ -1179,11 +1274,48 @@ pub fn run_route_with_requirements_and_fairy_rings(
     retry_ladder(res, seed, cancel, nodes, engine_name, |s, m, r| search(s, m, r, ctxs))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_route_with_requirements_virtual_start(
     snapshot: Arc<Snapshot>,
     neighbors: Arc<NeighborProvider>,
     neighbors_rev: Option<Arc<NeighborProvider>>,
     goal_id: u32,
+    seed: Option<u64>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    artifacts: &ProfileArtifacts,
+    canonical: Option<Arc<CanonicalGrid>>,
+    engine: EngineChoice,
+    ctxs: &mut dyn SearchContexts,
+) -> (SearchOutcome, Option<u32>) {
+    route_virtual_start(snapshot, neighbors, neighbors_rev, goal_id, None, seed, cancel, artifacts, canonical, engine, ctxs)
+}
+
+/// [`run_area_route`] for an off-graph start (entry through the eligible globals, as
+/// in [`run_route_with_requirements_virtual_start`]).
+#[allow(clippy::too_many_arguments)]
+pub fn run_area_route_virtual_start(
+    snapshot: Arc<Snapshot>,
+    neighbors: Arc<NeighborProvider>,
+    neighbors_rev: Option<Arc<NeighborProvider>>,
+    goals: &GoalSet,
+    goal_id: u32,
+    seed: Option<u64>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    artifacts: &ProfileArtifacts,
+    canonical: Option<Arc<CanonicalGrid>>,
+    engine: EngineChoice,
+    ctxs: &mut dyn SearchContexts,
+) -> (SearchOutcome, Option<u32>) {
+    route_virtual_start(snapshot, neighbors, neighbors_rev, goal_id, Some(goals), seed, cancel, artifacts, canonical, engine, ctxs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_virtual_start(
+    snapshot: Arc<Snapshot>,
+    neighbors: Arc<NeighborProvider>,
+    neighbors_rev: Option<Arc<NeighborProvider>>,
+    goal_id: u32,
+    goals: Option<&GoalSet>,
     seed: Option<u64>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     // Per-profile artifacts (see [`build_profile_artifacts`]). Fairy rings are wired
@@ -1268,11 +1400,17 @@ pub fn run_route_with_requirements_virtual_start(
         if let Some((rev, macro_filter_rev)) = bidir.as_ref() {
             let bp = BidirParams { macros_rev: rev, macro_filter_rev: Some(macro_filter_rev) };
             let (cf, cb) = ctxs.two();
+            if let Some(gs) = goals {
+                return view.astar_bidir_set(None, eligible_globals, gs, &bp, params, cf, cb, resume);
+            }
             return if resume {
                 view.astar_bidir_multi_resume(eligible_globals, &bp, params, cf, cb)
             } else {
                 view.astar_bidir_multi(eligible_globals, &bp, params, cf, cb)
             };
+        }
+        if let Some(gs) = goals {
+            return view.astar_set(None, eligible_globals, gs, params, ctxs.one(), resume);
         }
         if resume {
             view.astar_multi_resume(eligible_globals, params, ctxs.one())

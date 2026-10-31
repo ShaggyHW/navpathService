@@ -1230,6 +1230,8 @@ struct RouteJob {
     mask: navpath_core::eligibility::EligibilityMask,
     sid: u32,
     gid: u32,
+    /// `/route_area`: the goal set (`gid` is its representative); None on `/route`.
+    goals: Option<Arc<navpath_core::GoalSet>>,
     used_virtual_start: bool,
     seed: Option<u64>,
     quick_tele: bool,
@@ -1293,6 +1295,42 @@ impl RouteJob {
         let cur = &self.cur;
         let neighbors = cur.neighbors.clone().expect("neighbors are loaded with the snapshot");
         let mut lease = pool.checkout();
+        if let Some(goals) = self.goals.as_deref() {
+            return if self.used_virtual_start {
+                engine_adapter::run_area_route_virtual_start(
+                    self.snap().clone(),
+                    neighbors,
+                    cur.neighbors_rev.clone(),
+                    goals,
+                    self.gid,
+                    self.seed,
+                    Some(cancel),
+                    arts,
+                    cur.canonical_grid.clone(),
+                    engine,
+                    &mut lease,
+                )
+            } else {
+                (
+                    engine_adapter::run_area_route(
+                        self.snap().clone(),
+                        neighbors,
+                        cur.neighbors_rev.clone(),
+                        self.sid,
+                        goals,
+                        self.gid,
+                        &self.mask,
+                        self.seed,
+                        Some(cancel),
+                        arts,
+                        cur.canonical_grid.clone(),
+                        engine,
+                        &mut lease,
+                    ),
+                    None,
+                )
+            };
+        }
         if self.used_virtual_start {
             engine_adapter::run_route_with_requirements_virtual_start(
                 self.snap().clone(),
@@ -1604,6 +1642,62 @@ pub fn seeding_disabled() -> bool {
     })
 }
 
+/// The request profile's eligibility mask over the snapshot's requirement tags.
+fn request_mask(snap: &navpath_core::Snapshot, profile: &Profile) -> navpath_core::eligibility::EligibilityMask {
+    build_mask_from_u32(
+        snap.req_tags(),
+        profile.requirements.iter().filter_map(|kv| {
+            let (k, v) = (&kv.key, &kv.value);
+            if let Some(n) = v.as_i64() {
+                Some((k.as_str(), ClientValue::Num(n)))
+            } else if let Some(u) = v.as_u64() {
+                Some((k.as_str(), ClientValue::Num(u as i64)))
+            } else if let Some(b) = v.as_bool() {
+                Some((k.as_str(), ClientValue::Num(if b { 1 } else { 0 })))
+            } else if let Some(s) = v.as_str() {
+                let st = s.trim();
+                if let Ok(n) = st.parse::<i64>() {
+                    Some((k.as_str(), ClientValue::Num(n)))
+                } else {
+                    Some((k.as_str(), ClientValue::Str(st)))
+                }
+            } else {
+                None
+            }
+        }),
+    )
+}
+
+/// The profile's per-snapshot search artifacts, from the LRU or built (and cached).
+fn profile_artifacts(
+    cur: &SnapshotState,
+    neighbors: &navpath_core::NeighborProvider,
+    profile_key: &crate::ProfileKey,
+    mask: &navpath_core::eligibility::EligibilityMask,
+    quick_tele: bool,
+    portable_fairy: bool,
+) -> Arc<engine_adapter::ProfileArtifacts> {
+    let hit = cur.profile_cache.lock().ok().and_then(|mut c| c.get(profile_key).cloned());
+    match hit {
+        Some(a) => a,
+        None => {
+            let built = Arc::new(engine_adapter::build_profile_artifacts(
+                neighbors,
+                cur.neighbors_rev.as_deref(),
+                cur.globals.as_slice(),
+                cur.fairy_rings.as_slice(),
+                mask,
+                quick_tele,
+                portable_fairy,
+            ));
+            if let Ok(mut c) = cur.profile_cache.lock() {
+                c.put(profile_key.clone(), built.clone());
+            }
+            built
+        }
+    }
+}
+
 type RouteResult = Result<axum::response::Response, (StatusCode, String)>;
 
 pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteRequest>) -> RouteResult {
@@ -1658,28 +1752,7 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
     let quick_tele = req_has_quick_tele(&req.profile.requirements);
     let portable_fairy = req_has_portable_fairy(&req.profile.requirements);
 
-    let mask = build_mask_from_u32(
-        snap.req_tags(),
-        req.profile.requirements.iter().filter_map(|kv| {
-            let (k, v) = (&kv.key, &kv.value);
-            if let Some(n) = v.as_i64() {
-                Some((k.as_str(), ClientValue::Num(n)))
-            } else if let Some(u) = v.as_u64() {
-                Some((k.as_str(), ClientValue::Num(u as i64)))
-            } else if let Some(b) = v.as_bool() {
-                Some((k.as_str(), ClientValue::Num(if b { 1 } else { 0 })))
-            } else if let Some(s) = v.as_str() {
-                let st = s.trim();
-                if let Ok(n) = st.parse::<i64>() {
-                    Some((k.as_str(), ClientValue::Num(n)))
-                } else {
-                    Some((k.as_str(), ClientValue::Str(st)))
-                }
-            } else {
-                None
-            }
-        }),
-    );
+    let mask = request_mask(snap, &req.profile);
 
     // Route results are pure functions of (snapshot, endpoints, eligibility, seed);
     // repeated requests hit the per-snapshot LRU and skip the search entirely (payload
@@ -1767,6 +1840,7 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
         mask,
         sid,
         gid,
+        goals: None,
         used_virtual_start,
         seed,
         quick_tele,
@@ -1807,27 +1881,8 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
     // quick_tele), so misses resolve them from the per-snapshot LRU instead of
     // rebuilding. Cheap (a lock + at worst one ~1.7k-slot scan). Resolved before the
     // precheck, which reads the profile's reachability view (T3.14).
-    let artifacts: Arc<engine_adapter::ProfileArtifacts> = {
-        let hit = cur.profile_cache.lock().ok().and_then(|mut c| c.get(&profile_key).cloned());
-        match hit {
-            Some(a) => a,
-            None => {
-                let built = Arc::new(engine_adapter::build_profile_artifacts(
-                    neighbors.as_ref(),
-                    cur.neighbors_rev.as_deref(),
-                    cur.globals.as_slice(),
-                    cur.fairy_rings.as_slice(),
-                    &job.mask,
-                    quick_tele,
-                    portable_fairy,
-                ));
-                if let Ok(mut c) = cur.profile_cache.lock() {
-                    c.put(profile_key.clone(), built.clone());
-                }
-                built
-            }
-        }
-    };
+    let artifacts: Arc<engine_adapter::ProfileArtifacts> =
+        profile_artifacts(&cur, neighbors.as_ref(), &profile_key, &job.mask, quick_tele, portable_fairy);
 
     // Exact reachability precheck (roadmap 4.1): eligibility never gates walk edges,
     // so "can this goal be reached at all under this profile" is decided on the
@@ -2249,6 +2304,373 @@ async fn run_race(setup: RaceSetup, primary_permit: tokio::sync::OwnedSemaphoreP
     let (o, ve, us) = truncated.ok_or_else(|| "race: no engine reported".to_string())?;
     let job = setup.job.clone();
     tokio::task::spawn_blocking(move || job.finish(o, ve, us)).await.map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------------
+// POST /route_area — the cheapest route to ANY tile of an area.
+//
+// A separate endpoint: `/route` (single goal tile) is untouched — its handler, caches,
+// engine race and response bytes are exactly as before. See docs/route_to_area_endpoint.md.
+// ---------------------------------------------------------------------------------
+
+/// Inclusive tile rectangle on one plane (`goal_area` of a `/route_area` request).
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct GoalArea {
+    pub min_wx: i32,
+    pub min_wy: i32,
+    pub max_wx: i32,
+    pub max_wy: i32,
+    pub plane: i32,
+}
+
+/// Most tiles a `/route_area` request may name: per field (a 64x64 `goal_area`, or 4096
+/// `goal_tiles`) and in the resolved set.
+pub const MAX_AREA_TILES: usize = 4096;
+
+#[derive(Debug, Deserialize)]
+pub struct AreaRouteRequest {
+    #[serde(default)] pub start_id: Option<u32>,
+    #[serde(default)] pub start: Option<NodeTile>,
+    /// Optional tie preference: among area tiles reached at exactly equal cost, prefer the
+    /// one nearest (Chebyshev, same plane first) to this tile, then the lowest node id.
+    #[serde(default)] pub goal: Option<NodeTile>,
+    /// The area as a rectangle; `goal_tiles` (any tiles, any planes) is unioned with it.
+    #[serde(default)] pub goal_area: Option<GoalArea>,
+    #[serde(default)] pub goal_tiles: Option<Vec<NodeTile>>,
+    #[serde(default)] pub profile: Profile,
+    #[serde(default)] pub options: RouteOptions,
+    #[serde(default)] pub surge: SurgeConfig,
+    #[serde(default)] pub dive: DiveConfig,
+    #[serde(default)] pub seed: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct TileRef {
+    pub wx: i32,
+    pub wy: i32,
+    pub plane: i32,
+}
+
+/// `/route` response fields plus the area outcome.
+#[derive(Debug, Serialize)]
+pub struct AreaRouteResponse {
+    pub found: bool,
+    pub cost: f32,
+    #[serde(skip_serializing_if = "Option::is_none")] pub path: Option<Box<serde_json::value::RawValue>>,
+    pub length_tiles: usize,
+    pub duration_ms: u128,
+    pub duration_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")] pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub degraded: Option<&'static str>,
+    /// The area tile the path ends on — the first area tile it reaches. Absent on
+    /// found=false.
+    #[serde(skip_serializing_if = "Option::is_none")] pub goal_reached: Option<TileRef>,
+    /// Area tiles present in the snapshot.
+    pub goal_tiles_resolved: usize,
+    /// Of those, the tiles the search targeted: the ones a route can reach FIRST (see
+    /// [`entry_tiles`]) in a component the profile can reach.
+    pub goal_tiles_searched: usize,
+    #[serde(skip_serializing_if = "Option::is_none")] pub actions: Option<Box<serde_json::value::RawValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub geometry: Option<Box<serde_json::value::RawValue>>,
+}
+
+/// Resolve `goal_area` ∪ `goal_tiles` to snapshot nodes (sorted, deduplicated; tiles
+/// missing from the snapshot are skipped). Errors are the 400 messages.
+pub fn resolve_area_goals(
+    snap: &navpath_core::Snapshot,
+    area: Option<GoalArea>,
+    tiles: Option<&[NodeTile]>,
+) -> Result<Vec<u32>, String> {
+    if area.is_none() && tiles.is_none() {
+        return Err("missing goal_area / goal_tiles".into());
+    }
+    let mut nodes: Vec<u32> = Vec::new();
+    if let Some(a) = area {
+        if a.max_wx < a.min_wx || a.max_wy < a.min_wy {
+            return Err("goal_area: max_wx/max_wy must be >= min_wx/min_wy".into());
+        }
+        let count = (a.max_wx - a.min_wx + 1) as i64 * (a.max_wy - a.min_wy + 1) as i64;
+        if count > MAX_AREA_TILES as i64 {
+            return Err(format!("goal_area too large: {count} tiles (max {MAX_AREA_TILES})"));
+        }
+        for wy in a.min_wy..=a.max_wy {
+            for wx in a.min_wx..=a.max_wx {
+                if let Some(n) = snap.find_node(wx, wy, a.plane) {
+                    nodes.push(n);
+                }
+            }
+        }
+    }
+    if let Some(t) = tiles {
+        if t.len() > MAX_AREA_TILES {
+            return Err(format!("goal_tiles too large: {} tiles (max {MAX_AREA_TILES})", t.len()));
+        }
+        nodes.extend(t.iter().filter_map(|t| snap.find_node(t.wx, t.wy, t.plane)));
+    }
+    nodes.sort_unstable();
+    nodes.dedup();
+    if nodes.len() > MAX_AREA_TILES {
+        return Err(format!("goal set too large: {} tiles (max {MAX_AREA_TILES})", nodes.len()));
+    }
+    if nodes.is_empty() {
+        return Err("no goal_area tile in snapshot".into());
+    }
+    Ok(nodes)
+}
+
+/// The tiles of `nodes` (sorted) that a route can reach FIRST — the only ones that can
+/// end it. A route entering the area by walking steps onto a tile with a walk neighbour
+/// outside the area (walk edges are symmetric), so interior tiles can only be first when
+/// something lands on them: a macro edge (door, stairs, teleport), a global teleport, or
+/// a fairy ring — or when the route starts there. Dropping every other tile is exact:
+/// same cost, same reached tile (each dropped tile is strictly costlier than the
+/// boundary tile its route crossed).
+pub fn entry_tiles(snap: &navpath_core::Snapshot, globals: &[engine_adapter::GlobalTeleport], nodes: &[u32], start: Option<u32>) -> Vec<u32> {
+    let member = |v: u32| nodes.binary_search(&v).is_ok();
+    let mut keep = vec![false; nodes.len()];
+    let mark = |v: u32, keep: &mut [bool]| {
+        if let Ok(i) = nodes.binary_search(&v) {
+            keep[i] = true;
+        }
+    };
+    for &d in snap.macro_dst() {
+        mark(d, &mut keep);
+    }
+    for g in globals {
+        mark(g.dst, &mut keep);
+    }
+    for &r in snap.fairy_nodes() {
+        mark(r, &mut keep);
+    }
+    if let Some(s) = start {
+        mark(s, &mut keep);
+    }
+    let (offsets, dst) = (snap.walk_offsets(), snap.walk_dst());
+    for (i, &t) in nodes.iter().enumerate() {
+        if keep[i] {
+            continue;
+        }
+        let (a, b) = (offsets[t as usize] as usize, offsets[t as usize + 1] as usize);
+        keep[i] = dst[a..b].iter().any(|&v| !member(v));
+    }
+    nodes.iter().zip(keep).filter(|(_, k)| *k).map(|(&n, _)| n).collect()
+}
+
+/// Tie rank of each goal: Chebyshev distance to the preferred tile, other planes after
+/// every same-plane tile; all 0 without a preference (lowest node id wins).
+fn area_tie_ranks(snap: &navpath_core::Snapshot, nodes: &[u32], pref: Option<&NodeTile>) -> Vec<(u32, u32)> {
+    let coords = snap.coords_packed();
+    nodes
+        .iter()
+        .map(|&n| {
+            let rank = match pref {
+                None => 0,
+                Some(p) => {
+                    let (x, y, pl) = navpath_core::snapshot::unpack_coord(coords[n as usize]);
+                    let d = (x - p.wx).unsigned_abs().max((y - p.wy).unsigned_abs()).min(1 << 20);
+                    if pl == p.plane { d } else { (1 << 21) + d }
+                }
+            };
+            (n, rank)
+        })
+        .collect()
+}
+
+fn tile_of(snap: &navpath_core::Snapshot, n: u32) -> TileRef {
+    let (wx, wy, plane) = navpath_core::snapshot::unpack_coord(snap.coords_packed()[n as usize]);
+    TileRef { wx, wy, plane }
+}
+
+pub async fn route_area(State(state): State<AppState>, Json(mut req): Json<AreaRouteRequest>) -> RouteResult {
+    use std::sync::atomic::Ordering::Relaxed;
+    let start = std::time::Instant::now();
+    let seed_ignored = seeding_disabled() && req.seed.take().is_some();
+    let metrics = state.metrics.clone();
+    metrics.area_requests.fetch_add(1, Relaxed);
+    if !state.ready.load(std::sync::atomic::Ordering::Acquire) {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "warming up (snapshot populate / context pre-warm); retry".into()));
+    }
+    let cur: Arc<SnapshotState> = state.current.load_full();
+    let Some(snap) = cur.snapshot.as_ref() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "snapshot not loaded".into()));
+    };
+    let Some(neighbors) = cur.neighbors.as_ref() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "neighbors not loaded".into()));
+    };
+    let counts = snap.counts();
+
+    // Start: id, or coordinates (off the snapshot = virtual start through a teleport).
+    let (sid, used_virtual_start) = match (req.start_id, req.start.as_ref()) {
+        (Some(sid), _) => (sid, false),
+        (None, Some(s)) => match snap.find_node(s.wx, s.wy, s.plane) {
+            Some(sid) => (sid, false),
+            None => {
+                info!(start_x = s.wx, start_y = s.wy, start_plane = s.plane,
+                      "route_area: start coordinate not found in snapshot; will force global teleport entry");
+                (0, true)
+            }
+        },
+        (None, None) => return Err((StatusCode::BAD_REQUEST, "missing start; provide start_id or start {wx,wy,plane}".into())),
+    };
+    if !used_virtual_start && sid >= counts.nodes {
+        return Err((StatusCode::BAD_REQUEST, "start_id out of range".into()));
+    }
+    let resolved = resolve_area_goals(snap, req.goal_area, req.goal_tiles.as_deref()).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let start_node = if used_virtual_start { None } else { Some(sid) };
+    let mut targets = entry_tiles(snap, &cur.globals, &resolved, start_node);
+
+    let quick_tele = req_has_quick_tele(&req.profile.requirements);
+    let portable_fairy = req_has_portable_fairy(&req.profile.requirements);
+    let mask = request_mask(snap, &req.profile);
+    let mask_bits = crate::pack_mask_bits(&mask.satisfied);
+    let profile_key: crate::ProfileKey = (mask_bits, quick_tele, portable_fairy);
+    let artifacts = profile_artifacts(&cur, neighbors.as_ref(), &profile_key, &mask, quick_tele, portable_fairy);
+
+    // Exact reachability (as /route's precheck): keep the tiles in components the
+    // profile can reach from this start; none left = found=false, no search.
+    if let Some(cg) = cur.comp_graph.as_ref() {
+        let comps = snap.comp_ids();
+        let reach = artifacts.reach(cg, &mask).reachable_comps(start_node.map(|s| comps[s as usize]));
+        targets.retain(|&n| reach(comps[n as usize]));
+    }
+    let resolved_count = resolved.len();
+    let searched_count = targets.len();
+    if targets.is_empty() {
+        metrics.area_not_found.fetch_add(1, Relaxed);
+        let duration_us = start.elapsed().as_micros() as u64;
+        info!(duration_us, sid, virtual_start = used_virtual_start, goal_tiles_resolved = resolved_count,
+              "route_area: no reachable area tile (component precheck)");
+        let resp = AreaRouteResponse {
+            found: false, cost: f32::INFINITY, path: None, length_tiles: 0,
+            duration_ms: (duration_us / 1000) as u128, duration_us, reason: None, degraded: None, goal_reached: None,
+            goal_tiles_resolved: resolved_count, goal_tiles_searched: 0, actions: None, geometry: None,
+        };
+        return Ok(json_response(&resp, 256));
+    }
+    let ranked = area_tie_ranks(snap, &targets, req.goal.as_ref());
+    // Representative (landmark ranking, engine policy, logs): the preferred tile.
+    let gid = ranked.iter().min_by_key(|&&(n, r)| (r, n)).map_or(targets[0], |p| p.0);
+    let goals = Arc::new(navpath_core::GoalSet::with_ranks(ranked));
+
+    let Some(permit) = state.search_permits.try_acquire() else {
+        metrics.semaphore_rejects.fetch_add(1, Relaxed);
+        warn!(sid, gid, "route_area: search capacity exhausted; rejecting with 503");
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "search capacity exhausted; retry".into()));
+    };
+    // ONE engine, chosen from the request alone (never a timing race), so the same
+    // request always ends on the same tile. Unseeded: the unidirectional engine (JPS
+    // when enabled), the one that resolves EXACT cost ties by the `goal` preference —
+    // and unseeded is where exact ties happen. Seeded (jitter makes ties vanishingly
+    // rare): the race's primary when racing is configured, else the shipped policy.
+    let engine = if req.seed.is_none() {
+        engine_adapter::EngineChoice::Uni
+    } else if race_enabled() && engine_adapter::bidir_enabled() && cur.neighbors_rev.is_some() {
+        if primary_is_uni(req.seed, cur.canonical_grid.is_some()) { engine_adapter::EngineChoice::Uni } else { engine_adapter::EngineChoice::Bidir }
+    } else {
+        engine_adapter::EngineChoice::Policy
+    };
+    let seed = req.seed;
+    let job = Arc::new(RouteJob {
+        cur: cur.clone(),
+        artifacts: Some(artifacts),
+        mask,
+        sid,
+        gid,
+        goals: Some(goals.clone()),
+        used_virtual_start,
+        seed,
+        quick_tele,
+        portable_fairy,
+        return_geometry: req.options.return_geometry,
+        only_actions: req.options.only_actions,
+        surge: req.surge,
+        dive: req.dive,
+        virtual_start_from: if used_virtual_start { req.start.as_ref().map(|c| (c.wx, c.wy, c.plane)) } else { None },
+        // Area results stay out of the shared caches: /route is unaffected.
+        index_subpath: false,
+    });
+
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>, bool);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            if !self.1 {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    let mut disconnect_guard = CancelOnDrop(cancel.clone(), false);
+    let (task_job, task_cancel, pool) = (job.clone(), cancel.clone(), state.ctx_pool.clone());
+    let join = tokio::task::spawn_blocking(move || {
+        let t_search = std::time::Instant::now();
+        let (outcome, virtual_entry) = task_job.run_search(engine, &task_cancel, &pool);
+        let search_us = t_search.elapsed().as_micros() as u64;
+        drop(permit);
+        task_job.finish(outcome, virtual_entry, search_us)
+    });
+    let out = match tokio::time::timeout(route_deadline(), join).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(_) => {
+            cancel.store(true, Relaxed);
+            metrics.deadline_timeouts.fetch_add(1, Relaxed);
+            warn!(sid, gid, deadline_ms = route_deadline().as_millis() as u64, "route_area deadline exceeded; returning 504");
+            return Err((StatusCode::GATEWAY_TIMEOUT, "route deadline exceeded".into()));
+        }
+    };
+    disconnect_guard.1 = true;
+
+    metrics.area_searches.fetch_add(1, Relaxed);
+    let res = &out.res;
+    match res.status {
+        navpath_core::SearchStatus::Found => metrics.area_found.fetch_add(1, Relaxed),
+        navpath_core::SearchStatus::NotFound => metrics.area_not_found.fetch_add(1, Relaxed),
+        _ => metrics.area_truncated.fetch_add(1, Relaxed),
+    };
+    let goal_reached = if res.found { res.path.last().map(|&n| tile_of(snap, n)) } else { None };
+    let duration_us = start.elapsed().as_micros() as u64;
+    let reason = match res.status {
+        navpath_core::SearchStatus::BudgetExceeded => Some("budget_exceeded"),
+        navpath_core::SearchStatus::Cancelled => Some("cancelled"),
+        _ => None,
+    };
+    let degraded = if out.seed_dropped { Some("seed_dropped") } else if seed_ignored { Some("seed_ignored") } else { None };
+    info!(
+        duration_us,
+        search_us = out.search_us,
+        payload_us = out.payload.payload_us,
+        found = res.found,
+        cost = res.cost,
+        length = res.path.len(),
+        status = ?res.status,
+        pops = res.pops,
+        pops_f = res.pops_f,
+        pops_b = res.pops_b,
+        retried = out.retried,
+        seed_dropped = out.seed_dropped,
+        engine = out.engine,
+        goal_tiles_resolved = resolved_count,
+        goal_tiles_searched = searched_count,
+        goal_reached = ?goal_reached,
+        "route_area request completed"
+    );
+    let size_hint = out.payload.len() + 384;
+    let resp = AreaRouteResponse {
+        found: res.found,
+        cost: res.cost,
+        length_tiles: res.path.len(),
+        path: out.payload.path,
+        duration_ms: (duration_us / 1000) as u128,
+        duration_us,
+        reason,
+        degraded,
+        goal_reached,
+        goal_tiles_resolved: resolved_count,
+        goal_tiles_searched: searched_count,
+        actions: out.payload.actions,
+        geometry: out.payload.geometry,
+    };
+    Ok(json_response(&resp, size_hint))
 }
 
 #[derive(Debug, Serialize)]

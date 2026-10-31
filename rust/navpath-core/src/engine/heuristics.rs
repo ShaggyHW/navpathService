@@ -409,13 +409,54 @@ impl<'a> LandmarkHeuristic<'a> {
     /// goal reaches, and `d(L,goal) <= d(L,u) + d(u,goal)` means a node that a landmark
     /// reaches cannot reach the goal when that landmark cannot.
     pub fn select_active(&self, start: u32, goal: u32, k: usize) -> ActiveLandmarks {
-        let l = self.landmarks;
         if !self.has_table() {
             return ActiveLandmarks::default();
         }
-        let stride = 2 * l;
-        let (mut gbuf, mut sbuf) = ([0u16; 2 * MAX_LANDMARKS], [0u16; 2 * MAX_LANDMARKS]);
+        let mut gbuf = [0u16; 2 * MAX_LANDMARKS];
         let grow = self.row_exact(goal, &mut gbuf);
+        self.select_active_row(start, grow, k)
+    }
+
+    /// [`LandmarkHeuristic::select_active`] for a goal SET G (route to an area): the
+    /// bound is on d(u, G) = min over g of d(u, g). The goals are folded into one
+    /// virtual goal row, after which every single-goal rule applies unchanged:
+    ///   - forward lane `min_g fw[g]`: d(u,G) >= min_g d(L,g) - d(L,u). Goals L cannot
+    ///     reach (UNREACHABLE = 0xFFFF) drop out of the min on their own — a node L
+    ///     reaches cannot reach them either — and when L reaches NO goal the lane stays
+    ///     UNREACHABLE, which is exactly the forward-INF rule for the set;
+    ///   - backward lane `max_g bw[g]`: d(u,G) >= d(u,L) - max_g d(g,L). One goal that
+    ///     cannot reach L (or is saturated) makes the max UNREACHABLE (SATURATED), which
+    ///     disables the term (and, for UNREACHABLE, the backward-INF rule: u may still
+    ///     reach that goal) — the "INF only when it holds for EVERY goal" rule.
+    ///
+    /// h(g) = 0 for every g in G (both terms are <= 0 there), which the engines' goal
+    /// tests and incumbent pruning rely on. O(|G| x landmarks), once per search.
+    pub fn select_active_set(&self, start: u32, goals: &[u32], k: usize) -> ActiveLandmarks {
+        if !self.has_table() || goals.is_empty() {
+            return ActiveLandmarks::default();
+        }
+        let stride = 2 * self.landmarks;
+        let mut agg = [0u16; 2 * MAX_LANDMARKS];
+        for (i, lane) in agg[..stride].iter_mut().enumerate() {
+            *lane = if i % 2 == 0 { ALT_UNREACHABLE } else { 0 };
+        }
+        let mut gbuf = [0u16; 2 * MAX_LANDMARKS];
+        for &g in goals {
+            let row = self.row_exact(g, &mut gbuf);
+            for li in 0..self.landmarks {
+                agg[2 * li] = agg[2 * li].min(row[2 * li]);
+                agg[2 * li + 1] = agg[2 * li + 1].max(row[2 * li + 1]);
+            }
+        }
+        self.select_active_row(start, &agg[..stride], k)
+    }
+
+    /// Selection over an explicit (exact) goal row: a real goal's, or a goal set's
+    /// aggregate (see [`LandmarkHeuristic::select_active_set`]).
+    fn select_active_row(&self, start: u32, grow: &[u16], k: usize) -> ActiveLandmarks {
+        let l = self.landmarks;
+        let stride = 2 * l;
+        let mut sbuf = [0u16; 2 * MAX_LANDMARKS];
         let srow = self.row_exact(start, &mut sbuf);
 
         let one_sided = alt_one_sided();

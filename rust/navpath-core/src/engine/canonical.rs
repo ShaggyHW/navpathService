@@ -85,6 +85,31 @@ fn find_node(coords: &[u32], x: i32, y: i32, plane: i32) -> Option<usize> {
     coords.binary_search(&crate::snapshot::pack_coord(x, y, plane)).ok()
 }
 
+/// Inclusive tile rectangle on one plane: a bounding box of route-to-area goal tiles
+/// (see [`CanonicalGrid::jump_from_boxes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileBox {
+    pub plane: i32,
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
+/// Steps `t >= 1` of a run from coordinate `u` with unit step `d` (-1, 0 or 1) that
+/// land in `[lo, hi]`, as an inclusive interval (None = never).
+#[inline]
+fn run_span(u: i32, d: i32, lo: i32, hi: i32) -> Option<(i32, i32)> {
+    let (a, b) = match d {
+        0 if (lo..=hi).contains(&u) => (1, i32::MAX),
+        0 => return None,
+        1 => (lo - u, hi - u),
+        _ => (u - hi, u - lo),
+    };
+    let a = a.max(1);
+    if b >= a { Some((a, b)) } else { None }
+}
+
 /// Direction index of the unit step (dx, dy), by table lookup (`(dy+1)*3 + (dx+1)`);
 /// `u8::MAX` marks the non-steps (0,0). Replaces a linear scan of [`DELTAS`] on the
 /// per-pop and grid-build paths.
@@ -430,6 +455,64 @@ impl CanonicalGrid {
         if k > 0 { Some((self.jump_to[u * 8 + d] as usize, n)) } else { None }
     }
 
+    /// Goal-SET jump (route to an area) via the JPS+ tables: the goal-independent table
+    /// jump, cut short at the first step whose node lies in a goal bounding box (for a
+    /// cardinal run) or in a box's row/column band (for a diagonal run, whose cardinal
+    /// sub-runs may reach a goal from anywhere in the band). Every goal lies in some box
+    /// of its plane, so no goal is jumped over, and a run cut short inside a band or box
+    /// stops again at every following step. Stopping EARLY on a run is always safe: the
+    /// stop node is relaxed with the run's direction, and its tie-pruned successor row
+    /// contains the natural continuation, so the canonical paths are unchanged. Same
+    /// return contract as [`CanonicalGrid::jump_walk`]; requires the JPS+ tables.
+    pub fn jump_from_boxes(
+        &self,
+        u: usize,
+        (ux, uy, up): (i32, i32, i32),
+        d: usize,
+        boxes: &[TileBox],
+        coords: &[u32],
+    ) -> Option<(usize, u32)> {
+        let k = self.jump_dist[u * 8 + d];
+        if k == 0 {
+            return None;
+        }
+        let n = k.unsigned_abs() as u32;
+        let (dx, dy) = DELTAS[d];
+        let mut stop = u32::MAX;
+        for b in boxes {
+            if b.plane != up {
+                continue;
+            }
+            let sx = run_span(ux, dx, b.x0, b.x1);
+            let sy = run_span(uy, dy, b.y0, b.y1);
+            let t = if d < 4 {
+                // Inside the box: both coordinates in range at once.
+                match (sx, sy) {
+                    (Some(a), Some(c)) if a.0.max(c.0) <= a.1.min(c.1) => a.0.max(c.0),
+                    _ => continue,
+                }
+            } else {
+                // Inside the row band OR the column band.
+                match (sx, sy) {
+                    (Some(a), Some(c)) => a.0.min(c.0),
+                    (Some(a), None) => a.0,
+                    (None, Some(c)) => c.0,
+                    (None, None) => continue,
+                }
+            };
+            stop = stop.min(t as u32);
+        }
+        if stop <= n {
+            // The first n steps of the run are walkable, so the tile exists.
+            let i = stop as i32;
+            if let Some(v) = find_node(coords, ux + i * dx, uy + i * dy, up) {
+                return Some((v, stop));
+            }
+            debug_assert!(false, "straight run tile missing from coords");
+        }
+        if k > 0 { Some((self.jump_to[u * 8 + d] as usize, n)) } else { None }
+    }
+
     /// Whether the jump-point tie-pruned table was built (see [`CanonicalGrid::build_opts`]).
     #[inline]
     pub fn has_jps(&self) -> bool {
@@ -482,6 +565,20 @@ impl CanonicalGrid {
     /// the run dead-ends. Every node on an optimal path has an optimal canonical path
     /// that only turns at jump points, so relaxing jump points alone is cost-exact.
     pub fn jump_walk(&self, u: usize, d: usize, goal: usize, offsets: &[u32], dst: &[u32]) -> Option<(usize, u32)> {
+        self.jump_walk_until(u, d, &|n| n == goal, offsets, dst)
+    }
+
+    /// [`CanonicalGrid::jump_walk`] stopping on every node `is_goal` accepts (a goal
+    /// set, for routes to an area; the table-free fallback of
+    /// [`CanonicalGrid::jump_from_boxes`]).
+    pub fn jump_walk_until<F: Fn(usize) -> bool>(
+        &self,
+        u: usize,
+        d: usize,
+        is_goal: &F,
+        offsets: &[u32],
+        dst: &[u32],
+    ) -> Option<(usize, u32)> {
         let mut cur = u;
         let mut k: u32 = 0;
         if d < 4 {
@@ -489,7 +586,7 @@ impl CanonicalGrid {
             loop {
                 let next = self.step(cur, d, offsets, dst)?;
                 k += 1;
-                if next == goal || self.is_stop(next) {
+                if is_goal(next) || self.is_stop(next) {
                     return Some((next, k));
                 }
                 let s = self.succ_jps[next * 8 + d];
@@ -507,17 +604,17 @@ impl CanonicalGrid {
             loop {
                 let next = self.step(cur, d, offsets, dst)?;
                 k += 1;
-                if next == goal || self.is_stop(next) {
+                if is_goal(next) || self.is_stop(next) {
                     return Some((next, k));
                 }
                 let s = self.succ_jps[next * 8 + d];
                 if s & !natural != 0 {
                     return Some((next, k));
                 }
-                if s & (1 << c1) != 0 && self.jump_walk(next, c1, goal, offsets, dst).is_some() {
+                if s & (1 << c1) != 0 && self.jump_walk_until(next, c1, is_goal, offsets, dst).is_some() {
                     return Some((next, k));
                 }
-                if s & (1 << c2) != 0 && self.jump_walk(next, c2, goal, offsets, dst).is_some() {
+                if s & (1 << c2) != 0 && self.jump_walk_until(next, c2, is_goal, offsets, dst).is_some() {
                     return Some((next, k));
                 }
                 if s & (1 << d) == 0 {

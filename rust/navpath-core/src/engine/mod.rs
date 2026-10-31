@@ -5,4 +5,4 @@ pub mod search;
 
 pub use heuristics::LandmarkHeuristic;
 pub use neighbors::{Adjacency, NeighborProvider};
-pub use search::{EngineView, ExtraEdges, SearchParams, SearchResult, SearchStatus};
+pub use search::{EngineView, ExtraEdges, GoalSet, SearchParams, SearchResult, SearchStatus};

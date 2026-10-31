@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::snapshot::{unpack_coord, walk_diagonal_ms, Snapshot, WALK_CARDINAL_MS};
 
-use super::canonical::{arrival_code, CanonicalGrid};
+use super::canonical::{arrival_code, CanonicalGrid, TileBox};
 use super::heuristics::{active_landmarks, LandmarkHeuristic, RevAnchorBase};
 use super::neighbors::{MacroFilter, NeighborProvider, WalkGraph};
 
@@ -87,6 +87,156 @@ struct SeededJitter(u64);
 impl JitterPolicy for SeededJitter {
     #[inline(always)]
     fn w(self, from: u32, to: u32, w: f32) -> f32 { w + edge_jitter(self.0, from, to) }
+}
+
+/// Goal SET of a route-to-area search ([`EngineView::astar_set`] /
+/// [`EngineView::astar_bidir_set`]): the search returns the cheapest route to ANY of
+/// these nodes, ending on the first goal node it reaches.
+///
+/// Each node carries a tie rank (lower wins): among goals reached at bit-identical
+/// cost the unidirectional engine ends on the lowest (rank, node id). Membership is a
+/// hashed bit probe plus a binary search on filter hits, so the per-pop and per-relax
+/// goal tests stay a few nanoseconds for sets of thousands of nodes.
+pub struct GoalSet {
+    /// Sorted, deduplicated node ids.
+    nodes: Vec<u32>,
+    /// Tie rank per node (parallel to `nodes`).
+    rank: Vec<u32>,
+    /// Membership prefilter: >= 16 bits per goal (a ~6% false-positive rate at most).
+    bits: Vec<u64>,
+    shift: u32,
+    /// Order-sensitive fingerprint of (nodes, ranks): resume identity.
+    fp: u64,
+}
+
+impl GoalSet {
+    /// A goal set with every tie rank 0 (ties break by lowest node id).
+    pub fn new(nodes: impl IntoIterator<Item = u32>) -> Self {
+        Self::with_ranks(nodes.into_iter().map(|n| (n, 0)))
+    }
+
+    /// A goal set from (node, tie rank) pairs; a node listed twice keeps its lowest rank.
+    pub fn with_ranks(pairs: impl IntoIterator<Item = (u32, u32)>) -> Self {
+        let mut v: Vec<(u32, u32)> = pairs.into_iter().collect();
+        v.sort_unstable();
+        v.dedup_by_key(|p| p.0);
+        let nodes: Vec<u32> = v.iter().map(|p| p.0).collect();
+        let rank: Vec<u32> = v.iter().map(|p| p.1).collect();
+        let log2 = (nodes.len().max(64) * 16).next_power_of_two().trailing_zeros();
+        let shift = 32 - log2;
+        let mut bits = vec![0u64; (1usize << log2) / 64];
+        let mut fp: u64 = 0xcbf29ce484222325 ^ nodes.len() as u64;
+        for (&n, &r) in nodes.iter().zip(&rank) {
+            let h = Self::slot(n, shift);
+            bits[(h >> 6) as usize] |= 1 << (h & 63);
+            fp = (fp ^ n as u64).wrapping_mul(0x100000001b3);
+            fp = (fp ^ r as u64).wrapping_mul(0x100000001b3);
+        }
+        GoalSet { nodes, rank, bits, shift, fp }
+    }
+
+    #[inline(always)]
+    fn slot(id: u32, shift: u32) -> u32 {
+        id.wrapping_mul(0x9E37_79B1) >> shift
+    }
+
+    /// The goal nodes, ascending.
+    pub fn nodes(&self) -> &[u32] {
+        &self.nodes
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, id: u32) -> bool {
+        let h = Self::slot(id, self.shift);
+        (self.bits[(h >> 6) as usize] >> (h & 63)) & 1 != 0 && self.nodes.binary_search(&id).is_ok()
+    }
+
+    /// Index of the first goal node on `path`, if any.
+    pub fn first_on_path(&self, path: &[u32]) -> Option<usize> {
+        path.iter().position(|&n| self.contains(n))
+    }
+
+    /// The goal with the lowest (g, rank, id) among those `g_of` reports finite.
+    fn best_by(&self, g_of: impl Fn(u32) -> f32) -> Option<u32> {
+        let mut best: Option<(f32, u32, u32)> = None;
+        for (&n, &r) in self.nodes.iter().zip(&self.rank) {
+            let g = g_of(n);
+            if !g.is_finite() {
+                continue;
+            }
+            // Ascending ids: a later node only wins on strictly lower (g, rank).
+            if best.is_none_or(|(bg, br, _)| g < bg || (g == bg && r < br)) {
+                best = Some((g, r, n));
+            }
+        }
+        best.map(|b| b.2)
+    }
+}
+
+/// Per-node goal test, monomorphized so single-goal searches keep the plain `==`
+/// (no set probe, no extra branch) and their exact pre-goal-set behaviour.
+trait GoalTest: Copy {
+    fn is_goal(self, id: u32) -> bool;
+    /// The goal id of a single-goal search; None for a goal set.
+    fn single(self) -> Option<u32>;
+    /// Every goal node (one for a single goal).
+    fn nodes(&self) -> &[u32];
+    /// Resume identity of the goal set (0 for a single goal: `QueryTag::goal` covers it).
+    fn fingerprint(self) -> u64;
+    /// The goal with the lowest (g, tie rank, id) among those `g_of` reports finite.
+    fn best_by(self, g_of: impl Fn(u32) -> f32) -> Option<u32>;
+}
+
+#[derive(Clone, Copy)]
+struct OneGoal(u32);
+impl GoalTest for OneGoal {
+    #[inline(always)]
+    fn is_goal(self, id: u32) -> bool { id == self.0 }
+    #[inline(always)]
+    fn single(self) -> Option<u32> { Some(self.0) }
+    fn nodes(&self) -> &[u32] { std::slice::from_ref(&self.0) }
+    fn fingerprint(self) -> u64 { 0 }
+    fn best_by(self, g_of: impl Fn(u32) -> f32) -> Option<u32> {
+        if g_of(self.0).is_finite() { Some(self.0) } else { None }
+    }
+}
+
+impl GoalTest for &GoalSet {
+    #[inline(always)]
+    fn is_goal(self, id: u32) -> bool { self.contains(id) }
+    #[inline(always)]
+    fn single(self) -> Option<u32> { None }
+    fn nodes(&self) -> &[u32] { &self.nodes }
+    fn fingerprint(self) -> u64 { self.fp }
+    fn best_by(self, g_of: impl Fn(u32) -> f32) -> Option<u32> { GoalSet::best_by(self, g_of) }
+}
+
+/// One bounding box per plane over the goal nodes (JPS+ jump cut-offs, see
+/// [`CanonicalGrid::jump_from_boxes`]).
+fn goal_boxes(coords: &[u32], goals: &[u32]) -> Vec<TileBox> {
+    let mut boxes: Vec<TileBox> = Vec::new();
+    for &g in goals {
+        let Some(&c) = coords.get(g as usize) else { continue };
+        let (x, y, p) = unpack_coord(c);
+        match boxes.iter_mut().find(|b| b.plane == p) {
+            Some(b) => {
+                b.x0 = b.x0.min(x);
+                b.y0 = b.y0.min(y);
+                b.x1 = b.x1.max(x);
+                b.y1 = b.y1.max(y);
+            }
+            None => boxes.push(TileBox { plane: p, x0: x, y0: y, x1: x, y1: y }),
+        }
+    }
+    boxes
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +520,8 @@ struct QueryTag {
     bidir: bool,
     origin: Option<u32>,
     goal: u32,
+    /// Goal-set fingerprint (0 for single-goal searches).
+    goals_fp: u64,
     seed: Option<u64>,
     bucket_bits: u32,
     seeds_fp: u64,
@@ -665,6 +817,20 @@ fn expand_jumps(
     (out, out_g)
 }
 
+/// Goal-set contract: the path ends on the FIRST goal node it reaches. Optimal searches
+/// already satisfy it (an earlier goal would be strictly cheaper with positive edge
+/// weights); this is the guard for zero-cost edges, cutting the path (and its cost)
+/// at the earlier goal.
+fn end_at_first_goal(res: &mut SearchResult, is_goal: impl Fn(u32) -> bool) {
+    if let Some(i) = res.path.iter().position(|&v| is_goal(v)) {
+        if i + 1 < res.path.len() {
+            res.path.truncate(i + 1);
+            res.path_g.truncate(i + 1);
+            res.cost = res.path_g[i];
+        }
+    }
+}
+
 pub struct EngineView<'a> {
     pub nodes: usize,
     pub walk: WalkGraph<'a>,
@@ -756,18 +922,51 @@ impl<'a> EngineView<'a> {
         ctx: &mut SearchContext,
         resume: bool,
     ) -> SearchResult {
+        let gt = OneGoal(goal_id);
         match params.seed {
-            Some(s) => self.search_core_impl(origin, seeds, goal_id, params, ctx, SeededJitter(s), resume),
-            None => self.search_core_impl(origin, seeds, goal_id, params, ctx, NoJitter, resume),
+            Some(s) => self.search_core_impl(origin, seeds, goal_id, gt, params, ctx, SeededJitter(s), resume),
+            None => self.search_core_impl(origin, seeds, goal_id, gt, params, ctx, NoJitter, resume),
+        }
+    }
+
+    /// Route to the cheapest node of a goal SET (route to an area). `origin` is the
+    /// on-graph start (its eligible globals relaxed from it, as in
+    /// [`EngineView::astar`]); with `origin = None` the search is multi-source over
+    /// `seeds`, as in [`EngineView::astar_multi`]. `params.goal` is only a
+    /// representative (landmark ranking); `params.start` is ignored.
+    ///
+    /// The result's cost is `min over g in goals of d(origin, g)` and its path ends on
+    /// the first goal node it reaches. Among goals reached at bit-identical cost the
+    /// lowest (rank, node id) wins (see [`GoalSet::with_ranks`]). `resume` continues a
+    /// budget-stopped search exactly like [`EngineView::astar_resume`]. An empty set
+    /// finds nothing.
+    pub fn astar_set(
+        &self,
+        origin: Option<u32>,
+        seeds: &[(u32, f32)],
+        goals: &GoalSet,
+        params: SearchParams,
+        ctx: &mut SearchContext,
+        resume: bool,
+    ) -> SearchResult {
+        if goals.is_empty() {
+            ctx.resume = None;
+            return SearchResult::not_found(SearchStatus::NotFound, 0, 0);
+        }
+        let seeds: &[(u32, f32)] = if origin.is_some() { &[] } else { seeds };
+        match params.seed {
+            Some(s) => self.search_core_impl(origin, seeds, params.goal, goals, &params, ctx, SeededJitter(s), resume),
+            None => self.search_core_impl(origin, seeds, params.goal, goals, &params, ctx, NoJitter, resume),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn search_core_impl<J: JitterPolicy>(
+    fn search_core_impl<J: JitterPolicy, G: GoalTest>(
         &self,
         origin: Option<u32>,
         seeds: &[(u32, f32)],
         goal_id: u32,
+        gt: G,
         params: &SearchParams,
         ctx: &mut SearchContext,
         jit: J,
@@ -782,6 +981,7 @@ impl<'a> EngineView<'a> {
             bidir: false,
             origin,
             goal: goal_id,
+            goals_fp: gt.fingerprint(),
             seed: params.seed,
             bucket_bits: bucket.to_bits(),
             seeds_fp: seeds_fingerprint(seeds),
@@ -797,7 +997,10 @@ impl<'a> EngineView<'a> {
         // cost from all landmarks to a small constant. Multi-source searches rank by the
         // goal side only (any goal-finite subset is admissible).
         let rank_from = origin.unwrap_or(goal_id);
-        let active = self.lm.select_active(rank_from, goal_id, active_landmarks());
+        let active = match gt.single() {
+            Some(_) => self.lm.select_active(rank_from, goal_id, active_landmarks()),
+            None => self.lm.select_active_set(rank_from, gt.nodes(), active_landmarks()),
+        };
 
         // Admissibility invariant: the ALT tables must be built over a SUPERSET of the
         // edges this search relaxes from non-origin nodes. The builder therefore includes
@@ -827,6 +1030,18 @@ impl<'a> EngineView<'a> {
         let goal_xy = match canon {
             Some((_, coords, _, _)) if jps && goal < coords.len() => unpack_coord(coords[goal]),
             _ => (i32::MIN, i32::MIN, -1),
+        };
+        // Goal-set jumps stop on entering the goals' bounding boxes instead.
+        let goal_boxes: Vec<TileBox> = match canon {
+            Some((_, coords, _, _)) if jps && gt.single().is_none() => goal_boxes(coords, gt.nodes()),
+            _ => Vec::new(),
+        };
+        // Cheapest g over the goal nodes (the incumbent).
+        let goals_min_g = |ctx: &SearchContext| -> f32 {
+            match gt.single() {
+                Some(g) => ctx.get_g(g as usize),
+                None => gt.nodes().iter().map(|&g| ctx.get_g(g as usize)).fold(f32::INFINITY, f32::min),
+            }
         };
 
         let mut pops: u32;
@@ -885,7 +1100,7 @@ impl<'a> EngineView<'a> {
                 }
             }
             pops = 0;
-            incumbent = ctx.get_g(goal);
+            incumbent = goals_min_g(ctx);
         }
 
         let max_pops = params.max_pops.unwrap_or(u32::MAX);
@@ -902,7 +1117,7 @@ impl<'a> EngineView<'a> {
             }
             // Lazy-deletion: skip heap entries that were superseded by a better g.
             if gcur > ctx.get_g(u) { continue; }
-            if u == goal { break; }
+            if gt.is_goal(id) { break; }
 
             pops += 1;
             if pops > max_pops {
@@ -964,7 +1179,8 @@ impl<'a> EngineView<'a> {
                         cold.h
                     };
                     if hv.is_finite() {
-                        if v == goal {
+                        // ng <= incumbent here (the prune above), so this keeps the min.
+                        if gt.is_goal(v_id) {
                             *incumbent = ng;
                         }
                         let f = ng + hv;
@@ -987,10 +1203,11 @@ impl<'a> EngineView<'a> {
                 while bits != 0 {
                     let d = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let jumped = if tables {
-                        cg.jump_from(u, u_xy, d, goal, goal_xy, coords)
-                    } else {
-                        cg.jump_walk(u, d, goal, offsets, dst)
+                    let jumped = match (gt.single(), tables) {
+                        (Some(_), true) => cg.jump_from(u, u_xy, d, goal, goal_xy, coords),
+                        (Some(_), false) => cg.jump_walk(u, d, goal, offsets, dst),
+                        (None, true) => cg.jump_from_boxes(u, u_xy, d, &goal_boxes, coords),
+                        (None, false) => cg.jump_walk_until(u, d, &|v: usize| gt.is_goal(v as u32), offsets, dst),
                     };
                     if let Some((j, k)) = jumped {
                         let w = if d < 4 { WALK_CARDINAL_MS } else { diag_w };
@@ -1061,6 +1278,21 @@ impl<'a> EngineView<'a> {
                 pending_forward: true,
             });
         }
+        // The goal the path ends on. A goal set takes the lowest (g, rank, id): after a
+        // normal stop that is a goal at the popped (minimal) cost, and every goal tied
+        // with it is already relaxed at that cost — the ALT bound is STRICTLY below the
+        // true distance at non-goal nodes (its one-quantum slack), so each tied goal's
+        // optimal predecessor had f < cost and was expanded before the stop. After a
+        // budget/cancel break it is the best goal discovered so far.
+        let reached = match gt.single() {
+            Some(g) => g,
+            None => match gt.best_by(|g| ctx.get_g(g as usize)) {
+                Some(g) => g,
+                None => return SearchResult::not_found(ended.unwrap_or(SearchStatus::NotFound), pops, 0),
+            },
+        };
+        let goal = reached as usize;
+        let goal_id = reached;
         if ctx.get_g(goal) == f32::INFINITY {
             return SearchResult::not_found(ended.unwrap_or(SearchStatus::NotFound), pops, 0);
         }
@@ -1096,7 +1328,11 @@ impl<'a> EngineView<'a> {
         // global teleport seeds g(goal) at pop zero. Surface the truncation in the
         // status so callers can retry / refuse to cache instead of trusting the cost.
         let status = ended.unwrap_or(SearchStatus::Found);
-        SearchResult { found: true, status, path, path_g, cost: ctx.get_g(goal), pops, pops_f: pops, pops_b: 0 }
+        let mut res = SearchResult { found: true, status, path, path_g, cost: ctx.get_g(goal), pops, pops_f: pops, pops_b: 0 };
+        if gt.single().is_none() {
+            end_at_first_goal(&mut res, |v| gt.is_goal(v));
+        }
+        res
     }
 }
 
@@ -1179,9 +1415,41 @@ impl<'a> EngineView<'a> {
         ctx_b: &mut SearchContext,
         resume: bool,
     ) -> SearchResult {
+        let gt = OneGoal(params.goal);
         match params.seed {
-            Some(s) => self.bidir_core_impl(origin, seeds, bp, params, ctx_f, ctx_b, SeededJitter(s), resume),
-            None => self.bidir_core_impl(origin, seeds, bp, params, ctx_f, ctx_b, NoJitter, resume),
+            Some(s) => self.bidir_core_impl(origin, seeds, gt, bp, params, ctx_f, ctx_b, SeededJitter(s), resume),
+            None => self.bidir_core_impl(origin, seeds, gt, bp, params, ctx_f, ctx_b, NoJitter, resume),
+        }
+    }
+
+    /// Bidirectional MM to the cheapest node of a goal SET: the backward frontier is
+    /// seeded with every goal at g = 0 (the mirror of the forward multi-source seeds),
+    /// the forward bound is the set-aggregated ALT bound
+    /// ([`LandmarkHeuristic::select_active_set`]), the backward bound stays anchored on
+    /// the origins, and the stop rule is unchanged. Same `origin`/`seeds`/`resume`
+    /// contract as [`EngineView::astar_set`]; the path ends on the goal whose backward
+    /// tree the meeting node lies in (deterministic, but tied goals are not ranked —
+    /// only the unidirectional engine applies the [`GoalSet`] tie ranks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn astar_bidir_set(
+        &self,
+        origin: Option<u32>,
+        seeds: &[(u32, f32)],
+        goals: &GoalSet,
+        bp: &BidirParams,
+        params: SearchParams,
+        ctx_f: &mut SearchContext,
+        ctx_b: &mut SearchContext,
+        resume: bool,
+    ) -> SearchResult {
+        if goals.is_empty() {
+            ctx_f.resume = None;
+            return SearchResult::not_found(SearchStatus::NotFound, 0, 0);
+        }
+        let seeds: &[(u32, f32)] = if origin.is_some() { &[] } else { seeds };
+        match params.seed {
+            Some(s) => self.bidir_core_impl(origin, seeds, goals, bp, params, ctx_f, ctx_b, SeededJitter(s), resume),
+            None => self.bidir_core_impl(origin, seeds, goals, bp, params, ctx_f, ctx_b, NoJitter, resume),
         }
     }
 
@@ -1247,10 +1515,11 @@ impl<'a> EngineView<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn bidir_core_impl<J: JitterPolicy>(
+    fn bidir_core_impl<J: JitterPolicy, G: GoalTest>(
         &self,
         origin: Option<u32>,
         seeds: &[(u32, f32)],
+        gt: G,
         bp: &BidirParams,
         params: SearchParams,
         ctx_f: &mut SearchContext,
@@ -1260,12 +1529,11 @@ impl<'a> EngineView<'a> {
     ) -> SearchResult {
         let n = self.nodes;
         let goal_id = params.goal;
-        let goal = goal_id as usize;
         let bucket = params.bucket_ms;
 
-        if origin == Some(goal_id) {
+        if let Some(o) = origin.filter(|&o| gt.is_goal(o)) {
             ctx_f.resume = None;
-            return SearchResult { found: true, status: SearchStatus::Found, path: vec![goal_id], path_g: vec![0.0], cost: 0.0, pops: 0, pops_f: 0, pops_b: 0 };
+            return SearchResult { found: true, status: SearchStatus::Found, path: vec![o], path_g: vec![0.0], cost: 0.0, pops: 0, pops_f: 0, pops_b: 0 };
         }
 
         let canon = canonical_ctx(self, params.seed);
@@ -1273,6 +1541,7 @@ impl<'a> EngineView<'a> {
             bidir: true,
             origin,
             goal: goal_id,
+            goals_fp: gt.fingerprint(),
             seed: params.seed,
             bucket_bits: bucket.to_bits(),
             seeds_fp: seeds_fingerprint(seeds),
@@ -1282,7 +1551,10 @@ impl<'a> EngineView<'a> {
         };
         let resumed = if resume { ctx_f.resume.filter(|r| r.tag == tag) } else { None };
 
-        let active_f = self.lm.select_active(origin.unwrap_or(goal_id), goal_id, active_landmarks());
+        let active_f = match gt.single() {
+            Some(_) => self.lm.select_active(origin.unwrap_or(goal_id), goal_id, active_landmarks()),
+            None => self.lm.select_active_set(origin.unwrap_or(goal_id), gt.nodes(), active_landmarks()),
+        };
         let h_f = |u: u32| -> f32 { self.lm.h_active(u, &active_f) };
 
         // Backward bound anchors: the forward origins — start at 0 plus globals at
@@ -1366,17 +1638,22 @@ impl<'a> EngineView<'a> {
                 }
             }
 
-            // --- backward seeding ---
-            ctx_b.set_g(goal, 0.0);
-            ctx_b.set_parent(goal, u32::MAX);
-            let hg = ctx_b.h_cached(goal, || h_b(goal_id));
-            if hg.is_finite() {
-                ctx_b.open.push(Key::new_bucketed(hg.max(0.0), 0.0, goal_id, bucket));
-            }
-            // A forward seed IS a meeting candidate if it is the goal itself.
-            if ctx_f.get_g(goal).is_finite() {
-                mu = ctx_f.get_g(goal);
-                meet = Some(goal_id);
+            // --- backward seeding (every goal of a set at g = 0) ---
+            for &gid in gt.nodes() {
+                let g = gid as usize;
+                if g >= n { continue; }
+                ctx_b.set_g(g, 0.0);
+                ctx_b.set_parent(g, u32::MAX);
+                let hg = ctx_b.h_cached(g, || h_b(gid));
+                if hg.is_finite() {
+                    ctx_b.open.push(Key::new_bucketed(hg.max(0.0), 0.0, gid, bucket));
+                }
+                // A forward seed IS a meeting candidate if it is a goal itself.
+                let gf = ctx_f.get_g(g);
+                if gf < mu {
+                    mu = gf;
+                    meet = Some(gid);
+                }
             }
             pops = 0;
             pops_f = 0;
@@ -1702,7 +1979,11 @@ impl<'a> EngineView<'a> {
         // budget/cancel break inside that window leaves a valid-but-unproven meeting
         // path. Surface the truncation instead of reporting Found.
         let status = ended.unwrap_or(SearchStatus::Found);
-        SearchResult { found: true, status, path, path_g, cost, pops, pops_f, pops_b }
+        let mut res = SearchResult { found: true, status, path, path_g, cost, pops, pops_f, pops_b };
+        if gt.single().is_none() {
+            end_at_first_goal(&mut res, |v| gt.is_goal(v));
+        }
+        res
     }
 }
 
