@@ -136,6 +136,34 @@ each route log line carries `duration_us`, `search_us`, `payload_us` and `ns_per
 (≈150-230 warm; tens of thousands means the search hit a cold page cache). `/stats`
 adds `search_us_log2` and `ns_per_pop_log2` histograms.
 
+## Danger areas (`avoidDangerAreas`)
+
+`dangerAreas.txt` (next to the snapshot; override with `NAVPATH_DANGER_AREAS=/path`)
+lists rectangles routes must stay out of, one per line, like the extractor's
+`override.txt`:
+
+```text
+# minx, maxx, miny, maxy[, plane]     (inclusive; no plane = all planes; '#' comments)
+3020, 3060, 3683, 3713, 0
+```
+
+Avoidance is ON by default for `/route` and `/route_area`; a request turns it off with
+the requirement `{"key":"avoidDangerAreas","value":0}` (or `false` / `"0"`). With it on,
+the route walks around every area and only enters one when that is strictly required
+(start or goal inside, or no other way through), crossing as few danger tiles as
+possible. The served `cost` is always the real travel cost.
+
+How it works: the normal (JPS / bidir / race) search runs first; if its path enters no
+danger tile it is already the answer. Otherwise a unidirectional search re-runs with
+`NAVPATH_DANGER_PENALTY_MS` (default 1,000,000 ms) charged per danger tile entered (log
+line `engine="uni_avoid"`). Detours cost well under a millisecond; a goal INSIDE an area
+costs a near-full-map search (~700-900k pops, ~150-180 ms warm), because the search
+must prove no entry with fewer danger tiles exists.
+
+Edit the file, then `curl -XPOST localhost:8080/admin/reload` — the snapshot is kept,
+the areas are re-read and the route caches are cleared (the response reports
+`danger_areas: {areas, tiles, penalty_ms}`).
+
 ## API Endpoints
 
 ### Check if a tile exists

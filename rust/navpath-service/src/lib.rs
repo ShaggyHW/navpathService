@@ -13,6 +13,7 @@ use crate::engine_adapter::{GlobalTeleport, FairyRing, MacroLookup, SearchContex
 
 pub mod routes;
 pub mod engine_adapter;
+pub mod danger;
 
 /// Cache key for a route search. Everything the search result depends on is in here;
 /// snapshot identity is implicit (the cache lives inside SnapshotState, so a snapshot
@@ -31,6 +32,8 @@ pub struct RouteCacheKey {
     pub quick_tele: bool,
     pub portable_fairy: bool,
     pub seed: Option<u64>,
+    /// The request avoids danger areas AND the snapshot has some (see [`danger`]).
+    pub avoid_danger: bool,
 }
 
 /// Pack an eligibility mask's satisfied bits into the cache key's lossless form.
@@ -320,6 +323,9 @@ pub struct SnapshotState {
     /// What [`warm_snapshot`] pinned for this mapping ([`WarmState`] as u8), read by the
     /// keep-warm loop.
     pub warm_state: Arc<std::sync::atomic::AtomicU8>,
+    /// Danger areas resolved against this snapshot (see [`danger`]); None or empty =
+    /// avoidance inactive. Re-read on every `/admin/reload`.
+    pub danger: Option<Arc<danger::DangerAreas>>,
 }
 
 impl SnapshotState {
@@ -359,6 +365,7 @@ impl SnapshotState {
                 )
             });
         let comp_graph = engine_adapter::build_component_graph(snap, &globals, &fairy_rings, &macro_lookup);
+        let danger = Arc::new(danger::DangerAreas::load(snap, &path));
         SnapshotState {
             path,
             snapshot: Some(Arc::new(snapshot)),
@@ -377,7 +384,25 @@ impl SnapshotState {
             profile_cache: new_profile_cache(),
             subpath_cache: new_subpath_cache(),
             warm_state: Arc::new(std::sync::atomic::AtomicU8::new(WarmState::Unlocked as u8)),
+            danger: Some(danger),
         }
+    }
+
+    /// Same snapshot and derived structures with `danger` replaced and every
+    /// result cache emptied (cached routes were computed under the old areas).
+    pub fn with_danger(&self, danger: Arc<danger::DangerAreas>) -> SnapshotState {
+        SnapshotState {
+            route_cache: new_route_cache(),
+            seed_shadow: new_seed_shadow(),
+            subpath_cache: new_subpath_cache(),
+            danger: Some(danger),
+            ..self.clone()
+        }
+    }
+
+    /// The danger areas a request with `avoidDangerAreas` on routes around, if any.
+    pub fn active_danger(&self) -> Option<&Arc<danger::DangerAreas>> {
+        self.danger.as_ref().filter(|d| !d.is_empty())
     }
 
     /// Not-ready state for a snapshot that failed to open: `/route` answers 503.
@@ -400,6 +425,7 @@ impl SnapshotState {
             profile_cache: new_profile_cache(),
             subpath_cache: new_subpath_cache(),
             warm_state: Arc::new(std::sync::atomic::AtomicU8::new(WarmState::Unlocked as u8)),
+            danger: None,
         }
     }
 }

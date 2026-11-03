@@ -56,6 +56,23 @@ fn req_has_portable_fairy(reqs: &[RequirementKV]) -> bool {
     req_flag(reqs, "hasPortableFairyRing")
 }
 
+/// `avoidDangerAreas`: route around the configured danger areas (see
+/// [`crate::danger`]). Defaults to ON; only an explicit 0 / false / "0" / "false"
+/// turns it off.
+fn req_avoid_danger(reqs: &[RequirementKV]) -> bool {
+    for r in reqs {
+        if r.key.trim().eq_ignore_ascii_case("avoidDangerAreas") {
+            let off = r.value.as_i64() == Some(0)
+                || r.value.as_u64() == Some(0)
+                || r.value.as_f64() == Some(0.0)
+                || r.value.as_bool() == Some(false)
+                || r.value.as_str().is_some_and(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false"));
+            return !off;
+        }
+    }
+    true
+}
+
 /// A profile flag set to 1 / true / "1".
 fn req_flag(reqs: &[RequirementKV], key: &str) -> bool {
     for r in reqs {
@@ -1244,6 +1261,9 @@ struct RouteJob {
     /// Fresh proven results are indexed for the sub-path cache (unseeded, on-graph start,
     /// cache enabled) — in the blocking task, off the reactor (T3.6).
     index_subpath: bool,
+    /// Danger areas this request routes around (`avoidDangerAreas` on and the snapshot
+    /// has some); None = plain routing.
+    danger: Option<Arc<crate::danger::DangerAreas>>,
 }
 
 /// The pre-serialized halves of a response (T3.13).
@@ -1285,7 +1305,51 @@ impl RouteJob {
 
     /// One fresh search on `engine`, observing `cancel`. The contexts return to the pool
     /// when this returns, before payload building.
+    ///
+    /// Danger avoidance runs the normal search FIRST: penalties only ever add cost, so
+    /// an optimal path that enters no danger tile is also optimal with the penalties —
+    /// served as-is, at full speed (JPS / bidir / race). Only when it does enter one
+    /// does the penalized search run (see [`engine_adapter::run_penalized_route`]).
     fn run_search(
+        &self,
+        engine: engine_adapter::EngineChoice,
+        cancel: &std::sync::atomic::AtomicBool,
+        pool: &Arc<crate::ContextPool>,
+    ) -> (engine_adapter::SearchOutcome, Option<u32>) {
+        let (outcome, entry) = self.run_search_plain(engine, cancel, pool);
+        let Some(danger) = self.danger.as_deref() else { return (outcome, entry) };
+        if !outcome.res.found
+            || !danger.path_enters(&outcome.res.path, !self.used_virtual_start)
+            || cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return (outcome, entry);
+        }
+        let arts = self.artifacts.as_ref().expect("profile artifacts resolved for fresh searches");
+        let neighbors = self.cur.neighbors.clone().expect("neighbors are loaded with the snapshot");
+        let mut lease = pool.checkout();
+        let (avoid, avoid_entry) = engine_adapter::run_penalized_route(
+            self.snap().clone(),
+            neighbors,
+            (!self.used_virtual_start).then_some(self.sid),
+            self.gid,
+            self.goals.as_deref(),
+            self.seed,
+            Some(cancel),
+            arts,
+            danger.penalty(),
+            &mut lease,
+        );
+        if !avoid.res.found {
+            // Only a budget/cancel truncation gets here (same graph, so the plain
+            // search's path exists): keep the plain route rather than none.
+            warn!(sid = self.sid, gid = self.gid, status = ?avoid.res.status, pops = avoid.res.pops,
+                  "danger-avoiding search gave up; serving the unpenalized route");
+            return (outcome, entry);
+        }
+        (avoid, avoid_entry)
+    }
+
+    fn run_search_plain(
         &self,
         engine: engine_adapter::EngineChoice,
         cancel: &std::sync::atomic::AtomicBool,
@@ -1371,7 +1435,15 @@ impl RouteJob {
     fn finish(&self, outcome: engine_adapter::SearchOutcome, virtual_entry: Option<u32>, search_us: u64) -> RouteTaskOut {
         let res = Arc::new(outcome.res);
         let payload = self.payload(res.found, &res.path, virtual_entry);
-        let subpath_rec = if self.index_subpath { crate::PathRecord::new(res.clone()) } else { None };
+        // With danger areas configured, only PLAIN (unpenalized) optima that enter no
+        // danger tile are indexed: they (and every slice of them) are optimal with AND
+        // without avoidance, so the sub-path cache stays valid for both kinds of
+        // request. A penalized result is never indexed — its detour is not the plain
+        // optimum an `avoidDangerAreas=0` request must get.
+        let subpath_ok = self.index_subpath
+            && outcome.engine != engine_adapter::PENALIZED_ENGINE
+            && !self.cur.active_danger().is_some_and(|d| d.path_enters(&res.path, false));
+        let subpath_rec = if subpath_ok { crate::PathRecord::new(res.clone()) } else { None };
         RouteTaskOut {
             res,
             virtual_entry,
@@ -1751,6 +1823,7 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
 
     let quick_tele = req_has_quick_tele(&req.profile.requirements);
     let portable_fairy = req_has_portable_fairy(&req.profile.requirements);
+    let danger = if req_avoid_danger(&req.profile.requirements) { cur.active_danger().cloned() } else { None };
 
     let mask = request_mask(snap, &req.profile);
 
@@ -1767,6 +1840,7 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
         quick_tele,
         portable_fairy,
         seed: if crate::cache_ignore_seed() { None } else { req.seed },
+        avoid_danger: danger.is_some(),
     };
     let cached: Option<crate::RouteCacheEntry> = cur
         .route_cache
@@ -1851,6 +1925,7 @@ pub async fn route(State(state): State<AppState>, Json(mut req): Json<RouteReque
         dive: req.dive,
         virtual_start_from,
         index_subpath: cur.subpath_cache.is_some() && !used_virtual_start && seed.is_none(),
+        danger,
     };
 
     // ---- Cache / sub-path hit: no search, no permit. ----
@@ -2521,6 +2596,7 @@ pub async fn route_area(State(state): State<AppState>, Json(mut req): Json<AreaR
 
     let quick_tele = req_has_quick_tele(&req.profile.requirements);
     let portable_fairy = req_has_portable_fairy(&req.profile.requirements);
+    let danger = if req_avoid_danger(&req.profile.requirements) { cur.active_danger().cloned() } else { None };
     let mask = request_mask(snap, &req.profile);
     let mask_bits = crate::pack_mask_bits(&mask.satisfied);
     let profile_key: crate::ProfileKey = (mask_bits, quick_tele, portable_fairy);
@@ -2588,6 +2664,7 @@ pub async fn route_area(State(state): State<AppState>, Json(mut req): Json<AreaR
         virtual_start_from: if used_virtual_start { req.start.as_ref().map(|c| (c.wx, c.wy, c.plane)) } else { None },
         // Area results stay out of the shared caches: /route is unaffected.
         index_subpath: false,
+        danger,
     });
 
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2677,6 +2754,14 @@ pub async fn route_area(State(state): State<AppState>, Json(mut req): Json<AreaR
 pub struct ReloadResponse { pub reloaded: bool, pub snapshot_hash: Option<String>, pub loaded_at: u64 }
 
 pub async fn reload(State(state): State<AppState>, Query(q): Query<ReloadQuery>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    enum Built {
+        /// Snapshot and danger areas unchanged: keep the live state.
+        Unchanged,
+        /// Same snapshot, re-read danger areas changed: derived structures kept, result
+        /// caches emptied.
+        Danger(SnapshotState),
+        Snapshot(SnapshotState),
+    }
     let cur = state.current.load_full();
     let path = cur.path.clone();
     let force = matches!(q.force.as_deref().map(str::trim), Some("1") | Some("true"));
@@ -2687,12 +2772,19 @@ pub async fn reload(State(state): State<AppState>, Query(q): Query<ReloadQuery>)
     let serving = cur.clone();
     let built = tokio::task::spawn_blocking(move || {
         // The file on disk is the snapshot already serving (same blake3 tail hash): keep
-        // the live state — mapping, derived structures and warm caches. `?force=1`
+        // the live state — mapping, derived structures and warm caches — but re-read the
+        // danger-areas file (it is edited independently of the snapshot). `?force=1`
         // rebuilds anyway.
-        if !force && serving.snapshot.is_some() {
-            let disk = crate::read_tail_hash_hex(&path);
-            if disk.is_some() && disk == serving.snapshot_hash_hex {
-                return Ok(None);
+        if !force {
+            if let Some(snap) = serving.snapshot.as_ref() {
+                let disk = crate::read_tail_hash_hex(&path);
+                if disk.is_some() && disk == serving.snapshot_hash_hex {
+                    let d = crate::danger::DangerAreas::load(snap, &path);
+                    let same = serving.danger.as_ref().is_some_and(|old| {
+                        old.areas == d.areas && old.penalty_ms.to_bits() == d.penalty_ms.to_bits()
+                    });
+                    return Ok(if same { Built::Unchanged } else { Built::Danger(serving.with_danger(Arc::new(d))) });
+                }
             }
         }
         let new_snap = navpath_core::Snapshot::open(&path).map_err(|e| e.to_string())?;
@@ -2701,13 +2793,17 @@ pub async fn reload(State(state): State<AppState>, Query(q): Query<ReloadQuery>)
         let new_hash = new_snap.tail_hash_hex();
         let st = SnapshotState::build(path, new_snap, new_hash);
         st.set_warm_state(warm);
-        Ok::<Option<SnapshotState>, String>(Some(st))
+        Ok::<Built, String>(Built::Snapshot(st))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let danger_json = |st: &SnapshotState| match st.danger.as_ref() {
+        Some(d) => serde_json::json!({ "file": d.path, "areas": d.areas.len(), "tiles": d.tiles, "penalty_ms": d.penalty_ms }),
+        None => serde_json::Value::Null,
+    };
     match built {
-        Ok(Some(new_state)) => {
+        Ok(Built::Snapshot(new_state)) => {
             let new_hash = new_state.snapshot_hash_hex.clone();
             state.current.store(Arc::new(new_state));
             info!(path=?log_path, hash=?new_hash, "reloaded snapshot");
@@ -2715,16 +2811,31 @@ pub async fn reload(State(state): State<AppState>, Query(q): Query<ReloadQuery>)
             Ok(Json(serde_json::json!({
                 "reloaded": true,
                 "snapshot_hash": latest.snapshot_hash_hex,
-                "loaded_at": latest.loaded_at_unix
+                "loaded_at": latest.loaded_at_unix,
+                "danger_areas": danger_json(&latest),
             })))
         }
-        Ok(None) => {
-            info!(path=?log_path, hash=?cur.snapshot_hash_hex, "snapshot unchanged on disk; reload skipped (?force=1 rebuilds)");
+        Ok(Built::Danger(new_state)) => {
+            state.current.store(Arc::new(new_state));
+            let latest = state.current.load();
+            info!(path=?log_path, hash=?latest.snapshot_hash_hex, "snapshot unchanged; danger areas reloaded (result caches cleared)");
+            Ok(Json(serde_json::json!({
+                "reloaded": false,
+                "unchanged": true,
+                "danger_areas_reloaded": true,
+                "snapshot_hash": latest.snapshot_hash_hex,
+                "loaded_at": latest.loaded_at_unix,
+                "danger_areas": danger_json(&latest),
+            })))
+        }
+        Ok(Built::Unchanged) => {
+            info!(path=?log_path, hash=?cur.snapshot_hash_hex, "snapshot and danger areas unchanged on disk; reload skipped (?force=1 rebuilds)");
             Ok(Json(serde_json::json!({
                 "reloaded": false,
                 "unchanged": true,
                 "snapshot_hash": cur.snapshot_hash_hex,
-                "loaded_at": cur.loaded_at_unix
+                "loaded_at": cur.loaded_at_unix,
+                "danger_areas": danger_json(&cur),
             })))
         }
         Err(e) => {

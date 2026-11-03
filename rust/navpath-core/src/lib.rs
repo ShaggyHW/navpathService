@@ -27,4 +27,4 @@ pub mod engine;
 pub const QUICK_TELE_LODESTONE_MS: f32 = 5000.0;
 
 pub use snapshot::Snapshot;
-pub use engine::{EngineView, GoalSet, SearchParams, SearchResult, SearchStatus, NeighborProvider, LandmarkHeuristic};
+pub use engine::{EngineView, GoalSet, NodePenalty, SearchParams, SearchResult, SearchStatus, NeighborProvider, LandmarkHeuristic};

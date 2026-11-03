@@ -114,7 +114,7 @@ fn app_for(path: &std::path::Path, with_comp_graph: bool) -> axum::Router {
             canonical_grid: None,
             profile_cache: navpath_service::new_profile_cache(),
             subpath_cache: navpath_service::new_subpath_cache(),
-            warm_state: Default::default(),
+            warm_state: Default::default(), danger: None,
         })),
         search_permits: navpath_service::default_search_permits(),
         metrics: Arc::new(navpath_service::Metrics::default()),
@@ -277,4 +277,81 @@ async fn single_tile_route_is_unchanged() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["cost"], json!(54.0 * 300.0), "{v}");
     assert!(!text.contains("goal_reached"), "{text}");
+}
+
+/// `avoidDangerAreas` (default on): a flagged stretch of the west column. Walking
+/// (3200,3200) -> (3200,3215) crosses it; the global teleport (10000 ms) lands at
+/// (3200,3210), past it. Also guards the caches: a penalized detour must never be served
+/// to an `avoidDangerAreas=0` request (route cache or sub-path slices), nor vice versa.
+#[tokio::test]
+async fn danger_areas_are_avoided_unless_disabled() {
+    let snap = make_snapshot();
+    let opened = navpath_core::Snapshot::open(&snap).unwrap();
+    let areas = vec![navpath_service::danger::DangerArea { min_x: 3200, max_x: 3200, min_y: 3205, max_y: 3207, plane: Some(0) }];
+    let danger = Arc::new(navpath_service::danger::DangerAreas::build(&opened, snap.to_path_buf(), areas, 1_000_000.0));
+    assert_eq!(danger.tiles, 3);
+    let (neighbors, neighbors_rev, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
+    let comp_graph = Some(Arc::new(navpath_service::engine_adapter::build_component_graph(&opened, &globals, &[], &macro_lookup)));
+    let state = AppState {
+        current: Arc::new(ArcSwap::from_pointee(SnapshotState {
+            path: snap.to_path_buf(),
+            snapshot: Some(Arc::new(opened)),
+            neighbors: Some(Arc::new(neighbors)),
+            neighbors_rev: Some(Arc::new(neighbors_rev)),
+            globals: Arc::new(globals),
+            macro_lookup: Arc::new(macro_lookup),
+            loaded_at_unix: 123,
+            snapshot_hash_hex: None,
+            route_cache: navpath_service::new_route_cache(),
+            seed_shadow: navpath_service::new_seed_shadow(),
+            fairy_rings: Arc::new(Vec::new()),
+            node_to_fairy_ring: Arc::new(navpath_service::FxHashMap::default()),
+            comp_graph,
+            canonical_grid: None,
+            profile_cache: navpath_service::new_profile_cache(),
+            subpath_cache: navpath_service::new_subpath_cache(),
+            warm_state: Default::default(),
+            danger: Some(danger),
+        })),
+        search_permits: navpath_service::default_search_permits(),
+        metrics: Arc::new(navpath_service::Metrics::default()),
+        ctx_pool: navpath_service::ContextPool::new(),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    let app = build_router(state);
+    let route = |s: (i32, i32), g: (i32, i32), avoid: Option<Value>| {
+        let reqs = match avoid {
+            Some(v) => json!([{"key": "avoidDangerAreas", "value": v}]),
+            None => json!([]),
+        };
+        let app = app.clone();
+        async move {
+            let (st, v, _) = post(&app, "/route", json!({
+                "start": tile(s.0, s.1), "goal": tile(g.0, g.1), "profile": {"requirements": reqs},
+                "options": {"return_geometry": true},
+            })).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["found"], json!(true), "{v}");
+            let geo: Vec<(i64, i64)> = v["geometry"].as_array().unwrap().iter()
+                .map(|t| (t[0].as_i64().unwrap(), t[1].as_i64().unwrap())).collect();
+            let in_danger = geo.iter().filter(|&&(x, y)| x == 3200 && (3205..=3207).contains(&y)).count();
+            (v["cost"].as_f64().unwrap(), in_danger)
+        }
+    };
+    let walk = 15.0 * 300.0;
+    let detour = 10000.0 + 5.0 * 300.0;
+    // Interleaved so every answer could come from a cache filled by the other kind.
+    for _ in 0..2 {
+        assert_eq!(route((3200, 3200), (3200, 3215), None).await, (detour, 0));
+        assert_eq!(route((3200, 3200), (3200, 3215), Some(json!(0))).await, (walk, 3));
+        assert_eq!(route((3200, 3200), (3200, 3215), Some(json!(false))).await, (walk, 3));
+        assert_eq!(route((3200, 3200), (3200, 3215), Some(json!(1))).await, (detour, 0));
+        // A slice of either route (sub-path cache candidates).
+        assert_eq!(route((3200, 3201), (3200, 3214), Some(json!("0"))).await, (13.0 * 300.0, 3));
+        assert_eq!(route((3200, 3201), (3200, 3214), None).await, (10000.0 + 4.0 * 300.0, 0));
+    }
+    // Goal inside the area: entered (strictly required), from the cheaper side.
+    assert_eq!(route((3200, 3200), (3200, 3206), None).await, (6.0 * 300.0, 2));
+    // Routes that never touch the area are unaffected.
+    assert_eq!(route((3202, 3200), (3202, 3210), None).await, (10.0 * 300.0, 0));
 }

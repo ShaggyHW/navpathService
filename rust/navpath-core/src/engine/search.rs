@@ -71,8 +71,17 @@ pub fn edge_jitter(seed: u64, from: u32, to: u32) -> f32 {
 /// Both implementations are the exact arithmetic the old inline `match params.seed`
 /// performed, so results are bit-identical.
 trait JitterPolicy: Copy {
+    /// Whether this policy adds per-node entry penalties ([`Penalized`]). A const so
+    /// the unpenalized monomorphizations fold every penalty branch away (bit-identical
+    /// to the pre-penalty engine).
+    const PENALIZED: bool = false;
     /// Price of the forward edge `from -> to` with base weight `w` (ms).
     fn w(self, from: u32, to: u32, w: f32) -> f32;
+    /// Entry penalty of node `v` (charged on multi-source seeds, which enter the open
+    /// list without an edge). Only consulted when [`Self::PENALIZED`].
+    fn node_pen(self, _v: u32) -> f32 { 0.0 }
+    /// Identity of the penalty table, part of the resume tag (0 = none).
+    fn pen_fp(self) -> u64 { 0 }
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +96,79 @@ struct SeededJitter(u64);
 impl JitterPolicy for SeededJitter {
     #[inline(always)]
     fn w(self, from: u32, to: u32, w: f32) -> f32 { w + edge_jitter(self.0, from, to) }
+}
+
+/// Per-node ENTRY penalty (danger-area avoidance): every relaxation that lands on a
+/// flagged node pays `ms` on top of the edge weight. The origin itself is never charged
+/// (no edge enters it); multi-source seeds are (they are landings).
+///
+/// Penalties only ever ADD cost, so the ALT bound (built on the unpenalized graph) stays
+/// admissible and consistent: a penalized search is exact on the penalized graph. It
+/// breaks the uniform-walk-cost premise of canonical pruning and jump points, so
+/// penalized searches always run plain (unpruned) unidirectional expansion.
+#[derive(Clone, Copy)]
+pub struct NodePenalty<'a> {
+    /// One bit per node id (bit `v & 63` of word `v >> 6`); ids past the end are clear.
+    pub bits: &'a [u64],
+    /// Penalty per flagged node entered (ms).
+    pub ms: f32,
+}
+
+impl<'a> NodePenalty<'a> {
+    #[inline(always)]
+    pub fn contains(&self, v: u32) -> bool {
+        match self.bits.get((v >> 6) as usize) {
+            Some(w) => (w >> (v & 63)) & 1 != 0,
+            None => false,
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self, v: u32) -> f32 {
+        if self.contains(v) { self.ms } else { 0.0 }
+    }
+
+    fn fingerprint(&self) -> u64 {
+        (self.bits.as_ptr() as u64) ^ ((self.bits.len() as u64) << 40) ^ ((self.ms.to_bits() as u64) << 8) ^ 1
+    }
+
+    /// Remove the penalties a penalized search folded into `res` (`path_g`, `cost`), so
+    /// the result reports real travel costs. `origin_first`: `path[0]` is the search
+    /// origin (never charged) rather than a multi-source seed (charged). Returns the
+    /// number of charged nodes on the path. Subtraction is done in f64 from the exact
+    /// penalty total, so the only residue is the f32 rounding of the accumulation.
+    pub fn strip(&self, res: &mut SearchResult, origin_first: bool) -> u32 {
+        let mut charged = 0u32;
+        for (i, (&v, g)) in res.path.iter().zip(res.path_g.iter_mut()).enumerate() {
+            if self.contains(v) && !(i == 0 && origin_first) {
+                charged += 1;
+            }
+            if charged > 0 {
+                *g = (*g as f64 - charged as f64 * self.ms as f64).max(0.0) as f32;
+            }
+        }
+        if charged > 0 {
+            if let Some(&last) = res.path_g.last() {
+                res.cost = last;
+            }
+        }
+        charged
+    }
+}
+
+/// [`JitterPolicy`] wrapper charging [`NodePenalty`] on every edge's destination.
+#[derive(Clone, Copy)]
+struct Penalized<'a, J: JitterPolicy> {
+    inner: J,
+    pen: NodePenalty<'a>,
+}
+impl<J: JitterPolicy> JitterPolicy for Penalized<'_, J> {
+    const PENALIZED: bool = true;
+    #[inline(always)]
+    fn w(self, from: u32, to: u32, w: f32) -> f32 { self.inner.w(from, to, w) + self.pen.get(to) }
+    #[inline(always)]
+    fn node_pen(self, v: u32) -> f32 { self.pen.get(v) }
+    fn pen_fp(self) -> u64 { self.pen.fingerprint() }
 }
 
 /// Goal SET of a route-to-area search ([`EngineView::astar_set`] /
@@ -527,6 +609,8 @@ struct QueryTag {
     seeds_fp: u64,
     canon: bool,
     jps: bool,
+    /// Penalty-table identity ([`NodePenalty`]; 0 = unpenalized).
+    pen_fp: u64,
     /// Bidir: the backward context's generation, so a backward context reused for
     /// another search in between is detected.
     other_gen: u32,
@@ -960,6 +1044,38 @@ impl<'a> EngineView<'a> {
         }
     }
 
+    /// Unidirectional search on the graph with `penalty` charged on every node entered
+    /// (see [`NodePenalty`]): exact on the penalized graph, so it avoids flagged nodes
+    /// unless entering them is cheaper than every alternative including the penalties.
+    /// `origin`/`seeds`/`goals` follow [`EngineView::astar_set`] (`goals = None`: the
+    /// single goal `params.goal`; `origin = Some(..)` ignores `seeds`). Canonical
+    /// pruning and jump points never engage. The returned `path_g`/`cost` INCLUDE the
+    /// penalties; [`NodePenalty::strip`] converts them back to real costs. `resume`
+    /// continues a budget-stopped penalized search as in [`EngineView::astar_resume`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn astar_penalized(
+        &self,
+        origin: Option<u32>,
+        seeds: &[(u32, f32)],
+        goals: Option<&GoalSet>,
+        params: SearchParams,
+        penalty: NodePenalty,
+        ctx: &mut SearchContext,
+        resume: bool,
+    ) -> SearchResult {
+        let seeds: &[(u32, f32)] = if origin.is_some() { &[] } else { seeds };
+        match (goals, params.seed) {
+            (Some(gs), _) if gs.is_empty() => {
+                ctx.resume = None;
+                SearchResult::not_found(SearchStatus::NotFound, 0, 0)
+            }
+            (Some(gs), Some(s)) => self.search_core_impl(origin, seeds, params.goal, gs, &params, ctx, Penalized { inner: SeededJitter(s), pen: penalty }, resume),
+            (Some(gs), None) => self.search_core_impl(origin, seeds, params.goal, gs, &params, ctx, Penalized { inner: NoJitter, pen: penalty }, resume),
+            (None, Some(s)) => self.search_core_impl(origin, seeds, params.goal, OneGoal(params.goal), &params, ctx, Penalized { inner: SeededJitter(s), pen: penalty }, resume),
+            (None, None) => self.search_core_impl(origin, seeds, params.goal, OneGoal(params.goal), &params, ctx, Penalized { inner: NoJitter, pen: penalty }, resume),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn search_core_impl<J: JitterPolicy, G: GoalTest>(
         &self,
@@ -975,7 +1091,8 @@ impl<'a> EngineView<'a> {
         let n = self.nodes;
         let goal = goal_id as usize;
         let bucket = params.bucket_ms;
-        let canon = canonical_ctx(self, params.seed);
+        // Penalized pricing is non-uniform: no canonical pruning, no jump points.
+        let canon = if J::PENALIZED { None } else { canonical_ctx(self, params.seed) };
         let jps = self.jps && canon.is_some_and(|(cg, ..)| cg.has_jps());
         let tag = QueryTag {
             bidir: false,
@@ -987,6 +1104,7 @@ impl<'a> EngineView<'a> {
             seeds_fp: seeds_fingerprint(seeds),
             canon: canon.is_some(),
             jps,
+            pen_fp: jit.pen_fp(),
             other_gen: 0,
         };
         let resumed = if resume { ctx.resume.filter(|r| r.tag == tag) } else { None };
@@ -1090,6 +1208,7 @@ impl<'a> EngineView<'a> {
 
             for &(node, g0) in seeds {
                 if node as usize >= n { continue; }
+                let g0 = if J::PENALIZED { g0 + jit.node_pen(node) } else { g0 };
                 if g0 < ctx.get_g(node as usize) {
                     ctx.set_g(node as usize, g0);
                     ctx.set_parent(node as usize, u32::MAX);
@@ -1547,6 +1666,7 @@ impl<'a> EngineView<'a> {
             seeds_fp: seeds_fingerprint(seeds),
             canon: canon.is_some(),
             jps: false,
+            pen_fp: 0,
             other_gen: ctx_b.generation,
         };
         let resumed = if resume { ctx_f.resume.filter(|r| r.tag == tag) } else { None };

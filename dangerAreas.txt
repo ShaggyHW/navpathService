@@ -1,0 +1,8 @@
+# Danger areas: the router walks around these unless entering is strictly required.
+# Requests opt out with the requirement {"key":"avoidDangerAreas","value":0}.
+#
+# One area per line, inclusive bounds:  minx, maxx, miny, maxy[, plane]
+# (no plane = all planes). Blank lines and '#' comments are ignored.
+# Re-read on startup and on `POST /admin/reload` (no snapshot rebuild needed).
+
+3020, 3060, 3683, 3713, 0

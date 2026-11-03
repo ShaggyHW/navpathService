@@ -1427,6 +1427,77 @@ fn route_virtual_start(
     (outcome, entry)
 }
 
+/// [`SearchOutcome::engine`] of [`run_penalized_route`] results.
+pub const PENALIZED_ENGINE: &str = "uni_avoid";
+
+/// Danger-avoiding route (`avoidDangerAreas`): a unidirectional search with `penalty`
+/// charged on every node entered (see [`navpath_core::NodePenalty`]). `start = None` is
+/// a virtual start (multi-source over the eligible globals, `path[0]` = entry);
+/// `goals` routes to an area as [`run_area_route`]. Plain expansion only (penalties
+/// break canonical pruning / jump points) and no bidirectional engine; the same pop
+/// budgets and retry ladder as every other search. The returned cost / `path_g` are
+/// REAL travel costs (penalties stripped); the second value is the virtual entry.
+#[allow(clippy::too_many_arguments)]
+pub fn run_penalized_route(
+    snapshot: Arc<Snapshot>,
+    neighbors: Arc<NeighborProvider>,
+    start: Option<u32>,
+    goal_id: u32,
+    goals: Option<&GoalSet>,
+    seed: Option<u64>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    artifacts: &ProfileArtifacts,
+    penalty: navpath_core::NodePenalty,
+    ctxs: &mut dyn SearchContexts,
+) -> (SearchOutcome, Option<u32>) {
+    const ENGINE: &str = PENALIZED_ENGINE;
+    let eligible_globals: &[(u32, f32)] = &artifacts.eligible_globals;
+    if start.is_none() && eligible_globals.is_empty() {
+        return (
+            SearchOutcome { res: not_found_result(), retried: false, attempts_pops: [0, 0, 0], seed_dropped: false, engine: ENGINE },
+            None,
+        );
+    }
+    let nodes = snapshot.counts().nodes as usize;
+    let snap_ref: &Snapshot = &snapshot;
+    let mut view = EngineView {
+        nodes,
+        walk: WalkGraph::from_snapshot(snap_ref),
+        macros: neighbors,
+        lm: LandmarkHeuristic::from_snapshot(snap_ref),
+        extra: ExtraEdges::default(),
+        coords: Some(snap_ref.coords_packed()),
+        canonical: None,
+        jps: false,
+    };
+    if start.is_some() {
+        view.extra.global = std::borrow::Cow::Borrowed(eligible_globals);
+    }
+    view.extra.fairy_sources = std::borrow::Cow::Borrowed(artifacts.fairy_sources.as_slice());
+    view.extra.fairy_dests = std::borrow::Cow::Borrowed(artifacts.fairy_dests.as_slice());
+    let macro_filter = &artifacts.macro_filter;
+
+    let search = |seed: Option<u64>, max_pops: Option<u32>, resume: bool, ctxs: &mut dyn SearchContexts| -> SearchResult {
+        let params = SearchParams {
+            start: start.unwrap_or(goal_id),
+            goal: goal_id,
+            macro_filter: Some(macro_filter),
+            seed,
+            max_pops,
+            cancel,
+            bucket_ms: bucket_for(seed),
+        };
+        view.astar_penalized(start, eligible_globals, goals, params, penalty, ctxs.one(), resume)
+    };
+    let res = search(seed, default_max_pops(nodes), false, ctxs);
+    let mut outcome = retry_ladder(res, seed, cancel, nodes, ENGINE, |s, m, r| search(s, m, r, ctxs));
+    if outcome.res.found {
+        penalty.strip(&mut outcome.res, start.is_some());
+    }
+    let entry = if start.is_none() && outcome.res.found { outcome.res.path.first().copied() } else { None };
+    (outcome, entry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

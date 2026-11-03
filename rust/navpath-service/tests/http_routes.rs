@@ -201,7 +201,7 @@ async fn reachable_is_walk_only_and_range_bounded() {
         comp_graph: None,
         canonical_grid: None,
         profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache(),
-        warm_state: Default::default(),
+        warm_state: Default::default(), danger: None,
     })), search_permits: navpath_service::default_search_permits(), metrics: Arc::new(navpath_service::Metrics::default()), ctx_pool: navpath_service::ContextPool::new(), ready: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
 
     let app = build_router(state);
@@ -280,7 +280,7 @@ async fn health_and_route_and_reload() {
         comp_graph: None,
         canonical_grid: None,
         profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache(),
-        warm_state: Default::default(),
+        warm_state: Default::default(), danger: None,
     })), search_permits: navpath_service::default_search_permits(), metrics: Arc::new(navpath_service::Metrics::default()), ctx_pool: navpath_service::ContextPool::new(), ready: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
 
     let app = build_router(state.clone());
@@ -341,7 +341,7 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
         comp_graph: None,
         canonical_grid: None,
         profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache(),
-        warm_state: Default::default(),
+        warm_state: Default::default(), danger: None,
     })), search_permits: navpath_service::default_search_permits(), metrics: Arc::new(navpath_service::Metrics::default()), ctx_pool: navpath_service::ContextPool::new(), ready: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
 
     let app = build_router(state.clone());
