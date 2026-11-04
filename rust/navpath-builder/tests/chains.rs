@@ -1,4 +1,4 @@
-use navpath_builder::build::chains::flatten_chains;
+use navpath_builder::build::chains::{flatten_chains, flatten_global_chains};
 use navpath_builder::build::graph::NodeIndex;
 use navpath_builder::build::load_sqlite::{Tile, load_fairy_rings};
 use rusqlite::{Connection, OpenFlags};
@@ -328,4 +328,116 @@ fn load_fairy_rings_skips_missing_tiles() {
     assert_eq!(rings.len(), 1);
     assert_eq!(rings[0].code, "CKS");
     assert_eq!(rings[0].node_id, 200);
+}
+
+// ---- Destination boxes (dest_min/max_*) -------------------------------------------
+
+/// The production box columns on top of the minimal schema, plus the POA table the
+/// global flatten scans.
+fn create_box_schema(conn: &Connection) {
+    create_schema(conn);
+    conn.execute_batch(
+        r#"
+        ALTER TABLE teleports_item_nodes ADD COLUMN dest_max_x INTEGER;
+        ALTER TABLE teleports_item_nodes ADD COLUMN dest_max_y INTEGER;
+        ALTER TABLE teleports_object_nodes ADD COLUMN dest_max_x INTEGER;
+        ALTER TABLE teleports_object_nodes ADD COLUMN dest_max_y INTEGER;
+        CREATE TABLE teleports_POA_nodes (
+            id INTEGER PRIMARY KEY,
+            dest_min_x INTEGER, dest_max_x INTEGER, dest_min_y INTEGER, dest_max_y INTEGER,
+            dest_plane INTEGER, cost REAL, requirements TEXT
+        );
+        "#,
+    )
+    .unwrap();
+}
+
+fn insert_item_box(conn: &Connection, id: i64, min: (i32, i32), max: (i32, i32)) {
+    conn.execute(
+        "INSERT INTO teleports_item_nodes (id, dest_min_x, dest_min_y, dest_max_x, dest_max_y, dest_plane, cost, requirements)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 1.0, NULL)",
+        rusqlite::params![id, min.0, min.1, max.0, max.1],
+    )
+    .unwrap();
+}
+
+/// Node-ordered fixture: node id = position, so `tiles[id].walk_mask` lines up.
+fn fixture(coords: &[((i32, i32), u32)]) -> (NodeIndex<'static>, Vec<Tile>) {
+    let pairs: Vec<((i32, i32, i32), u32)> =
+        coords.iter().enumerate().map(|(i, &((x, y), _))| ((x, y, 0), i as u32)).collect();
+    let tiles = coords
+        .iter()
+        .map(|&((x, y), walk_mask)| Tile { x, y, plane: 0, walk_mask })
+        .collect();
+    (NodeIndex::from_coords(&pairs), tiles)
+}
+
+#[test]
+fn global_box_lands_on_walkable_tile_nearest_centre_when_min_corner_is_off_graph() {
+    let conn = mem_conn();
+    create_box_schema(&conn);
+    // Box 10..=14 x 20..=24, centre (12, 22). The min corner (10, 20) is not a tile —
+    // the Dwarven Outpost case that used to drop the teleport silently.
+    insert_item_box(&conn, 169, (10, 20), (14, 24));
+    let (index, tiles) = fixture(&[((11, 20), 255), ((12, 23), 255), ((14, 24), 255)]);
+
+    let g = flatten_global_chains(&conn, &tiles, &index).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].dst, 1, "(12, 23) is nearest the centre");
+    assert_eq!((g[0].steps[0].kind, g[0].steps[0].id), ("item", 169));
+}
+
+#[test]
+fn landing_prefers_walkable_tiles_and_breaks_ties_by_lowest_y_then_x() {
+    let conn = mem_conn();
+    create_box_schema(&conn);
+    insert_item_box(&conn, 1, (0, 0), (4, 4)); // centre (2, 2)
+    // The centre itself has walk_mask 0; the four orthogonal neighbours tie.
+    let (index, tiles) = fixture(&[
+        ((2, 2), 0),
+        ((2, 3), 255),
+        ((3, 2), 255),
+        ((1, 2), 255),
+        ((2, 1), 255),
+    ]);
+
+    let g = flatten_global_chains(&conn, &tiles, &index).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].dst, 4, "(2, 1): walkable, nearest, lowest y");
+}
+
+#[test]
+fn box_without_walkable_tile_keeps_min_corner_node_else_drops() {
+    let conn = mem_conn();
+    create_box_schema(&conn);
+    // Item 1: its only tile is the min corner, walk_mask 0 — kept, as before the fix
+    // (single-tile hand-offs onto mask-0 tiles must not disappear).
+    insert_item_box(&conn, 1, (0, 0), (0, 0));
+    // Item 2: a mask-0 tile that is not the corner — nothing to land on.
+    insert_item_box(&conn, 2, (10, 10), (12, 12));
+    // Item 3: no tile in the box at all.
+    insert_item_box(&conn, 3, (50, 50), (52, 52));
+    let (index, tiles) = fixture(&[((0, 0), 0), ((11, 11), 0)]);
+
+    let g = flatten_global_chains(&conn, &tiles, &index).unwrap();
+    let ids: Vec<i64> = g.iter().map(|m| m.steps[0].id).collect();
+    assert_eq!(ids, vec![1]);
+    assert_eq!(g[0].dst, 0);
+}
+
+#[test]
+fn positional_object_box_dest_resolves_the_same_way() {
+    let conn = mem_conn();
+    create_box_schema(&conn);
+    conn.execute(
+        "INSERT INTO teleports_object_nodes (id, orig_min_x, orig_min_y, orig_plane, dest_min_x, dest_min_y, dest_max_x, dest_max_y, dest_plane, next_node_type, next_node_id, cost, requirements)
+         VALUES (5, 0, 0, 0, 100, 100, 102, 102, 0, NULL, NULL, 2.0, NULL)",
+        [],
+    )
+    .unwrap();
+    let (index, tiles) = fixture(&[((0, 0), 255), ((101, 101), 255), ((102, 100), 255)]);
+
+    let metas = flatten_chains(&conn, &tiles, &index).unwrap();
+    assert_eq!(metas.len(), 1);
+    assert_eq!((metas[0].src, metas[0].dst), (0, 1));
 }

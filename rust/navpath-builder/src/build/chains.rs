@@ -123,13 +123,126 @@ pub struct MacroEdgeMeta {
     pub steps: Vec<ChainStepMeta>,
 }
 
+/// A step's destination: an inclusive tile box on one plane. Door and lodestone rows
+/// name a single tile (a 1x1 box); the `dest_min/max_*` tables name an area the
+/// player lands somewhere inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DestBox {
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    plane: i32,
+}
+
+impl DestBox {
+    fn tile(x: i64, y: i64, plane: i64) -> Self {
+        DestBox { min_x: x as i32, min_y: y as i32, max_x: x as i32, max_y: y as i32, plane: plane as i32 }
+    }
+
+    /// A missing or inverted max edge collapses to the min corner (the old single-tile
+    /// reading), so a malformed row degrades instead of scanning a bogus range.
+    fn from_row(min_x: i64, min_y: i64, max_x: Option<i64>, max_y: Option<i64>, plane: i64) -> Self {
+        let max_x = max_x.filter(|&m| m >= min_x).unwrap_or(min_x);
+        let max_y = max_y.filter(|&m| m >= min_y).unwrap_or(min_y);
+        DestBox { min_x: min_x as i32, min_y: min_y as i32, max_x: max_x as i32, max_y: max_y as i32, plane: plane as i32 }
+    }
+}
+
+/// Boxes larger than this are data errors (the biggest real one is ~3k tiles); they
+/// resolve as their min corner instead of being scanned.
+const MAX_LANDING_SCAN_TILES: i64 = 1 << 16;
+
+/// Resolves a destination box to the one node a chain lands on: the walkable
+/// (`walk_mask != 0`) graph tile nearest the box centre, ties broken by lowest (y, x).
+/// One representative tile rather than an edge per tile: in game the landing scatters
+/// across the box, so fanning out would let the planner assume it always lands on the
+/// tile nearest its goal (an optimistic cost) and multiply the edges.
+///
+/// With no walkable tile in the box, falls back to the min corner if it is a graph node
+/// at all — the pre-box behaviour, kept so the explicit single-tile hand-offs that sit on
+/// `walk_mask = 0` tiles still resolve exactly as before. `None` means nothing to land on.
+///
+/// `tiles` is the node-ordered tile list (`tiles[node].walk_mask`); empty means every
+/// node counts as walkable (test fixtures with sparse ids).
+fn resolve_landing(b: &DestBox, index: &NodeIndex, tiles: &[Tile]) -> Option<u32> {
+    let walkable = |n: u32| tiles.get(n as usize).map_or(tiles.is_empty(), |t| t.walk_mask != 0);
+    let area = (b.max_x - b.min_x + 1) as i64 * (b.max_y - b.min_y + 1) as i64;
+    if area > MAX_LANDING_SCAN_TILES {
+        tracing::warn!(?b, area, "destination box too large to scan; using its min corner");
+    } else {
+        // Doubled coordinates keep the centre exact for even-sized boxes.
+        let (cx2, cy2) = ((b.min_x + b.max_x) as i64, (b.min_y + b.max_y) as i64);
+        let mut best: Option<(i64, u32)> = None;
+        for y in b.min_y..=b.max_y {
+            for x in b.min_x..=b.max_x {
+                let Some(n) = index.get(x, y, b.plane) else { continue };
+                if !walkable(n) { continue; }
+                let (dx, dy) = (2 * x as i64 - cx2, 2 * y as i64 - cy2);
+                let d = dx * dx + dy * dy;
+                // Row-major scan + strict `<` = lowest (y, x) wins ties.
+                if best.map_or(true, |(bd, _)| d < bd) { best = Some((d, n)); }
+            }
+        }
+        if let Some((_, n)) = best { return Some(n); }
+    }
+    index.get(b.min_x, b.min_y, b.plane)
+}
+
 struct StepRow {
-    dest: Option<(i32, i32, i32)>,
+    dest: Option<DestBox>,
     next_kind: Option<NodeKind>,
     next_id: Option<i64>,
     cost: f32,
     requirements: Vec<i64>,
     lodestone: Option<String>,
+}
+
+fn sanitize_cost(cost: f64) -> f32 {
+    if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 }
+}
+
+/// Reads one row of a `dest_min/max_*` table. `chains`: the table has next_node columns
+/// (POA rows are standalone). `nullable_cost`: a NULL cost reads as 0 instead of failing
+/// the build (useOn rows). DBs predating the `dest_max_*` columns read as single tiles.
+fn fetch_box_step(
+    conn: &Connection,
+    table: &str,
+    chains: bool,
+    nullable_cost: bool,
+    id: i64,
+) -> Result<Option<StepRow>> {
+    let next = if chains { "next_node_type, next_node_id" } else { "NULL, NULL" };
+    let sql = |max: &str| {
+        format!("SELECT dest_min_x, dest_min_y, dest_plane, {next}, cost, requirements, {max} FROM {table} WHERE id = ?1")
+    };
+    let mut st = match conn.prepare_cached(&sql("dest_max_x, dest_max_y")) {
+        Ok(st) => st,
+        Err(_) => conn.prepare_cached(&sql("NULL, NULL"))?,
+    };
+    let row = st.query_row(params![id], |r: &Row| {
+        let dx: Option<i64> = r.get(0)?;
+        let dy: Option<i64> = r.get(1)?;
+        let dp: Option<i64> = r.get(2)?;
+        let ntype: Option<String> = r.get(3)?;
+        let nid: Option<i64> = r.get(4)?;
+        let cost: f64 = if nullable_cost { r.get::<_, Option<f64>>(5)?.unwrap_or(0.0) } else { r.get(5)? };
+        let req: Option<String> = r.get(6)?;
+        let max_x: Option<i64> = r.get(7)?;
+        let max_y: Option<i64> = r.get(8)?;
+        Ok(StepRow {
+            dest: match (dx, dy, dp) {
+                (Some(x), Some(y), Some(p)) => Some(DestBox::from_row(x, y, max_x, max_y, p)),
+                _ => None,
+            },
+            next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
+            next_id: nid,
+            cost: sanitize_cost(cost),
+            requirements: parse_requirements(req),
+            lodestone: None,
+        })
+    }).optional()?;
+    Ok(row)
 }
 
 fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepRow>> {
@@ -148,12 +261,12 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                 let req: Option<String> = r.get(6)?;
                 Ok(StepRow {
                     dest: match (dx, dy, dp) {
-                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
+                        (Some(x), Some(y), Some(p)) => Some(DestBox::tile(x, y, p)),
                         _ => None,
                     },
                     next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
                     next_id: nid,
-                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
+                    cost: sanitize_cost(cost),
                     requirements: parse_requirements(req),
                     lodestone: None,
                 })
@@ -166,34 +279,14 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
             // without the column fail this prepare and take the name-less path below,
             // exactly as the old best-effort second query did. A name that can't be read
             // as text stays None, also as before.
-            if let Ok(mut st) = conn.prepare_cached(
+            let (mut st, with_name) = match conn.prepare_cached(
                 "SELECT dest_x, dest_y, dest_plane, next_node_type, next_node_id, cost, requirements, lodestone FROM teleports_lodestone_nodes WHERE id = ?1",
             ) {
-                let row = st.query_row(params![id], |r: &Row| {
-                    let dx: Option<i64> = r.get(0)?;
-                    let dy: Option<i64> = r.get(1)?;
-                    let dp: Option<i64> = r.get(2)?;
-                    let ntype: Option<String> = r.get(3)?;
-                    let nid: Option<i64> = r.get(4)?;
-                    let cost: f64 = r.get(5)?;
-                    let req: Option<String> = r.get(6)?;
-                    Ok(StepRow {
-                        dest: match (dx, dy, dp) {
-                            (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
-                            _ => None,
-                        },
-                        next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
-                        next_id: nid,
-                        cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                        requirements: parse_requirements(req),
-                        lodestone: r.get::<_, Option<String>>(7).ok().flatten(),
-                    })
-                }).optional()?;
-                return Ok(row);
-            }
-            let mut st = conn.prepare_cached(
-                "SELECT dest_x, dest_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_lodestone_nodes WHERE id = ?1",
-            )?;
+                Ok(st) => (st, true),
+                Err(_) => (conn.prepare_cached(
+                    "SELECT dest_x, dest_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_lodestone_nodes WHERE id = ?1",
+                )?, false),
+            };
             let row = st.query_row(params![id], |r: &Row| {
                 let dx: Option<i64> = r.get(0)?;
                 let dy: Option<i64> = r.get(1)?;
@@ -204,175 +297,27 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
                 let req: Option<String> = r.get(6)?;
                 Ok(StepRow {
                     dest: match (dx, dy, dp) {
-                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
+                        (Some(x), Some(y), Some(p)) => Some(DestBox::tile(x, y, p)),
                         _ => None,
                     },
                     next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
                     next_id: nid,
-                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
+                    cost: sanitize_cost(cost),
                     requirements: parse_requirements(req),
-                    lodestone: None,
+                    lodestone: if with_name { r.get::<_, Option<String>>(7).ok().flatten() } else { None },
                 })
             }).optional()?;
             Ok(row)
         }
-        NodeKind::Npc => {
-            let mut st = conn.prepare_cached(
-                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_npc_nodes WHERE id = ?1",
-            )?;
-            let row = st.query_row(params![id], |r: &Row| {
-                let dx: Option<i64> = r.get(0)?;
-                let dy: Option<i64> = r.get(1)?;
-                let dp: Option<i64> = r.get(2)?;
-                let ntype: Option<String> = r.get(3)?;
-                let nid: Option<i64> = r.get(4)?;
-                let cost: f64 = r.get(5)?;
-                let req: Option<String> = r.get(6)?;
-                Ok(StepRow {
-                    dest: match (dx, dy, dp) {
-                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
-                        _ => None,
-                    },
-                    next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
-                    next_id: nid,
-                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirements: parse_requirements(req),
-                    lodestone: None,
-                })
-            }).optional()?;
-            Ok(row)
-        }
-        NodeKind::Object => {
-            let mut st = conn.prepare_cached(
-                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_object_nodes WHERE id = ?1",
-            )?;
-            let row = st.query_row(params![id], |r: &Row| {
-                let dx: Option<i64> = r.get(0)?;
-                let dy: Option<i64> = r.get(1)?;
-                let dp: Option<i64> = r.get(2)?;
-                let ntype: Option<String> = r.get(3)?;
-                let nid: Option<i64> = r.get(4)?;
-                let cost: f64 = r.get(5)?;
-                let req: Option<String> = r.get(6)?;
-                Ok(StepRow {
-                    dest: match (dx, dy, dp) {
-                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
-                        _ => None,
-                    },
-                    next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
-                    next_id: nid,
-                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirements: parse_requirements(req),
-                    lodestone: None,
-                })
-            }).optional()?;
-            Ok(row)
-        }
-        NodeKind::Item => {
-            let mut st = conn.prepare_cached(
-                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_item_nodes WHERE id = ?1",
-            )?;
-            let row = st.query_row(params![id], |r: &Row| {
-                let dx: Option<i64> = r.get(0)?;
-                let dy: Option<i64> = r.get(1)?;
-                let dp: Option<i64> = r.get(2)?;
-                let ntype: Option<String> = r.get(3)?;
-                let nid: Option<i64> = r.get(4)?;
-                let cost: f64 = r.get(5)?;
-                let req: Option<String> = r.get(6)?;
-                Ok(StepRow {
-                    dest: match (dx, dy, dp) {
-                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
-                        _ => None,
-                    },
-                    next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
-                    next_id: nid,
-                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirements: parse_requirements(req),
-                    lodestone: None,
-                })
-            }).optional()?;
-            Ok(row)
-        }
-        NodeKind::Poa => {
-            // POA nodes are standalone global teleports (like items): no next_node chaining.
-            let mut st = conn.prepare_cached(
-                "SELECT dest_min_x, dest_min_y, dest_plane, cost, requirements FROM teleports_POA_nodes WHERE id = ?1",
-            )?;
-            let row = st.query_row(params![id], |r: &Row| {
-                let dx: Option<i64> = r.get(0)?;
-                let dy: Option<i64> = r.get(1)?;
-                let dp: Option<i64> = r.get(2)?;
-                let cost: f64 = r.get(3)?;
-                let req: Option<String> = r.get(4)?;
-                Ok(StepRow {
-                    dest: match (dx, dy, dp) {
-                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
-                        _ => None,
-                    },
-                    next_kind: None,
-                    next_id: None,
-                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirements: parse_requirements(req),
-                    lodestone: None,
-                })
-            }).optional()?;
-            Ok(row)
-        }
-        NodeKind::UseOn => {
-            // "Use item X on object Y" at a fixed spot: positional source (orig_*) like
-            // objects/npcs, so it flattens into a macro edge, and it can chain onwards.
-            let mut st = conn.prepare_cached(
-                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_useOn_nodes WHERE id = ?1",
-            )?;
-            let row = st.query_row(params![id], |r: &Row| {
-                let dx: Option<i64> = r.get(0)?;
-                let dy: Option<i64> = r.get(1)?;
-                let dp: Option<i64> = r.get(2)?;
-                let ntype: Option<String> = r.get(3)?;
-                let nid: Option<i64> = r.get(4)?;
-                let cost: f64 = r.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
-                let req: Option<String> = r.get(6)?;
-                Ok(StepRow {
-                    dest: match (dx, dy, dp) {
-                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
-                        _ => None,
-                    },
-                    next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
-                    next_id: nid,
-                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirements: parse_requirements(req),
-                    lodestone: None,
-                })
-            }).optional()?;
-            Ok(row)
-        }
-        NodeKind::Ifslot => {
-            let mut st = conn.prepare_cached(
-                "SELECT dest_min_x, dest_min_y, dest_plane, next_node_type, next_node_id, cost, requirements FROM teleports_ifslot_nodes WHERE id = ?1",
-            )?;
-            let row = st.query_row(params![id], |r: &Row| {
-                let dx: Option<i64> = r.get(0)?;
-                let dy: Option<i64> = r.get(1)?;
-                let dp: Option<i64> = r.get(2)?;
-                let ntype: Option<String> = r.get(3)?;
-                let nid: Option<i64> = r.get(4)?;
-                let cost: f64 = r.get(5)?;
-                let req: Option<String> = r.get(6)?;
-                Ok(StepRow {
-                    dest: match (dx, dy, dp) {
-                        (Some(x), Some(y), Some(p)) => Some((x as i32, y as i32, p as i32)),
-                        _ => None,
-                    },
-                    next_kind: ntype.and_then(|s| NodeKind::parse(&s)),
-                    next_id: nid,
-                    cost: if cost.is_finite() && cost >= 0.0 { cost as f32 } else { 0.0 },
-                    requirements: parse_requirements(req),
-                    lodestone: None,
-                })
-            }).optional()?;
-            Ok(row)
-        }
+        NodeKind::Npc => fetch_box_step(conn, "teleports_npc_nodes", true, false, id),
+        NodeKind::Object => fetch_box_step(conn, "teleports_object_nodes", true, false, id),
+        NodeKind::Item => fetch_box_step(conn, "teleports_item_nodes", true, false, id),
+        // POA nodes are standalone global teleports (like items): no next_node chaining.
+        NodeKind::Poa => fetch_box_step(conn, "teleports_POA_nodes", false, false, id),
+        // "Use item X on object Y" at a fixed spot: positional source (orig_*) like
+        // objects/npcs, so it flattens into a macro edge, and it can chain onwards.
+        NodeKind::UseOn => fetch_box_step(conn, "teleports_useOn_nodes", true, true, id),
+        NodeKind::Ifslot => fetch_box_step(conn, "teleports_ifslot_nodes", true, false, id),
     }
 }
 
@@ -484,13 +429,15 @@ fn enumerate_chain_starts(conn: &Connection, incoming: &Incoming) -> Result<Vec<
     Ok(out)
 }
 
+/// `tiles` is the node-ordered tile list, used to prefer `walk_mask != 0` landing tiles
+/// (see [`resolve_landing`]); pass an empty slice to treat every node as walkable.
 pub fn flatten_chains(
     conn: &Connection,
-    _tiles: &[Tile],
+    tiles: &[Tile],
     node_id_of: &NodeIndex,
 ) -> Result<Vec<MacroEdgeMeta>> {
     let incoming = collect_incoming_pairs(conn)?;
-    flatten_chains_with(conn, node_id_of, &incoming)
+    flatten_chains_with(conn, node_id_of, tiles, &incoming)
 }
 
 /// Positional (macro-edge) and global chains together, scanning the incoming-pair set
@@ -499,20 +446,23 @@ pub fn flatten_chains(
 pub fn flatten_all_chains(
     conn: &Connection,
     node_id_of: &NodeIndex,
+    tiles: &[Tile],
 ) -> Result<(Vec<MacroEdgeMeta>, Vec<GlobalChainMeta>)> {
     let incoming = collect_incoming_pairs(conn)?;
     Ok((
-        flatten_chains_with(conn, node_id_of, &incoming)?,
-        flatten_global_chains_with(conn, node_id_of, &incoming)?,
+        flatten_chains_with(conn, node_id_of, tiles, &incoming)?,
+        flatten_global_chains_with(conn, node_id_of, tiles, &incoming)?,
     ))
 }
 
 fn flatten_chains_with(
     conn: &Connection,
     node_id_of: &NodeIndex,
+    tiles: &[Tile],
     incoming: &Incoming,
 ) -> Result<Vec<MacroEdgeMeta>> {
     let mut result: Vec<MacroEdgeMeta> = Vec::new();
+    let mut dropped = 0usize;
 
     let starts = enumerate_chain_starts(conn, incoming)?;
 
@@ -526,9 +476,9 @@ fn flatten_chains_with(
         let mut cost_sum: f32 = 0.0;
         let mut cur_kind = start_kind;
         let mut cur_id = start_id;
-        let mut last_dest: Option<(i32, i32, i32)> = None;
+        let mut last_dest: Option<(DestBox, NodeKind, i64)> = None;
         // Capture first-door info to generate a reverse inside->outside edge for doors only
-        let mut first_door_dest: Option<(i32, i32, i32)> = None;
+        let mut first_door_dest: Option<DestBox> = None;
         let mut first_door_reqs: Vec<i64> = Vec::new();
         let mut first_door_cost: f32 = 0.0;
         let mut first_door_id: Option<i64> = None;
@@ -547,7 +497,7 @@ fn flatten_chains_with(
                 first_door_id = Some(cur_id);
             }
             steps.push(ChainStepMeta { kind: cur_kind.as_str(), id: cur_id, cost: row.cost, requirements: row.requirements, lodestone: row.lodestone });
-            if let Some(d) = row.dest { last_dest = Some(d); }
+            if let Some(d) = row.dest { last_dest = Some((d, cur_kind, cur_id)); }
             if let (Some(nk), Some(nid)) = (row.next_kind, row.next_id) {
                 cur_kind = nk; cur_id = nid;
                 continue;
@@ -558,8 +508,12 @@ fn flatten_chains_with(
         if cycle { continue; } // drop cycles
 
         // Require a concrete destination discovered at some point in the chain
-        let Some((dx, dy, dp)) = last_dest else { continue; };
-        let Some(dst_node) = node_id_of.get(dx, dy, dp) else { continue; };
+        let Some((dest, dest_kind, dest_id)) = last_dest else { continue; };
+        let Some(dst_node) = resolve_landing(&dest, node_id_of, tiles) else {
+            warn_no_landing(start_kind, start_id, dest_kind, dest_id, &dest);
+            dropped += 1;
+            continue;
+        };
 
         // Dedup and sort req ids deterministically
         requirement_ids.sort_unstable();
@@ -575,8 +529,8 @@ fn flatten_chains_with(
 
         // Doors are bidirectional: add a reverse edge consisting solely of the first door step
         if start_kind == NodeKind::Door {
-            if let Some((ix, iy, ip)) = first_door_dest {
-                if let Some(inside_node) = node_id_of.get(ix, iy, ip) {
+            if let Some(inside) = first_door_dest {
+                if let Some(inside_node) = node_id_of.get(inside.min_x, inside.min_y, inside.plane) {
                     let rev_reqs: Vec<i64> = first_door_reqs.clone();
                     let door_id = first_door_id.unwrap_or(0);
                     result.push(MacroEdgeMeta {
@@ -591,6 +545,9 @@ fn flatten_chains_with(
         }
     }
 
+    if dropped > 0 {
+        tracing::warn!(dropped, "positional chains dropped: destination box has no graph tile");
+    }
     // Deterministic ordering: by src, then dst, then cost, then steps len
     result.sort_by(|a, b| {
         a.src.cmp(&b.src)
@@ -600,6 +557,15 @@ fn flatten_chains_with(
     });
 
     Ok(result)
+}
+
+fn warn_no_landing(start_kind: NodeKind, start_id: i64, dest_kind: NodeKind, dest_id: i64, b: &DestBox) {
+    tracing::warn!(
+        chain_start = %format!("{}:{}", start_kind.as_str(), start_id),
+        dest_row = %format!("{}:{}", dest_kind.as_str(), dest_id),
+        dest = %format!("({}..={}, {}..={}, plane {})", b.min_x, b.max_x, b.min_y, b.max_y, b.plane),
+        "dropping teleport chain: no graph tile in its destination box"
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -663,20 +629,24 @@ fn enumerate_global_starts(conn: &Connection, incoming: &Incoming) -> Result<Vec
     Ok(out)
 }
 
+/// `tiles`: as for [`flatten_chains`].
 pub fn flatten_global_chains(
     conn: &Connection,
+    tiles: &[Tile],
     node_id_of: &NodeIndex,
 ) -> Result<Vec<GlobalChainMeta>> {
     let incoming = collect_incoming_pairs(conn)?;
-    flatten_global_chains_with(conn, node_id_of, &incoming)
+    flatten_global_chains_with(conn, node_id_of, tiles, &incoming)
 }
 
 fn flatten_global_chains_with(
     conn: &Connection,
     node_id_of: &NodeIndex,
+    tiles: &[Tile],
     incoming: &Incoming,
 ) -> Result<Vec<GlobalChainMeta>> {
     let mut result: Vec<GlobalChainMeta> = Vec::new();
+    let mut dropped = 0usize;
     let starts = enumerate_global_starts(conn, incoming)?;
     for (start_kind, start_id) in starts {
         let mut visited: HashSet<(NodeKind, i64)> = HashSet::new();
@@ -685,7 +655,7 @@ fn flatten_global_chains_with(
         let mut cost_sum: f32 = 0.0;
         let mut cur_kind = start_kind;
         let mut cur_id = start_id;
-        let mut last_dest: Option<(i32, i32, i32)> = None;
+        let mut last_dest: Option<(DestBox, NodeKind, i64)> = None;
         let mut cycle = false;
 
         loop {
@@ -694,7 +664,7 @@ fn flatten_global_chains_with(
             cost_sum += row.cost;
             requirement_ids.extend(row.requirements.iter().copied());
             steps.push(ChainStepMeta { kind: cur_kind.as_str(), id: cur_id, cost: row.cost, requirements: row.requirements, lodestone: row.lodestone });
-            if let Some(d) = row.dest { last_dest = Some(d); }
+            if let Some(d) = row.dest { last_dest = Some((d, cur_kind, cur_id)); }
             if let (Some(nk), Some(nid)) = (row.next_kind, row.next_id) {
                 cur_kind = nk; cur_id = nid;
                 continue;
@@ -703,13 +673,20 @@ fn flatten_global_chains_with(
             }
         }
         if cycle { continue; }
-        let Some((dx, dy, dp)) = last_dest else { continue; };
-        let Some(dst_node) = node_id_of.get(dx, dy, dp) else { continue; };
+        let Some((dest, dest_kind, dest_id)) = last_dest else { continue; };
+        let Some(dst_node) = resolve_landing(&dest, node_id_of, tiles) else {
+            warn_no_landing(start_kind, start_id, dest_kind, dest_id, &dest);
+            dropped += 1;
+            continue;
+        };
 
         requirement_ids.sort_unstable();
         requirement_ids.dedup();
 
         result.push(GlobalChainMeta { dst: dst_node, cost: cost_sum, requirement_ids, steps });
+    }
+    if dropped > 0 {
+        tracing::warn!(dropped, "global chains dropped: destination box has no graph tile");
     }
     // Deterministic ordering by dst, then cost, then steps len
     result.sort_by(|a, b| a.dst.cmp(&b.dst)

@@ -543,7 +543,7 @@ fn main() -> Result<()> {
 
     // Flatten chains into macro-edges with cycle detection and deterministic ordering
     let t = std::time::Instant::now();
-    let (metas, gmetas) = flatten_all_chains(&conn, &node_id_of)?;
+    let (metas, gmetas) = flatten_all_chains(&conn, &node_id_of, &tiles)?;
     let mut macro_src = Vec::with_capacity(metas.len());
     let mut macro_dst = Vec::with_capacity(metas.len());
     let mut macro_w = Vec::with_capacity(metas.len());
