@@ -62,6 +62,7 @@ pub enum NodeKind {
     Ifslot,
     Poa,
     UseOn,
+    Spell,
 }
 
 impl NodeKind {
@@ -75,6 +76,7 @@ impl NodeKind {
             NodeKind::Ifslot => "ifslot",
             NodeKind::Poa => "poa_item",
             NodeKind::UseOn => "use_on",
+            NodeKind::Spell => "spell",
         }
     }
     fn parse(s: &str) -> Option<NodeKind> {
@@ -89,6 +91,7 @@ impl NodeKind {
             "ifslot" => Some(NodeKind::Ifslot),
             "poa_item" => Some(NodeKind::Poa),
             "use_on" | "useon" => Some(NodeKind::UseOn),
+            "spell" => Some(NodeKind::Spell),
             _ => None,
         }
     }
@@ -318,6 +321,9 @@ fn fetch_step(conn: &Connection, kind: NodeKind, id: i64) -> Result<Option<StepR
         // objects/npcs, so it flattens into a macro edge, and it can chain onwards.
         NodeKind::UseOn => fetch_box_step(conn, "teleports_useOn_nodes", true, true, id),
         NodeKind::Ifslot => fetch_box_step(conn, "teleports_ifslot_nodes", true, false, id),
+        // Spellbook teleports: global (cast from anywhere), box destination, can chain
+        // onwards exactly like ifslot rows.
+        NodeKind::Spell => fetch_box_step(conn, "teleports_spell_nodes", true, false, id),
     }
 }
 
@@ -347,6 +353,9 @@ fn collect_incoming_pairs(conn: &Connection) -> Result<HashSet<(NodeKind, i64)>>
     add_from("SELECT next_node_type, next_node_id FROM teleports_ifslot_nodes WHERE next_node_type IS NOT NULL AND next_node_id IS NOT NULL")?;
     if table_exists(conn, "teleports_useOn_nodes")? {
         add_from("SELECT next_node_type, next_node_id FROM teleports_useOn_nodes WHERE next_node_type IS NOT NULL AND next_node_id IS NOT NULL")?;
+    }
+    if table_exists(conn, "teleports_spell_nodes")? {
+        add_from("SELECT next_node_type, next_node_id FROM teleports_spell_nodes WHERE next_node_type IS NOT NULL AND next_node_id IS NOT NULL")?;
     }
     Ok(set)
 }
@@ -624,6 +633,18 @@ fn enumerate_global_starts(conn: &Connection, incoming: &Incoming) -> Result<Vec
         for r in rows {
             let id = r?;
             if !incoming.contains(&(NodeKind::Poa, id)) { out.push((NodeKind::Poa, id)); }
+        }
+    }
+    // Spells (global teleports cast from the spellbook; the table postdates older DBs)
+    if table_exists(conn, "teleports_spell_nodes")? {
+        let mut st = conn.prepare_cached("SELECT id FROM teleports_spell_nodes ORDER BY id")?;
+        let rows = st.query_map([], |r: &Row| {
+            let id: i64 = r.get(0)?;
+            Ok(id)
+        })?;
+        for r in rows {
+            let id = r?;
+            if !incoming.contains(&(NodeKind::Spell, id)) { out.push((NodeKind::Spell, id)); }
         }
     }
     Ok(out)

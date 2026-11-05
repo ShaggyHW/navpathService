@@ -11,6 +11,17 @@ use tempfile::NamedTempFile;
 use tower::ServiceExt; // for `oneshot`
 
 fn make_snapshot_file(nodes: usize) -> tempfile::TempPath {
+    // Keep this cost very high so it doesn't affect the normal 0->1->2 route.
+    make_snapshot_file_with_globals(nodes, json!([{
+        "dst": 1,
+        "cost_ms": 10000.0,
+        "steps": [{"kind": "npc"}],
+        "requirements": []
+    }]))
+}
+
+/// The 3-node chain fixture with `globals` as the carrier edge's "global" array.
+fn make_snapshot_file_with_globals(nodes: usize, globals: serde_json::Value) -> tempfile::TempPath {
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
     assert_eq!(nodes, 3, "fixture is a 3-node chain");
@@ -34,15 +45,7 @@ fn make_snapshot_file(nodes: usize) -> tempfile::TempPath {
     let macro_id_first: Vec<u32> = vec![13, 0];
 
     let meta0: Vec<u8> = b"{}".to_vec();
-    // Keep this cost very high so it doesn't affect the normal 0->1->2 route.
-    let meta1: Vec<u8> = serde_json::json!({
-        "global": [{
-            "dst": 1,
-            "cost_ms": 10000.0,
-            "steps": [{"kind": "npc"}],
-            "requirements": []
-        }]
-    }).to_string().into_bytes();
+    let meta1: Vec<u8> = serde_json::json!({ "global": globals }).to_string().into_bytes();
 
     let macro_meta_offs: Vec<u32> = vec![0, meta0.len() as u32];
     let macro_meta_lens: Vec<u32> = vec![meta0.len() as u32, meta1.len() as u32];
@@ -319,6 +322,73 @@ async fn health_and_route_and_reload() {
     assert!(res.status().is_success());
 }
 
+/// Routes from `start` to node 2 (3202, 3200, 0) over the chain fixture with `globals`
+/// and returns (served cost, action types).
+async fn route_with_globals(start: (i32, i32, i32), globals: serde_json::Value) -> (f64, Vec<String>) {
+    let snap_path = make_snapshot_file_with_globals(3, globals);
+    let opened = navpath_core::Snapshot::open(&snap_path).unwrap();
+    let (neighbors, neighbors_rev, globals, macro_lookup) = navpath_service::engine_adapter::build_neighbor_provider(&opened);
+    let state = AppState { current: Arc::new(ArcSwap::from_pointee(SnapshotState {
+        path: snap_path.to_path_buf(),
+        snapshot: Some(Arc::new(opened)),
+        neighbors: Some(Arc::new(neighbors)),
+        neighbors_rev: Some(Arc::new(neighbors_rev)),
+        globals: Arc::new(globals),
+        macro_lookup: Arc::new(macro_lookup),
+        loaded_at_unix: 123,
+        snapshot_hash_hex: None,
+        route_cache: navpath_service::new_route_cache(),
+        seed_shadow: navpath_service::new_seed_shadow(),
+        fairy_rings: Arc::new(Vec::new()),
+        node_to_fairy_ring: Arc::new(navpath_service::FxHashMap::default()),
+        comp_graph: None,
+        canonical_grid: None,
+        profile_cache: navpath_service::new_profile_cache(), subpath_cache: navpath_service::new_subpath_cache(),
+        warm_state: Default::default(), danger: None,
+    })), search_permits: navpath_service::default_search_permits(), metrics: Arc::new(navpath_service::Metrics::default()), ctx_pool: navpath_service::ContextPool::new(), ready: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+    let req_body = json!({
+        "start": {"wx": start.0, "wy": start.1, "plane": start.2},
+        "goal":  {"wx": 3202, "wy": 3200, "plane": 0},
+        "profile": {"requirements": []},
+        "options": {"return_geometry": false, "only_actions": true}
+    }).to_string();
+    let res = build_router(state).oneshot(Request::builder()
+        .method("POST")
+        .uri("/route")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body)).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["found"], true, "{v}");
+    let types = v["actions"].as_array().unwrap().iter()
+        .map(|a| a["type"].as_str().unwrap_or("").to_string()).collect();
+    (v["cost"].as_f64().unwrap(), types)
+}
+
+#[tokio::test]
+async fn spell_teleports_carry_the_planning_penalty() {
+    let penalty = navpath_core::SPELL_PENALTY_MS as f64;
+    assert_eq!(penalty, 3000.0);
+    // From node 0 to node 2: a 100 ms teleport onto node 1 then one 300 ms step (400),
+    // vs walking two steps (600). (Node 1 keeps the teleport off the fixture's 0->2
+    // lodestone edge.) The served cost shows which one the planner chose — the payload
+    // labels a hop onto a walk neighbour as a move either way.
+    let item = json!({"dst": 1, "cost_ms": 100.0, "steps": [{"kind": "item", "id": 1}], "requirements": []});
+    let (cost, _) = route_with_globals((3200, 3200, 0), json!([item])).await;
+    assert_eq!(cost, 400.0, "a non-spell global has no penalty and wins");
+
+    let spell = json!({"dst": 1, "cost_ms": 100.0, "steps": [{"kind": "spell", "id": 1}], "requirements": []});
+    let (cost, types) = route_with_globals((3200, 3200, 0), json!([spell])).await;
+    assert_eq!(cost, 600.0, "at 100 + 3000 the spell loses to walking");
+    assert_eq!(types, vec!["move", "move"]);
+
+    // When the spell is the only way in (off-graph start), it is used and its served
+    // cost includes the penalty.
+    let (cost, types) = route_with_globals((2212, 4944, 1), json!([spell])).await;
+    assert_eq!(types, vec!["spell", "move"]);
+    assert_eq!(cost, 100.0 + penalty + 300.0);
+}
+
 #[tokio::test]
 async fn missing_start_coordinate_forces_global_teleport_entry() {
     let snap_path = make_snapshot_file(3);
@@ -372,4 +442,5 @@ async fn missing_start_coordinate_forces_global_teleport_entry() {
         Some("start_coordinate_not_found")
     );
 }
+
 

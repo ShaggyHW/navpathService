@@ -848,6 +848,19 @@ pub fn build_profile_artifacts(
     }
 }
 
+/// `kind_first` code of a spell-first global teleport (see [`kind_code`]).
+pub const KIND_SPELL: u32 = 9;
+
+/// The spell planning surcharge: `NAVPATH_SPELL_PENALTY_MS` (finite, >= 0) or
+/// [`navpath_core::SPELL_PENALTY_MS`].
+pub fn spell_penalty_ms() -> f32 {
+    std::env::var("NAVPATH_SPELL_PENALTY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(navpath_core::SPELL_PENALTY_MS)
+}
+
 fn kind_code(kind: &str) -> u32 {
     match kind {
         "door" => 1,
@@ -858,6 +871,7 @@ fn kind_code(kind: &str) -> u32 {
         "ifslot" => 6,
         "poa_item" => 7,
         "use_on" => 8,
+        "spell" => KIND_SPELL,
         _ => 0,
     }
 }
@@ -960,6 +974,7 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Neighb
     let mkind_vec: &[u32] = snapshot.macro_kind_first();
 
     let mut missing_req_ids: u64 = 0;
+    let spell_penalty_ms = spell_penalty_ms();
 
     for idx in 0..len {
         let mut reqs = Vec::new();
@@ -983,6 +998,9 @@ pub fn build_neighbor_provider(snapshot: &Snapshot) -> (NeighborProvider, Neighb
                                  .map(kind_code)
                                  .unwrap_or(0);
                              let g_reqs = decode_reqs(g, &id_to_idx, &mut missing_req_ids);
+                             // Spells carry a planning surcharge. Raising a global's cost keeps
+                             // the ALT bounds (built at the sheet cost) admissible.
+                             let cost = if kind_first == KIND_SPELL { cost + spell_penalty_ms } else { cost };
                              if dst != 0 {
                                  globals.push(GlobalTeleport { dst, cost, reqs: g_reqs, kind_first, meta: Arc::new(g.clone()) });
                              }

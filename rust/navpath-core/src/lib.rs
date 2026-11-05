@@ -26,5 +26,11 @@ pub mod engine;
 /// quick lodestones more. Was a hard-coded 2400.
 pub const QUICK_TELE_LODESTONE_MS: f32 = 5000.0;
 
+/// Planning surcharge (ms) added to every spell-first global teleport's sheet cost, so
+/// the planner only casts a spell when it beats the alternatives by more than this.
+/// Applied when the service loads the snapshot (`NAVPATH_SPELL_PENALTY_MS` overrides it);
+/// the snapshot and the step metadata keep the sheet cost.
+pub const SPELL_PENALTY_MS: f32 = 3000.0;
+
 pub use snapshot::Snapshot;
 pub use engine::{EngineView, GoalSet, NodePenalty, SearchParams, SearchResult, SearchStatus, NeighborProvider, LandmarkHeuristic};

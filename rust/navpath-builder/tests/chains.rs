@@ -441,3 +441,83 @@ fn positional_object_box_dest_resolves_the_same_way() {
     assert_eq!(metas.len(), 1);
     assert_eq!((metas[0].src, metas[0].dst), (0, 1));
 }
+
+// ---- Spell teleports (teleports_spell_nodes) --------------------------------------
+
+fn create_spell_table(conn: &Connection) {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE teleports_spell_nodes (
+            id INTEGER PRIMARY KEY,
+            spell_id INTEGER,
+            dest_min_x INTEGER, dest_max_x INTEGER, dest_min_y INTEGER, dest_max_y INTEGER,
+            dest_plane INTEGER, cost INTEGER,
+            next_node_type TEXT, next_node_id INTEGER,
+            requirements TEXT
+        );
+        "#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn spell_is_a_global_teleport_landing_in_its_box() {
+    let conn = mem_conn();
+    create_box_schema(&conn);
+    create_spell_table(&conn);
+    // Trollheim-style box 0..=4 x 0..=4, centre (2, 2).
+    conn.execute(
+        "INSERT INTO teleports_spell_nodes (id, spell_id, dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane, cost, requirements)
+         VALUES (1, 57, 0, 4, 0, 4, 0, 3150, '304')",
+        [],
+    )
+    .unwrap();
+    let (index, tiles) = fixture(&[((0, 0), 255), ((2, 2), 255)]);
+
+    // Global only: no positional macro edge.
+    assert!(flatten_chains(&conn, &tiles, &index).unwrap().is_empty());
+    let g = flatten_global_chains(&conn, &tiles, &index).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].dst, 1, "(2, 2) is the box centre");
+    assert_eq!(g[0].cost, 3150.0);
+    assert_eq!(g[0].requirement_ids, vec![304]);
+    assert_eq!((g[0].steps[0].kind, g[0].steps[0].id), ("spell", 1));
+}
+
+#[test]
+fn spell_chains_onward_and_its_continuation_is_not_a_global_start() {
+    let conn = mem_conn();
+    create_box_schema(&conn);
+    create_spell_table(&conn);
+    // spell(1) -> ifslot(7): the ifslot row is a continuation, not its own global.
+    conn.execute(
+        "INSERT INTO teleports_spell_nodes (id, spell_id, cost, next_node_type, next_node_id, requirements)
+         VALUES (1, 205, 1000, 'ifslot', 7, '305')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO teleports_ifslot_nodes (id, dest_min_x, dest_min_y, dest_plane, cost, requirements)
+         VALUES (7, 2, 2, 0, 500, '9')",
+        [],
+    )
+    .unwrap();
+    let (index, tiles) = fixture(&[((0, 0), 255), ((2, 2), 255)]);
+
+    let g = flatten_global_chains(&conn, &tiles, &index).unwrap();
+    assert_eq!(g.len(), 1);
+    let kinds: Vec<_> = g[0].steps.iter().map(|s| s.kind).collect();
+    assert_eq!(kinds, vec!["spell", "ifslot"]);
+    assert_eq!(g[0].dst, 1);
+    assert_eq!(g[0].cost, 1500.0);
+    assert_eq!(g[0].requirement_ids, vec![9, 305]);
+}
+
+#[test]
+fn missing_spell_table_is_tolerated() {
+    let conn = mem_conn();
+    create_box_schema(&conn);
+    insert_item_box(&conn, 1, (0, 0), (0, 0));
+    let (index, tiles) = fixture(&[((0, 0), 255)]);
+    assert_eq!(flatten_global_chains(&conn, &tiles, &index).unwrap().len(), 1);
+}
