@@ -6,3 +6,5 @@
 # Re-read on startup and on `POST /admin/reload` (no snapshot rebuild needed).
 
 3020, 3060, 3683, 3713, 0
+3242, 3259, 3844, 3857, 0
+2586, 2595, 3094, 3095, 0
