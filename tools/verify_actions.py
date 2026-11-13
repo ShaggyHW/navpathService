@@ -11,7 +11,10 @@ disagreement:
   * an ability's `from` is the tile the character actually stands on at that point
     (actions carry only `to`, so an off-by-one here is invisible to the client until it
     tries to execute the hop);
-  * an ability's straight-line span is within the 10-tile reach;
+  * an ability's reach (Chebyshev, the game's rule) is within 10 tiles, and it lands on
+    the walk (the tile `tiles_covered` steps on);
+  * the response `cost` equals the sum of the actions' `cost_ms` (walk steps 300 ms,
+    hops 600 ms, macro steps as priced) — the contract since 2026-11-13;
   * the walk ends on the goal tile with nothing skipped or replayed.
 
 Both bugs fixed on 2026-07-31 were caught by exactly these checks (leading ability
@@ -24,14 +27,12 @@ to the payload builder or the surge/dive optimizer:
 """
 
 import json
-import math
 import os
 import sys
 import urllib.request
 
+# Surge/Dive reach: Chebyshev distance (crate::hops::HOP_RANGE).
 MAX_ABILITY_TILES = 10
-# The service compares against MAX_ABILITY_TILES + 0.5 (half-tile slack), so mirror it.
-MAX_ABILITY_SPAN = MAX_ABILITY_TILES + 0.5
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "8080"
 URL = f"http://127.0.0.1:{PORT}/route"
@@ -57,8 +58,8 @@ def check(entry, seed):
         "start": {"wx": entry["start"][0], "wy": entry["start"][1], "plane": entry["start"][2]},
         "goal": {"wx": entry["goal"][0], "wy": entry["goal"][1], "plane": entry["goal"][2]},
         "options": {"return_geometry": True, "only_actions": True},
-        "surge": {"enabled": True, "charges": 2, "cooldown_ms": 20400},
-        "dive": {"enabled": True, "cooldown_ms": 20400},
+        "surge": {"enabled": True, "charges": 2, "cooldown_ms": 10200},
+        "dive": {"enabled": True, "cooldown_ms": 10200},
     }
     if seed is not None:
         body["seed"] = seed
@@ -74,6 +75,9 @@ def check(entry, seed):
     geo = [tuple(g) for g in resp["geometry"]]
     acts = resp["actions"]
     errs = []
+    total = sum(a["cost_ms"] for a in acts)
+    if abs(total - resp["cost"]) > 1.0:
+        errs.append(f"cost {resp['cost']} != sum of actions' cost_ms {total}")
 
     # A virtual-start route prepends one synthetic action that consumes no graph edge: it
     # carries the character from the off-graph tile onto path[0]. It is identifiable by
@@ -88,9 +92,9 @@ def check(entry, seed):
         if kind in ("dive", "surge"):
             if tuple(a["from"]) != pos:
                 errs.append(f"act{k} {kind}: from={tuple(a['from'])} but character stands at {pos}")
-            span = math.hypot(a["to"][0] - a["from"][0], a["to"][1] - a["from"][1])
-            if span > MAX_ABILITY_SPAN:
-                errs.append(f"act{k} {kind}: spans {span:.2f} tiles, limit {MAX_ABILITY_SPAN}")
+            reach = max(abs(a["to"][0] - a["from"][0]), abs(a["to"][1] - a["from"][1]))
+            if reach > MAX_ABILITY_TILES or a["to"][2] != a["from"][2]:
+                errs.append(f"act{k} {kind}: reaches {reach} tiles, limit {MAX_ABILITY_TILES}")
             gi += a["tiles_covered"]
         else:
             # move / macro / global / fairy / teleport all consume exactly one graph edge.

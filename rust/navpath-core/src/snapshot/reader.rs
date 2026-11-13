@@ -518,7 +518,7 @@ mod tests {
         // slot 0 (0->1) cardinal, slot 1 (0->2) diagonal
         assert_eq!(snap.walk_edge_weight(0, 1), Some(300.0));
         let d = snap.walk_edge_weight(0, 2).unwrap();
-        assert!((d - 424.26407).abs() < 1e-3);
+        assert_eq!(d, 300.0 + crate::snapshot::WALK_DIAGONAL_TIEBREAK_MS);
         assert_eq!(snap.walk_edge_weight(1, 1), None);
 
         assert_eq!(snap.comp_ids(), &comp);

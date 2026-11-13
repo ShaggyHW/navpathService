@@ -42,6 +42,9 @@ impl Fixture {
     }
 
     fn node(&self, x: i32, y: i32, p: i32) -> Option<u32> {
+        if !(0..32768).contains(&x) || !(0..32768).contains(&y) {
+            return None; // rect_set rectangles hang off the grid edge
+        }
         self.coords.binary_search(&pack_coord(x, y, p)).ok().map(|i| i as u32)
     }
 

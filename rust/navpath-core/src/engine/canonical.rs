@@ -32,7 +32,7 @@
 //! also be an x-boundary wrap, and macro/teleport parents must fall back to the full
 //! successor set. Arrival via an ADJACENT MACRO edge is priced correctly because every
 //! adjacent macro edge is at least as expensive as the walk step it parallels
-//! (validated by [`CanonicalGrid::build`]; measured minimum 600 ms vs 424.26) — the
+//! (validated by [`CanonicalGrid::build`]; measured minimum 600 ms vs 300.25) — the
 //! pruning comparison then only UNDERSTATES the through-cost, which keeps pruned
 //! alternatives no-worse and the decision sound.
 
@@ -52,10 +52,16 @@ const DELTAS: [(i32, i32); 8] = [
     (1, 1),
 ];
 
-/// Exact integer step costs for local comparisons: cardinal 10, diagonal 14. The only
-/// equalities in {sums of two} are the true geometric ties (2.0 == 2.0, 1+sqrt2 ==
-/// sqrt2+1), and no 1-step cost ever equals a 2-step cost — so strict `<` on these
-/// integers is exactly strict `<` on real costs.
+/// Exact integer step costs for local comparisons: cardinal 10, diagonal 14. Only the
+/// ORDER of 1- and 2-step costs matters here, and it is the same for the octile weights
+/// these integers were chosen for (1 < sqrt2 < 2 < 1+sqrt2 < 2sqrt2) and for today's
+/// Chebyshev-plus-tie-break weights (1 < 1+e < 2 < 2+e < 2+2e, see
+/// `snapshot::WALK_DIAGONAL_TIEBREAK_MS`). The only
+/// equalities in {sums of two} are the cardinal+diagonal permutations (and 2 == 2), and
+/// no 1-step cost ever equals a 2-step cost — so strict `<` on these integers is
+/// exactly strict `<` on real costs. (Pure Chebyshev, e = 0, would NOT fit: diag+diag
+/// would tie two cardinals and the tie-pruned table would canonicalize straight runs
+/// into zig-zags.)
 const STEP_COST: [u16; 8] = [10, 10, 10, 10, 14, 14, 14, 14];
 
 /// Cardinal component directions of each diagonal (index d-4): (x-component, y-component).

@@ -14,6 +14,7 @@ use crate::engine_adapter::{GlobalTeleport, FairyRing, MacroLookup, SearchContex
 pub mod routes;
 pub mod engine_adapter;
 pub mod danger;
+pub mod hops;
 
 /// Cache key for a route search. Everything the search result depends on is in here;
 /// snapshot identity is implicit (the cache lives inside SnapshotState, so a snapshot

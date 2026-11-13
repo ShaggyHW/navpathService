@@ -371,11 +371,12 @@ async fn spell_teleports_carry_the_planning_penalty() {
     assert_eq!(penalty, 3000.0);
     // From node 0 to node 2: a 100 ms teleport onto node 1 then one 300 ms step (400),
     // vs walking two steps (600). (Node 1 keeps the teleport off the fixture's 0->2
-    // lodestone edge.) The served cost shows which one the planner chose — the payload
-    // labels a hop onto a walk neighbour as a move either way.
+    // lodestone edge.) The served cost (the actions' sum) shows which one the planner
+    // chose: a hop onto a walk neighbour that beats the step is emitted as the hop.
     let item = json!({"dst": 1, "cost_ms": 100.0, "steps": [{"kind": "item", "id": 1}], "requirements": []});
-    let (cost, _) = route_with_globals((3200, 3200, 0), json!([item])).await;
+    let (cost, types) = route_with_globals((3200, 3200, 0), json!([item])).await;
     assert_eq!(cost, 400.0, "a non-spell global has no penalty and wins");
+    assert_eq!(types, vec!["item", "move"]);
 
     let spell = json!({"dst": 1, "cost_ms": 100.0, "steps": [{"kind": "spell", "id": 1}], "requirements": []});
     let (cost, types) = route_with_globals((3200, 3200, 0), json!([spell])).await;

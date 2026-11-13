@@ -22,6 +22,10 @@ cargo run -p navpath-builder --release --   --sqlite /home/query/Dev/rs3cache_ex
 
 UPDATE THE PATH TO YOUR ONW
 
+Snapshot format v10 (2026-11): walk steps cost 300 ms in all 8 directions (see "Route
+cost" below). The section layout is unchanged from v9, but the landmark tables bake walk
+distances, so a v9 snapshot is refused and must be rebuilt.
+
 Snapshot format v9 (2026-09): node ids follow a plane-major Morton (Z-order) coordinate
 key instead of raster (plane, y, x) order, and the ALT (landmark distance) table is
 stored packed by default (per-16-node-cluster u16 bases + u8 offsets, with an exact
@@ -229,6 +233,28 @@ curl -s http://127.0.0.1:8080/route \
   }'
 ```
 
+### Route cost, walking, Surge and Dive
+
+`cost` (ms) is the route's travel time, and it is exactly the sum of the returned
+actions' `cost_ms` — on `/route` and `/route_area`, whether or not actions are requested:
+
+- **Walk steps cost 300 ms in all 8 directions.** Running moves 2 tiles per 600 ms
+  tick, diagonal or not. The search adds a sub-millisecond tie-break per diagonal
+  (`WALK_DIAGONAL_TIEBREAK_MS`), so among routes with the fewest steps it picks one with
+  the fewest diagonals (natural shapes, no zig-zags, deterministic); the tie-break is
+  never part of the served cost.
+- **Surge / Dive** (`surge.enabled/charges/cooldown_ms`, `dive.enabled/available_in_ms/
+  cooldown_ms`) are placed after the search by the game's hop trajectory (diagonal step
+  toward the target if walkable, else x, else y, inside the start/target rectangle — hops
+  slide around corners; `src/hops.rs`) and a simple cast schedule: minimum gain Surge 8 /
+  Dive 6 route tiles, no hop with < 5 walk tiles left, Dive to the best later walk tile
+  within 10 (Chebyshev), Surge along the facing (the last step walked or hop taken; none
+  right after a teleport/interaction) and only when it lands on the walk, 700 ms reaction
+  after cooldown, 1.2 s after a teleport/interaction landing, the 2-tick anti-spam delay
+  between Surges. Each hop action costs one tick (600 ms) and replaces the walk steps it
+  skips (`tiles_covered`).
+- Macro / teleport / fairy steps cost what they did before.
+
 ### Route to an area
 
 `POST /route_area` returns the cheapest route to **any** tile of an area (emote clue
@@ -336,7 +362,8 @@ has the same tail hash as the one being served is a no-op that keeps the warm ca
 Bots re-request the same goal as they walk, and every such request misses the exact
 key. A second, per-profile index keeps the newest `NAVPATH_SUBPATH_CACHE` optimal paths
 with a node→position map; if both the requested start and goal lie on one of them (in
-order), the slice is served with the exact cost `path_g[goal] - path_g[start]`. A
+order), the slice is served (its exact search cost is `path_g[goal] - path_g[start]`; the
+response `cost` is, as always, the sum of its actions). A
 sub-path of a shortest path is a shortest path, and the graph is identical for the
 same profile, so this is exact — including origin-only global teleports (the cached
 optimum already proved walking on beats teleporting from any node on it). Suffix

@@ -71,7 +71,7 @@ impl Adjacency {
 
 /// The walk grid, either borrowed zero-copy from the snapshot's CSR sections (service
 /// path) or owned (tests / ad-hoc graphs). Weights are derived: cardinal 300ms,
-/// diagonal 300*sqrt(2), selected by the per-slot diagonal bitmap.
+/// diagonal `walk_diagonal_ms()` (300 + tie-break), selected by the per-slot diagonal bitmap.
 pub enum WalkGraph<'a> {
     Csr {
         offsets: &'a [u32],

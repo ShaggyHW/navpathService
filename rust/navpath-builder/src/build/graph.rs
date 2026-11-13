@@ -53,8 +53,7 @@ impl<'a> NodeIndex<'a> {
 /// The walk graph in the snapshot's v8 CSR form: `offsets` (n + 1), `dst` (one slot per
 /// edge, each row in ascending direction-bit order) and a per-slot diagonal bitmap.
 /// Weights are implied: `WALK_CARDINAL_MS` for cardinal slots, `walk_diagonal_ms()` for
-/// diagonal ones — bit-identical to the old per-edge `cost * 300.0` weights
-/// (`1.0 * 300.0` and `2f32.sqrt() * 300.0`).
+/// diagonal ones (300 ms + a tiny tie-break since snapshot v10; 300*sqrt(2) before).
 pub struct WalkCsr {
     pub offsets: Vec<u32>,
     pub dst: Vec<u32>,
@@ -238,14 +237,14 @@ mod tests {
         const BOTTOMRIGHT: usize = 6;
         const TOPRIGHT: usize = 7;
         let dirs = [
-            (LEFT, -1, 0, RIGHT, 1.0_f32),
-            (BOTTOM, 0, -1, TOP, 1.0_f32),
-            (RIGHT, 1, 0, LEFT, 1.0_f32),
-            (TOP, 0, 1, BOTTOM, 1.0_f32),
-            (TOPLEFT, -1, 1, TOPRIGHT, 2_f32.sqrt()),
-            (BOTTOMLEFT, -1, -1, TOPRIGHT, 2_f32.sqrt()),
-            (BOTTOMRIGHT, 1, -1, TOPLEFT, 2_f32.sqrt()),
-            (TOPRIGHT, 1, 1, BOTTOMLEFT, 2_f32.sqrt()),
+            (LEFT, -1, 0, RIGHT, navpath_core::snapshot::WALK_CARDINAL_MS),
+            (BOTTOM, 0, -1, TOP, navpath_core::snapshot::WALK_CARDINAL_MS),
+            (RIGHT, 1, 0, LEFT, navpath_core::snapshot::WALK_CARDINAL_MS),
+            (TOP, 0, 1, BOTTOM, navpath_core::snapshot::WALK_CARDINAL_MS),
+            (TOPLEFT, -1, 1, TOPRIGHT, navpath_core::snapshot::walk_diagonal_ms()),
+            (BOTTOMLEFT, -1, -1, TOPRIGHT, navpath_core::snapshot::walk_diagonal_ms()),
+            (BOTTOMRIGHT, 1, -1, TOPLEFT, navpath_core::snapshot::walk_diagonal_ms()),
+            (TOPRIGHT, 1, 1, BOTTOMLEFT, navpath_core::snapshot::walk_diagonal_ms()),
         ];
         let diag_require = [
             (TOPLEFT, TOP, LEFT),
@@ -297,7 +296,7 @@ mod tests {
                     }
                     src.push(sid);
                     dst.push(did);
-                    w.push(cost * 300.0);
+                    w.push(cost);
                 }
             }
         }
@@ -324,7 +323,7 @@ mod tests {
             let slot = cur[src[i] as usize] as usize;
             out[slot] = dst[i];
             ws[slot] = w[i];
-            if w[i] > 350.0 {
+            if w[i] > navpath_core::snapshot::WALK_CARDINAL_MS {
                 diag[slot / 8] |= 1 << (slot % 8);
             }
             cur[src[i] as usize] += 1;

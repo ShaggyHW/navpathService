@@ -19,8 +19,13 @@ pub const SNAPSHOT_MAGIC: [u8; 4] = *b"NPSS"; // NavPath SnapShot
 //  - the ALT section may use the clustered u8 encoding (`alt_format` = 1, see
 //    `alt_pack`), and starts and ends on 2 MiB boundaries so every table page can be
 //    PMD-mapped.
+// v10 (2026-11): walk steps cost 300 ms in all 8 directions (RS3 runs 2 tiles a tick,
+//  diagonal or not) plus a tiny diagonal tie-break (see `walk_diagonal_ms`). The ALT
+//  tables bake walk distances, so v9 tables (octile weights) would OVERestimate the new
+//  distances — an inadmissible heuristic. The format is unchanged; the bump only makes
+//  the service refuse a snapshot built with the old weights.
 // Snapshots must be rebuilt.
-pub const SNAPSHOT_VERSION: u32 = 9;
+pub const SNAPSHOT_VERSION: u32 = 10;
 
 /// ALT section encodings (`Manifest::alt_format`).
 pub const ALT_FORMAT_U16: u32 = 0;
@@ -47,13 +52,31 @@ pub const ALT_UNREACHABLE: u16 = u16::MAX;
 /// Saturation marker: the true distance is at least this many quanta.
 pub const ALT_SATURATED: u16 = u16::MAX - 1;
 
-/// Walk-edge weights are not stored: cardinal steps cost 300ms, diagonal steps
-/// 300*sqrt(2), selected by the per-edge diagonal bitmap.
+/// Walk-edge weights are not stored: every step costs 300ms (running moves 2 tiles per
+/// 600ms server tick in any of the 8 directions), diagonal steps plus
+/// [`WALK_DIAGONAL_TIEBREAK_MS`], selected by the per-edge diagonal bitmap.
 pub const WALK_CARDINAL_MS: f32 = 300.0;
+
+/// Secondary cost of a diagonal step. Real travel time is Chebyshev (a diagonal step
+/// takes as long as a cardinal one), but pure Chebyshev weights make huge equal-cost
+/// plateaus: a 10x3 offset has dozens of 10-step paths, zig-zags included. This tiny
+/// surcharge picks, among the paths with the fewest steps, one with the fewest
+/// diagonals — the old octile cost as a secondary key — so paths stay natural and
+/// deterministic.
+///
+/// It also keeps every comparison of 1- and 2-step costs in the SAME order as octile
+/// weights did (1 < 1+e < 2 < 2+e < 2+2e, as 1 < sqrt2 < 2 < 1+sqrt2 < 2sqrt2), which is
+/// all canonical pruning and the jump-point tables look at (`canonical.rs` STEP_COST): the
+/// derived tables are bit-identical to the octile ones and stay sound.
+///
+/// Sized so it survives f32 accumulation (ulp is 0.25 ms only past 2M ms of route) and
+/// can only outweigh a whole step after 1,200 extra diagonals. Response costs never
+/// include it: the payload re-prices walk steps at exactly [`WALK_CARDINAL_MS`].
+pub const WALK_DIAGONAL_TIEBREAK_MS: f32 = 0.25;
 
 #[inline]
 pub fn walk_diagonal_ms() -> f32 {
-    2f32.sqrt() * WALK_CARDINAL_MS
+    WALK_CARDINAL_MS + WALK_DIAGONAL_TIEBREAK_MS
 }
 
 /// Spread the low 15 bits of `v` to the even bit positions.

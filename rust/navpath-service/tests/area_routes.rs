@@ -355,3 +355,47 @@ async fn danger_areas_are_avoided_unless_disabled() {
     // Routes that never touch the area are unaffected.
     assert_eq!(route((3202, 3200), (3202, 3210), None).await, (10.0 * 300.0, 0));
 }
+
+/// The response `cost` is the sum of the actions' `cost_ms` (walk steps at 300 ms,
+/// Surge/Dive hops at one tick each), on both endpoints, whether the actions are
+/// requested or not.
+#[tokio::test]
+async fn cost_is_the_actions_sum_on_both_endpoints() {
+    let snap = make_snapshot();
+    let app = app_for(&snap, true);
+    let abilities = json!({
+        "surge": {"enabled": true, "charges": 2, "cooldown_ms": 10200},
+        "dive": {"enabled": true, "cooldown_ms": 10200},
+    });
+    // The west column, straight up: 26 steps.
+    let walk = 26.0 * 300.0;
+    for (hops, opts) in [(false, json!({})), (false, json!({"only_actions": true})), (true, json!({})), (true, json!({"only_actions": true}))] {
+        let mut body = json!({"start": tile(3200, 3200), "goal": tile(3200, 3226), "options": opts});
+        let mut area_body = json!({"start": tile(3200, 3200), "goal_tiles": [tile(3200, 3226)], "options": opts});
+        if hops {
+            for (k, v) in abilities.as_object().unwrap() {
+                body[k] = v.clone();
+                area_body[k] = v.clone();
+            }
+        }
+        let (st, r, _) = post(&app, "/route", body).await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        let (st, a, _) = post(&app, "/route_area", area_body).await;
+        assert_eq!(st, StatusCode::OK, "{a}");
+        let cost = r["cost"].as_f64().unwrap();
+        assert_eq!(cost, a["cost"].as_f64().unwrap(), "/route and /route_area disagree: {r} vs {a}");
+        if hops {
+            assert!(cost < walk, "hops must shorten the walk: {cost}");
+        } else {
+            assert_eq!(cost, walk);
+        }
+        for v in [&r, &a] {
+            if let Some(actions) = v["actions"].as_array() {
+                let sum: f64 = actions.iter().map(|x| x["cost_ms"].as_f64().unwrap()).sum();
+                assert_eq!(sum, cost, "{v}");
+                let hop_count = actions.iter().filter(|x| x["type"] == "surge" || x["type"] == "dive").count();
+                assert_eq!(hop_count > 0, hops, "{v}");
+            }
+        }
+    }
+}
