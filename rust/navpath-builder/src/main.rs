@@ -365,18 +365,23 @@ fn fetch_db_row(conn: &Connection, kind: &str, id: i64) -> Option<serde_json::Va
             None
         }
         "spell" => {
-            if let Ok(mut st) = conn.prepare_cached(
-                "SELECT spell_id,
+            // `action` was added to the table later: fall back to NULL on older DBs so the
+            // rest of the row is still returned.
+            let sql = |action: &str| format!(
+                "SELECT spell_id, {action},
                         dest_min_x, dest_max_x, dest_min_y, dest_max_y, dest_plane,
                         cost, next_node_type, next_node_id, requirements
                  FROM teleports_spell_nodes WHERE id = ?1"
-            ) {
+            );
+            let stmt = conn.prepare_cached(&sql("action")).or_else(|_| conn.prepare_cached(&sql("NULL")));
+            if let Ok(mut st) = stmt {
                 let row: std::result::Result<serde_json::Value, _> = st.query_row([id], |r: &rusqlite::Row| {
-                    let spell: Option<i64> = r.get(0)?;
-                    let dminx: Option<i64> = r.get(1)?; let dmaxx: Option<i64> = r.get(2)?; let dminy: Option<i64> = r.get(3)?; let dmaxy: Option<i64> = r.get(4)?; let dp: Option<i64> = r.get(5)?;
-                    let cost: Option<f64> = r.get(6)?; let next_t: Option<String> = r.get(7)?; let next_id: Option<i64> = r.get(8)?; let req: Option<String> = r.get(9)?;
+                    let spell: Option<i64> = r.get(0)?; let action: Option<String> = r.get(1)?;
+                    let dminx: Option<i64> = r.get(2)?; let dmaxx: Option<i64> = r.get(3)?; let dminy: Option<i64> = r.get(4)?; let dmaxy: Option<i64> = r.get(5)?; let dp: Option<i64> = r.get(6)?;
+                    let cost: Option<f64> = r.get(7)?; let next_t: Option<String> = r.get(8)?; let next_id: Option<i64> = r.get(9)?; let req: Option<String> = r.get(10)?;
                     let mut obj = serde_json::Map::new();
                     obj.insert("spell_id".to_string(), spell.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+                    obj.insert("action".to_string(), action.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
                     obj.insert("dest_min_x".to_string(), dminx.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
                     obj.insert("dest_max_x".to_string(), dmaxx.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
                     obj.insert("dest_min_y".to_string(), dminy.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
