@@ -15,6 +15,7 @@ pub mod routes;
 pub mod engine_adapter;
 pub mod danger;
 pub mod hops;
+pub mod hop_knowledge;
 
 /// Cache key for a route search. Everything the search result depends on is in here;
 /// snapshot identity is implicit (the cache lives inside SnapshotState, so a snapshot

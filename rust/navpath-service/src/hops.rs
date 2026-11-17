@@ -13,17 +13,25 @@
 //! docs/surge_dive_improvements, §0-§4).
 //!
 //! **Schedule** ([`plan_walk`]): a deliberately simple, slightly pessimistic caster —
-//! none of the client's holds, pair/chain bonuses, end-of-walk scheduling or learned hop
-//! knowledge. Along a walk, at each tile reached, it casts the usable hop with the
-//! largest gain (route tiles skipped; ties go to Surge), or walks on:
-//! - gain >= [`SURGE_MIN_GAIN`] / [`DIVE_MIN_GAIN`], and no hop with fewer than
-//!   [`END_GATE_TILES`] walk tiles left;
+//! none of the client's holds or end-of-walk scheduling. Along a walk, at each tile
+//! reached, it casts a usable hop or walks on:
+//! - gain (route tiles skipped) >= [`SURGE_MIN_GAIN`] / [`DIVE_MIN_GAIN`], and no hop
+//!   with fewer than [`END_GATE_TILES`] walk tiles left;
+//! - **pairs** (the client's `comboBonus`, END_AWARE_HOPS.md A.6): with both abilities
+//!   ready, a Surge is also worth what the Dive from its landing adds over the Dive's best
+//!   use now, so a short Surge that sets up a long Dive goes; and the caster takes the
+//!   order (Surge → Dive or Dive → Surge, the Surge along the Dive's facing) that skips
+//!   more tiles over both hops, ties to Surge first. The second hop of a pair goes from
+//!   the first's landing on the next tick (a same-tick pair is not assumed: it lands in
+//!   one tick only some of the time);
 //! - Dive aims at the later walk tile within [`HOP_RANGE`] (Chebyshev) with the best gain
 //!   that `greedy` reaches; Surge goes along the facing (the last step walked, or the
 //!   last hop's facing) and must land on a later walk tile. No facing (first move after
 //!   the route start, a teleport or an interaction) = no Surge;
-//! - off cooldown plus a [`REACTION_MS`] reaction, and [`LANDING_HOLD_MS`] after a
-//!   teleport / interaction landing; a Surge also puts every charge on the game's 2-tick
+//! - off cooldown plus a [`REACTION_MS`] reaction, and a hold after a teleport /
+//!   interaction landing: [`LANDING_HOLD_MS`], or longer where the clients learned how
+//!   long that kind of landing holds the player (`lock:` times, see
+//!   [`crate::hop_knowledge`]); a Surge also puts every charge on the game's 2-tick
 //!   anti-spam delay ([`SURGE_SPAM_MS`]);
 //! - a hop takes one tick ([`HOP_MS`]); walking resumes from the landing.
 //!
@@ -80,14 +88,26 @@ fn dir_bit(dx: i32, dy: i32) -> Option<u8> {
 
 /// [`StepRule`] over the snapshot's walk graph: a step is legal iff the walk edge
 /// exists (degree <= 8). Each tile's 8-direction mask is derived once per request.
+///
+/// With [`SnapshotSteps::with_knowledge`] the clients' learned hop edges are laid over it
+/// (as the launcher's `HopKnowledge.RULE`): a learned hop-stopper refuses a walkable step,
+/// and a learned hop-passable edge allows a step walking cannot take, when its far tile
+/// is a node of the snapshot.
 pub struct SnapshotSteps<'a> {
     snap: &'a navpath_core::Snapshot,
     masks: crate::FxHashMap<Tile, u8>,
+    learned: Option<std::sync::Arc<crate::hop_knowledge::HopKnowledge>>,
 }
 
 impl<'a> SnapshotSteps<'a> {
     pub fn new(snap: &'a navpath_core::Snapshot) -> Self {
-        Self { snap, masks: crate::FxHashMap::default() }
+        Self { snap, masks: crate::FxHashMap::default(), learned: None }
+    }
+
+    /// The walk graph plus the learned hop edges in `k` (ignored when it has none).
+    pub fn with_knowledge(snap: &'a navpath_core::Snapshot, k: std::sync::Arc<crate::hop_knowledge::HopKnowledge>) -> Self {
+        let has_edges = k.usable_pass_edges() + k.usable_stop_edges() > 0;
+        Self { snap, masks: crate::FxHashMap::default(), learned: has_edges.then_some(k) }
     }
 
     fn mask(&mut self, x: i32, y: i32, p: i32) -> u8 {
@@ -113,11 +133,31 @@ impl<'a> SnapshotSteps<'a> {
 
 impl StepRule for SnapshotSteps<'_> {
     fn can_step(&mut self, x: i32, y: i32, plane: i32, dx: i32, dy: i32) -> bool {
-        match dir_bit(dx, dy) {
-            Some(b) => self.mask(x, y, plane) & (1 << b) != 0,
-            None => false,
-        }
+        let Some(b) = dir_bit(dx, dy) else { return false };
+        let Some(k) = self.learned.clone() else { return self.mask(x, y, plane) & (1 << b) != 0 };
+        let snap = self.snap;
+        learned_step(
+            &k,
+            (x, y, plane, dx, dy),
+            || self.mask(x, y, plane) & (1 << b) != 0,
+            || snap.find_node(x + dx, y + dy, plane).is_some(),
+        )
     }
+}
+
+/// A hop step with learned edges laid over walking (`HopKnowledge.RULE`): refused at a
+/// learned hop-stopper; else allowed when walking allows it, or across a learned
+/// hop-passable edge whose far tile exists.
+pub fn learned_step(
+    k: &crate::hop_knowledge::HopKnowledge,
+    (x, y, plane, dx, dy): (i32, i32, i32, i32, i32),
+    walkable: impl FnOnce() -> bool,
+    far_tile_exists: impl FnOnce() -> bool,
+) -> bool {
+    if k.stops(x, y, plane, dx, dy) {
+        return false;
+    }
+    walkable() || (k.passable(x, y, plane, dx, dy) && far_tile_exists())
 }
 
 /// `HopModel.greedy`: walk from `from` to `target` by the hop rule (diagonal toward the
@@ -241,9 +281,9 @@ pub struct HopState {
     dive_ready: f64,
     /// Unit direction the character faces (None = unknown).
     facing: Option<(i32, i32)>,
-    /// End of the last teleport / interaction landing (None = none yet: the route start
-    /// itself is not a landing).
-    landed_at: Option<f64>,
+    /// No hop before this: the end of the last landing's hold (None = no landing yet:
+    /// the route start itself is not a landing).
+    hold_until: Option<f64>,
 }
 
 impl HopState {
@@ -256,20 +296,21 @@ impl HopState {
             surge_spam_until: f64::NEG_INFINITY,
             dive_ready: abilities.dive_available_in_ms.max(0.0),
             facing: None,
-            landed_at: None,
+            hold_until: None,
         }
     }
 
     /// A non-walk action (teleport, door, NPC, ...) of `cost_ms`: the clock advances,
-    /// the character lands (hold) with an unknown facing.
-    pub fn other_action(&mut self, cost_ms: f64) {
+    /// the character lands with an unknown facing and no hop goes for `hold_ms`
+    /// (at least [`LANDING_HOLD_MS`]).
+    pub fn other_action(&mut self, cost_ms: f64, hold_ms: f64) {
         self.elapsed += cost_ms;
-        self.landed_at = Some(self.elapsed);
+        self.hold_until = Some(self.elapsed + hold_ms.max(LANDING_HOLD_MS));
         self.facing = None;
     }
 
     fn landing_clear(&self, t: f64) -> bool {
-        self.landed_at.is_none_or(|l| t >= l + LANDING_HOLD_MS)
+        self.hold_until.is_none_or(|h| t >= h)
     }
 
     fn surge_charge(&self, t: f64) -> Option<usize> {
@@ -320,47 +361,88 @@ impl HopState {
             return None;
         }
         let here = tiles[i];
-        let last = end.min(i + HOP_LOOKAHEAD);
+        let charge = self.surge_charge(t);
+        let dive_ready = self.dive_usable(t);
 
-        let surge = match (self.surge_charge(t), self.facing) {
-            // Cheap pre-check before the ray's up-to-100 step tests: the landing must be
-            // a walk tile at least SURGE_MIN_GAIN on that lies on the ray.
-            (Some(charge), Some(dir)) if (i + SURGE_MIN_GAIN..=last).any(|j| on_ray(here, dir, tiles[j])) => {
-                ray(rule, here, dir, HOP_RANGE)
-                    .and_then(|land| (i + 1..=last).find(|&j| tiles[j] == land))
-                    .filter(|&j| j - i >= SURGE_MIN_GAIN)
-                    .map(|j| (j, charge))
-            }
+        // The Surge's landing on the walk (any gain: a short one may still pay as a pair).
+        let surge = match (charge, self.facing) {
+            (Some(_), Some(dir)) => surge_landing(rule, tiles, i, end, dir),
             _ => None,
         };
-        let dive = if self.dive_usable(t) {
-            (i + DIVE_MIN_GAIN..=last).rev().find(|&j| {
-                let aim = tiles[j];
-                aim.2 == here.2
-                    && (aim.0 - here.0).abs().max((aim.1 - here.1).abs()) <= HOP_RANGE
-                    && greedy(rule, here, aim)
-            })
-        } else {
-            None
-        };
+        let dive = if dive_ready { best_dive(rule, tiles, i, end) } else { None };
+        let surge_gain = surge.map_or(0, |j| j - i);
+        let dive_gain = dive.map_or(0, |j| j - i);
 
-        let hop = match (surge, dive) {
-            (Some((sj, charge)), dj) if dj.is_none_or(|dj| sj >= dj) => {
-                self.surge_ready[charge] = t + self.abilities.surge_cooldown_ms;
-                self.surge_spam_until = t + SURGE_SPAM_MS;
-                // The facing is unchanged: a Surge goes the way the character faces.
-                Hop { kind: HopKind::Surge, from: i, to: sj, cast_ms: t }
-            }
-            (_, Some(dj)) => {
-                self.dive_ready = t + self.abilities.dive_cooldown_ms;
-                let to = tiles[dj];
-                self.facing = facing(to.0 - here.0, to.1 - here.1);
-                Hop { kind: HopKind::Dive, from: i, to: dj, cast_ms: t }
-            }
-            _ => return None,
+        // Pairs, with both ready: what the second hop gains from the first's landing.
+        // Straight after a Surge a Dive can go any way; after a Dive a Surge goes the way
+        // the Dive left the character facing, and must earn its own minimum.
+        let dive_after_surge = match (surge, dive_ready) {
+            (Some(sj), true) => best_dive(rule, tiles, sj, end).map_or(0, |j| j - sj),
+            _ => 0,
+        };
+        let surge_after_dive = match (dive, charge) {
+            (Some(dj), Some(_)) => facing(tiles[dj].0 - here.0, tiles[dj].1 - here.1)
+                .and_then(|f| surge_landing(rule, tiles, dj, end, f))
+                .map(|j| j - dj)
+                .filter(|&g| g >= SURGE_MIN_GAIN)
+                .unwrap_or(0),
+            _ => 0,
+        };
+        // The client's comboBonus: what the Dive from the Surge's landing adds over the
+        // Dive's best use without it (at least its minimum).
+        let combo_bonus = dive_after_surge.saturating_sub(dive_gain.max(DIVE_MIN_GAIN));
+        let surge_ok = surge.is_some() && surge_gain + combo_bonus >= SURGE_MIN_GAIN;
+        let dive_ok = dive.is_some();
+
+        let surge_first = match (surge_ok, dive_ok) {
+            (true, true) => surge_gain + dive_after_surge >= dive_gain + surge_after_dive,
+            (true, false) => true,
+            (false, true) => false,
+            (false, false) => return None,
+        };
+        let hop = if surge_first {
+            let (sj, charge) = (surge?, charge?);
+            self.surge_ready[charge] = t + self.abilities.surge_cooldown_ms;
+            self.surge_spam_until = t + SURGE_SPAM_MS;
+            // The facing is unchanged: a Surge goes the way the character faces.
+            Hop { kind: HopKind::Surge, from: i, to: sj, cast_ms: t }
+        } else {
+            let dj = dive?;
+            self.dive_ready = t + self.abilities.dive_cooldown_ms;
+            let to = tiles[dj];
+            self.facing = facing(to.0 - here.0, to.1 - here.1);
+            Hop { kind: HopKind::Dive, from: i, to: dj, cast_ms: t }
         };
         Some(hop)
     }
+}
+
+/// Where a Surge from walk index `i` along `dir` lands, as a later walk index (any gain),
+/// or None when it lands off the walk (or not at all).
+fn surge_landing<R: StepRule + ?Sized>(rule: &mut R, tiles: &[Tile], i: usize, end: usize, dir: (i32, i32)) -> Option<usize> {
+    let here = tiles[i];
+    let last = end.min(i + HOP_LOOKAHEAD);
+    // Cheap pre-check before the ray's up-to-100 step tests: some later walk tile must
+    // lie on the ray.
+    if !(i + 1..=last).any(|j| on_ray(here, dir, tiles[j])) {
+        return None;
+    }
+    let land = ray(rule, here, dir, HOP_RANGE)?;
+    (i + 1..=last).find(|&j| tiles[j] == land)
+}
+
+/// The Dive from walk index `i` with the best gain >= [`DIVE_MIN_GAIN`]: the furthest
+/// later walk tile within [`HOP_RANGE`] (Chebyshev) that `greedy` reaches.
+fn best_dive<R: StepRule + ?Sized>(rule: &mut R, tiles: &[Tile], i: usize, end: usize) -> Option<usize> {
+    let here = tiles[i];
+    let last = end.min(i + HOP_LOOKAHEAD);
+    if i + DIVE_MIN_GAIN > last {
+        return None;
+    }
+    (i + DIVE_MIN_GAIN..=last).rev().find(|&j| {
+        let aim = tiles[j];
+        aim.2 == here.2 && (aim.0 - here.0).abs().max((aim.1 - here.1).abs()) <= HOP_RANGE && greedy(rule, here, aim)
+    })
 }
 
 #[cfg(test)]
@@ -566,7 +648,7 @@ mod tests {
         // ready surge and no hold left, the surge goes from tile 1, not tile 0.
         let mut st = HopState::new(abilities(true, false));
         st.elapsed = 10_000.0;
-        st.other_action(0.0);
+        st.other_action(0.0, LANDING_HOLD_MS);
         st.elapsed += LANDING_HOLD_MS; // the hold is over before the walk starts
         let hops = st.plan_walk(&mut Grid::default(), &line(20, (1, 0)));
         assert_eq!(hops[0].from, 1);
@@ -611,7 +693,7 @@ mod tests {
     fn no_hop_within_the_landing_hold() {
         let mut st = HopState::new(abilities(true, true));
         st.elapsed = 50_000.0;
-        st.other_action(3_000.0); // a teleport lands at 53,000
+        st.other_action(3_000.0, LANDING_HOLD_MS); // a teleport lands at 53,000
         let hops = st.plan_walk(&mut Grid::default(), &line(30, (1, 0)));
         assert!(hops[0].cast_ms >= 53_000.0 + LANDING_HOLD_MS);
         assert_eq!(hops[0].from, 4, "1,200 ms of walking = 4 tiles");
@@ -633,5 +715,65 @@ mod tests {
         assert_eq!(hops[0].kind, HopKind::Dive);
         assert_eq!(hops[0].from, 3);
         assert_eq!(tiles[hops[0].to], t(6, 10), "aims at the furthest walk tile within 10 (Chebyshev)");
+    }
+
+    /// The walk east to (10,0), then north up x = 10; a solid tile at (11,0) stops an east
+    /// Surge at the corner, and a wall between x = 5 and 6 from `wall_from_y` up keeps a
+    /// Dive from (3,0) off the northern leg.
+    fn corner_with_wall(wall_from_y: i32) -> (Vec<Tile>, Grid) {
+        let mut tiles = line(10, (1, 0));
+        tiles.extend((1..=20).map(|i| t(10, i)));
+        let mut g = Grid::default();
+        g.solid.insert((11, 0));
+        for y in wall_from_y..=25 {
+            g.wall(5, y, 1, 0);
+        }
+        (tiles, g)
+    }
+
+    #[test]
+    fn a_short_surge_goes_when_it_sets_up_a_dive() {
+        // At tile 3 (the first after the reaction) the Surge gains 7 (< 8) and the Dive 7.
+        // From the Surge's landing the Dive gains 10: worth 3 more than the Dive now, so
+        // the pair goes, Surge first, the Dive one tick later from its landing.
+        let (tiles, mut g) = corner_with_wall(1);
+        let mut st = HopState::new(abilities(true, true));
+        let hops = st.plan_walk(&mut g, &tiles);
+        assert_eq!(hops[0], Hop { kind: HopKind::Surge, from: 3, to: 10, cast_ms: 900.0 });
+        assert_eq!(hops[1], Hop { kind: HopKind::Dive, from: 10, to: 20, cast_ms: 900.0 + HOP_MS });
+        // Without a Dive to follow, the same 7-tile Surge is not worth a charge.
+        let mut st = HopState::new(abilities(true, false));
+        assert!(st.plan_walk(&mut g, &tiles).iter().all(|h| h.from != 3));
+    }
+
+    #[test]
+    fn pairs_take_the_order_that_skips_more() {
+        // The Dive now reaches (10,1) (gain 8) and beats the Surge's 7 on its own, but
+        // after it the Surge faces east, off the walk: 8 in all. Surge -> Dive skips 17.
+        let (tiles, mut g) = corner_with_wall(2);
+        let mut st = HopState::new(abilities(true, true));
+        let hops = st.plan_walk(&mut g, &tiles);
+        assert_eq!((hops[0].kind, hops[0].from, hops[0].to), (HopKind::Surge, 3, 10));
+        assert_eq!((hops[1].kind, hops[1].from, hops[1].to), (HopKind::Dive, 10, 20));
+    }
+
+    #[test]
+    fn learned_edges_overlay_walking() {
+        use crate::hop_knowledge::HopKnowledge;
+        let k = HopKnowledge::from_files([(
+            "contrib-a.jsonl",
+            r#"{"k":"pe:5:5:0:E","s":2,"w":0,"f":0,"m":7}
+{"k":"se:7:5:0:N","s":2,"w":0,"f":0,"m":7}"#,
+        )]);
+        // Walking can't cross (5,5)->(6,5); a hop can, when (6,5) exists, either way.
+        assert!(learned_step(&k, (5, 5, 0, 1, 0), || false, || true));
+        assert!(learned_step(&k, (6, 5, 0, -1, 0), || false, || true));
+        assert!(!learned_step(&k, (5, 5, 0, 1, 0), || false, || false), "no far tile");
+        // A hop stops at (7,5)->(7,6) although walking passes.
+        assert!(!learned_step(&k, (7, 5, 0, 0, 1), || true, || true));
+        assert!(!learned_step(&k, (7, 6, 0, 0, -1), || true, || true));
+        // Elsewhere walking decides.
+        assert!(learned_step(&k, (1, 1, 0, 1, 1), || true, || true));
+        assert!(!learned_step(&k, (1, 1, 0, 1, 1), || false, || true));
     }
 }

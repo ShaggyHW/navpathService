@@ -205,6 +205,11 @@ pub struct MacroAction {
     /// Owned because this subtree is MUTATED per action (door_direction insertion,
     /// db_row removal); it is parsed fresh from the snapshot's metadata bytes.
     pub metadata: serde_json::Value,
+    /// The client's key for the first interaction of this step (`NpcNode:Charter`),
+    /// which names the landing hold learned for it. Set only when learned times are
+    /// loaded; never serialized.
+    #[serde(skip)]
+    pub client_key: Option<String>,
 }
 
 /// Serialize an `Arc<Value>` by reading through it (serde's blanket `Arc` impl is
@@ -308,6 +313,20 @@ impl Action {
         }
     }
 
+    /// What the client calls the interaction that sent the player here (its arrival key,
+    /// `RouteWalker.arrivalKey`): the landing hold learned for it applies after it.
+    fn arrival_key(&self) -> Option<String> {
+        use crate::hop_knowledge::client_key;
+        match self {
+            Action::Move(_) | Action::Ability(_) => None,
+            Action::Macro(a) => a.client_key.clone(),
+            Action::Global(a) => client_key(&a.kind, None).map(|k| k.0).or_else(|| Some("teleport".into())),
+            Action::Fairy(_) => Some("FairyRingNode".into()),
+            Action::Teleport(_) => Some("teleport".into()),
+            Action::VirtualStart(a) => client_key(&a.kind, None).map(|k| k.0).or_else(|| Some("teleport".into())),
+        }
+    }
+
     /// Destination tile: the `to` array for moves/abilities, `to.min` for the
     /// min/max-block actions — the same lookup the old code did on JSON values.
     fn to_coords(&self) -> (i32, i32, i32) {
@@ -335,6 +354,10 @@ impl Action {
 /// costs therefore add up to the route's travel time, which is what the response's
 /// `cost` reports.
 ///
+/// After a run of non-walk actions the hop hold is the landing hold the clients learned
+/// for the run's first interaction (`lock:<key>`, [`crate::hop_knowledge`]), at least
+/// [`crate::hops::LANDING_HOLD_MS`].
+///
 /// `route_origin` is the tile the character actually stands on before the first action
 /// (`path[0]`). It is REQUIRED for correctness whenever the route opens with walk steps:
 /// actions only carry their destination (`to`), so the first move's origin exists nowhere
@@ -346,8 +369,9 @@ fn optimize_with_surge_dive<R: crate::hops::StepRule + ?Sized>(
     dive_config: &DiveConfig,
     route_origin: Option<(i32, i32, i32)>,
     rule: &mut R,
+    learned: &crate::hop_knowledge::HopKnowledge,
 ) -> Vec<Action> {
-    use crate::hops::{Abilities, HopKind, HopState, HOP_MS};
+    use crate::hops::{Abilities, HopKind, HopState, HOP_MS, LANDING_HOLD_MS};
     let abilities = Abilities {
         surge: surge_config.enabled,
         surge_charges: surge_config.charges,
@@ -364,13 +388,19 @@ fn optimize_with_surge_dive<R: crate::hops::StepRule + ?Sized>(
     let mut moves: Vec<MoveAction> = Vec::new();
     let mut tiles: Vec<(i32, i32, i32)> = Vec::new();
     let mut iter = actions.into_iter().peekable();
+    // The landing hold of the current run of non-walk actions (its first one's).
+    let mut run_hold: Option<f64> = None;
 
     while let Some(action) = iter.next() {
         let Action::Move(first_move) = action else {
-            state.other_action(action.cost_ms_f64());
+            let hold = *run_hold.get_or_insert_with(|| {
+                action.arrival_key().and_then(|k| learned.landing_hold_ms(&k)).unwrap_or(LANDING_HOLD_MS)
+            });
+            state.other_action(action.cost_ms_f64(), hold);
             result.push(action);
             continue;
         };
+        run_hold = None;
         // Where the character stands before this run: the previous action's destination,
         // or — at the head of the route — the caller-supplied origin tile. (Last-resort
         // fallback when neither exists: the first move's own tile, a zero-length step.)
@@ -808,6 +838,9 @@ fn build_route_payload(
     let node_to_fairy_ring = &job.cur.node_to_fairy_ring;
     let mask = &job.mask;
     let quick_tele = job.quick_tele;
+    // What the launcher's clients learned (empty unless NAVPATH_HOP_KNOWLEDGE_DIR is set).
+    let learned = crate::hop_knowledge::current();
+    let learned_times = learned.timing_keys() > 0;
 
     let coord = |id: u32| -> (i32, i32, i32) { snap.node_coord(id) };
 
@@ -924,6 +957,20 @@ fn build_route_payload(
                     }
                 }
             }
+            // The clients' measured interaction times replace the snapshot's per-step
+            // placeholders (see `learned_macro_cost`).
+            let mut cost_ms = cost_ms as f64;
+            let mut client_key = None;
+            if learned_times {
+                let parsed;
+                let m = if want_actions {
+                    &meta
+                } else {
+                    parsed = macro_lookup.meta_value(snap, idx);
+                    &parsed
+                };
+                (cost_ms, client_key) = learned_macro_cost(kstr, m, cost_ms, &learned, quick_tele);
+            }
             // Remove duplicated top-level db_row; it exists inside per-step entries already
             if let Some(obj) = meta.as_object_mut() {
                 obj.remove("db_row");
@@ -932,9 +979,10 @@ fn build_route_payload(
                 kind: kstr,
                 from: MinMax::point(x1, y1, p1),
                 to: MinMax::point(x2, y2, p2),
-                cost_ms: cost_ms as f64,
+                cost_ms,
                 node: NodeRef { kind: kstr, id: kid },
                 metadata: meta,
+                client_key,
             })));
         } else {
             // Walk edge or unknown: check the snapshot's walk CSR directly (degree <= 8).
@@ -1038,12 +1086,79 @@ fn build_route_payload(
     // path nothing in `acts` records it — see `optimize_with_surge_dive`.
     let route_origin = path.first().map(|&id| coord(id));
 
-    // Insert Surge/Dive along the walks, by the game's hop model on this snapshot.
-    let mut steps = crate::hops::SnapshotSteps::new(snap);
-    (Some(optimize_with_surge_dive(acts, &job.surge, &job.dive, route_origin, &mut steps)), geometry)
+    // A ring walked into and dialled: the clients' measured time (a portable ring opens
+    // from an item, which the client times as another node).
+    if learned_times {
+        if let Some(ms) = learned.interaction_ms("FairyRingNode", "FairyRingNode") {
+            for a in acts.iter_mut() {
+                if let Action::Fairy(f) = a {
+                    if f.from.object_id.is_some() {
+                        f.cost_ms = ms;
+                    }
+                }
+            }
+        }
+    }
+
+    // Insert Surge/Dive along the walks, by the game's hop model on this snapshot plus the
+    // hop edges the clients learned.
+    let mut steps = crate::hops::SnapshotSteps::with_knowledge(snap, learned.clone());
+    (Some(optimize_with_surge_dive(acts, &job.surge, &job.dive, route_origin, &mut steps, &learned)), geometry)
 }
 
 /// A global teleport action; `gc` is its effective cost (quick-tele lodestones `QUICK_TELE_LODESTONE_MS`).
+/// A macro step priced by what the clients measured (`dead:` times,
+/// [`crate::hop_knowledge`]): each interaction in the step's metadata chain whose time was
+/// learned replaces its own snapshot cost; the rest keep theirs. Lodestones are left alone
+/// with quick-tele (its own fixed cost). Returns the cost and the client's key of the
+/// chain's first interaction (the arrival key of the landing hold).
+fn learned_macro_cost(
+    kind: &str,
+    meta: &serde_json::Value,
+    cost_ms: f64,
+    learned: &crate::hop_knowledge::HopKnowledge,
+    quick_tele: bool,
+) -> (f64, Option<String>) {
+    use crate::hop_knowledge::client_key;
+    fn action_of<'a>(kind: &str, holder: Option<&'a serde_json::Value>) -> Option<&'a str> {
+        let field = if kind == "door" { "open_action" } else { "action" };
+        holder?.get(field).and_then(serde_json::Value::as_str)
+    }
+    // (client key and node type, the step's own snapshot cost)
+    type Step = (Option<(String, &'static str)>, Option<f64>);
+    let mut chain: Vec<Step> = Vec::new();
+    match meta.get("steps").and_then(serde_json::Value::as_array).filter(|a| !a.is_empty()) {
+        Some(steps) => {
+            let single = steps.len() == 1;
+            for st in steps {
+                let k = st.get("kind").and_then(serde_json::Value::as_str).unwrap_or(kind);
+                let action = action_of(k, st.get("db_row")).or_else(|| st.get("action").and_then(serde_json::Value::as_str));
+                let own = st.get("cost_ms").and_then(serde_json::Value::as_f64).or(single.then_some(cost_ms));
+                chain.push((client_key(k, action), own));
+            }
+        }
+        None => {
+            let action = meta
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| action_of(kind, meta.get("db_row")));
+            chain.push((client_key(kind, action), Some(cost_ms)));
+        }
+    }
+    let arrival = chain.first().and_then(|(k, _)| k.as_ref()).map(|(key, _)| key.clone());
+    let mut total = cost_ms;
+    for (key, own) in &chain {
+        let (Some((key, node_type)), Some(own)) = (key, own) else { continue };
+        if quick_tele && *node_type == "LodestoneNode" {
+            continue;
+        }
+        if let Some(ms) = learned.interaction_ms(key, node_type) {
+            total += ms - own;
+        }
+    }
+    (total.max(0.0), arrival)
+}
+
 fn global_action(
     meta: &Arc<serde_json::Value>,
     quick_tele: bool,
@@ -2723,7 +2838,7 @@ mod surge_dive_tests {
 
     fn run(path: Vec<Action>, surge: bool, dive: bool) -> Vec<Action> {
         let (s, d) = cfgs(surge, dive);
-        optimize_with_surge_dive(path, &s, &d, Some((0, 0, 0)), &mut Open)
+        optimize_with_surge_dive(path, &s, &d, Some((0, 0, 0)), &mut Open, &crate::hop_knowledge::HopKnowledge::default())
     }
 
     fn abilities(actions: &[Action]) -> Vec<(&'static str, [i32; 3], [i32; 3])> {
@@ -2869,5 +2984,72 @@ mod surge_dive_tests {
         assert_eq!(abs[0].1, [104, 0, 0]);
         let walked = out.iter().filter(|a| matches!(a, Action::Move(_))).count();
         assert_eq!(total(&out), walked as f64 * 300.0 + 2400.0 + abs.len() as f64 * HOP_MS);
+    }
+
+    fn learned_times() -> crate::hop_knowledge::HopKnowledge {
+        crate::hop_knowledge::HopKnowledge::from_files([(
+            "schedule-a.jsonl",
+            r#"{"k":"dead:ObjectNode:Climb-over","w":4.0,"s1":16000.0,"s2":0}
+{"k":"dead:ObjectNode","w":4.0,"s1":16000.0,"s2":0}
+{"k":"dead:IFSlotNode","w":1.0,"s1":1000.0,"s2":0}
+{"k":"dead:LodestoneNode","w":1.0,"s1":9600.0,"s2":0}
+{"k":"lock:LodestoneNode","w":1.0,"s1":4800.0,"s2":0}"#,
+        )])
+    }
+
+    #[test]
+    fn learned_interaction_times_replace_the_step_costs() {
+        let k = learned_times();
+        let step = |kind: &str, action: Option<&str>, cost: f64| {
+            let mut db = serde_json::json!({});
+            if let Some(a) = action {
+                db["action"] = serde_json::Value::String(a.to_string());
+            }
+            serde_json::json!({ "kind": kind, "cost_ms": cost, "db_row": db })
+        };
+        // One object step: the learned time ((16,000 + 3,000) / 5 = 3,800 ms) replaces 1,200.
+        let meta = serde_json::json!({ "steps": [step("object", Some("Climb-over"), 1200.0)] });
+        assert_eq!(learned_macro_cost("object", &meta, 1200.0, &k, false), (3800.0, Some("ObjectNode:Climb-over".into())));
+        // A chain: the NPC (never timed by the client) keeps its 4,500; the interface
+        // after it takes its learned (1,000 + 3,000) / 2 = 2,000 instead of 300.
+        let meta = serde_json::json!({ "steps": [step("npc", Some("Charter"), 4500.0), step("ifslot", None, 300.0)] });
+        assert_eq!(learned_macro_cost("npc", &meta, 4800.0, &k, false), (6500.0, Some("NpcNode:Charter".into())));
+        // Lodestones keep the quick-tele cost; without it they take the learned time.
+        let meta = serde_json::json!({ "steps": [step("lodestone", None, 17000.0)] });
+        assert_eq!(learned_macro_cost("lodestone", &meta, 5000.0, &k, true).0, 5000.0);
+        assert_eq!(learned_macro_cost("lodestone", &meta, 17000.0, &k, false).0, ((9600.0 + 10800.0) / 2.0_f64).round());
+        // Nothing learned: unchanged.
+        let none = crate::hop_knowledge::HopKnowledge::default();
+        let meta = serde_json::json!({ "steps": [step("object", Some("Climb-over"), 1200.0)] });
+        assert_eq!(learned_macro_cost("object", &meta, 1200.0, &none, false).0, 1200.0);
+    }
+
+    #[test]
+    fn a_learned_landing_hold_delays_the_first_hop() {
+        let k = learned_times();
+        let lodestone = |cost_ms: f64| {
+            Action::Macro(Box::new(MacroAction {
+                kind: "lodestone",
+                from: MinMax::point(5, 0, 0),
+                to: MinMax::point(100, 0, 0),
+                cost_ms,
+                node: NodeRef { kind: "lodestone", id: 1 },
+                metadata: serde_json::Value::Null,
+                client_key: Some("LodestoneNode".into()),
+            }))
+        };
+        let mut path: Vec<Action> = (1..=5).map(|x| mv(x, 0)).collect();
+        path.push(lodestone(5000.0));
+        path.extend((101..=130).map(|x| mv(x, 0)));
+        let (s, d) = cfgs(false, true);
+        let out = optimize_with_surge_dive(path, &s, &d, Some((0, 0, 0)), &mut Open, &k);
+        // (4,800 + 1,200) / 2 = 3,000 ms held after the landing: 10 tiles walked first.
+        assert_eq!(abilities(&out)[0].1, [110, 0, 0]);
+        // Without learned data the 1.2 s default applies (4 tiles).
+        let mut path: Vec<Action> = (1..=5).map(|x| mv(x, 0)).collect();
+        path.push(lodestone(5000.0));
+        path.extend((101..=130).map(|x| mv(x, 0)));
+        let out = run(path, false, true);
+        assert_eq!(abilities(&out)[0].1, [104, 0, 0]);
     }
 }

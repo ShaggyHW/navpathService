@@ -63,6 +63,11 @@ export NAVPATH_RACE=1            # hedged JPS-uni/bidir race on the cache misses
 #                                # falls back to locking the ~45 MB per-pop head; a keep-warm loop re-populates the rest)
 # export NAVPATH_CTX_PREWARM=64  # raise the startup context pre-warm on a dedicated box (default 16 contexts, ~19 MB each)
 
+# Learned hop data (see "Learned hop data" below); unset = built-in model only:
+export NAVPATH_HOP_KNOWLEDGE_DIR=/home/query/Dev/Hoor2/launcher/payload/hop_knowledge  # shared folder (contrib-*/schedule-*.jsonl)
+export NAVPATH_HOP_LOCAL_DIR=/home/query/.rs3Client/hops                                # this machine's unexported store
+# export NAVPATH_HOP_CONTRIBUTOR=<16 hex>  # only if ~/.rs3Client/config.txt has no hop_contributor=
+
 cargo run -p navpath-service --release
 # --no-seed: ignore client seeds (no jitter, no seeded retry ladder; same optimal path).
 # --dump-result: rewrites result.json on every request (debugging only; a sync file write per response).
@@ -167,6 +172,37 @@ must prove no entry with fewer danger tiles exists.
 Edit the file, then `curl -XPOST localhost:8080/admin/reload` — the snapshot is kept,
 the areas are re-read and the route caches are cleared (the response reports
 `danger_areas: {areas, tiles, penalty_ms}`).
+
+## Learned hop data (`NAVPATH_HOP_KNOWLEDGE_DIR`, `NAVPATH_HOP_LOCAL_DIR`)
+
+Point `NAVPATH_HOP_KNOWLEDGE_DIR` at the launcher's shared folder
+(`Hoor2/launcher/payload/hop_knowledge`) to price routes with what the clients learned
+(`navpath-service/src/hop_knowledge.rs`):
+
+- `schedule-*.jsonl` `dead:<interaction>`: a macro step's interactions take their
+  measured time instead of the snapshot's placeholder (doors are 1,200 ms in the
+  snapshot, ~2 s measured; a Squeeze-through ~8.5 s). Per step of the metadata chain;
+  NPCs and spells keep their cost (the client never times them); quick-tele lodestones
+  keep theirs. Fairy rings (not portable) take `dead:FairyRingNode`.
+- `schedule-*.jsonl` `lock:<what landed the player>`: after a landing no hop goes for the
+  learned hold (at least the 1.2 s default).
+- `contrib-*.jsonl` `pe:` / `se:` edges: once usable by the launcher's evidence rules (and
+  of hop model 7 or later), Surge/Dive may cross a learned hop-passable edge, and stop at
+  a learned hop-stopper. Loc-type keys (`pt:`) are not used.
+
+Point `NAVPATH_HOP_LOCAL_DIR` at a machine's own store (`~/.rs3Client/hops`) to also read
+what that machine learned but has not exported yet: `knowledge.jsonl` (edges; ignored
+whole if its header's hop model is below 7) and `schedule.jsonl` (times). Its shared
+export and its store hold the same hops, so they are merged as the client merges them —
+edges by the larger count, times by the heavier key — and only other contributors add
+up. The machine's contributor id is `NAVPATH_HOP_CONTRIBUTOR`, else `hop_contributor=`
+in the `config.txt` next to the store; without one the export is counted on top of the
+store (a warning says so). Either variable works alone.
+
+Unset = the built-in model only. Both folders are re-read when a file changes (checked
+every 30 s), so a `git pull` of the launcher repo, or a client's flush to its store,
+reaches the service without a restart. Only
+the response's actions and `cost` change; the search still uses the snapshot's weights.
 
 ## API Endpoints
 

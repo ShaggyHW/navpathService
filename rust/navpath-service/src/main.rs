@@ -120,6 +120,8 @@ async fn serve(search_permits: Arc<navpath_service::SearchPermits>) -> Result<()
             SnapshotState::unloaded(snapshot_path.clone(), read_tail_hash_hex(&snapshot_path))
         }
     };
+    // The launcher clients' learned hop data (NAVPATH_HOP_KNOWLEDGE_DIR; a no-op unset).
+    navpath_service::hop_knowledge::start();
     let state = AppState {
         current: Arc::new(ArcSwap::from_pointee(init)),
         search_permits,
